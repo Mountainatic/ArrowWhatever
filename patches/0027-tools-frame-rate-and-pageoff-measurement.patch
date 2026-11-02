@@ -1,0 +1,1612 @@
+# 0027 native-display tools: boot-guard grace fix, current pins, frame-rate and page-off measurement tools
+#
+# Base:  tools/ after 0016 + 0019
+# Files: tools/m4a2-bootguard.sh, tools/m3db-preflight.sh; new: tools/{ab-probe.sh, anim-probe.m, anim-summary.py,
+#        display-capture.sh, display-modes.m, display-modes-all.m, display-set-mode.m, display-trace.sh, e3-check.sh,
+#        eb-measure.py, flip-sampler.pl, fps-probe.m, list-modes.m, lockseed-test.c, mark-timeout-watch.sh,
+#        pass-bench.m, passtime-sizes.py, passtime-summ.py, rt-bench.c, screen-fps.m, sysctl-once.c},
+#        tools/e1/{ws-nowait.sh, com.xegfx.ws-nowait.plist}, tools/apple-kc/{kcx.py, sl.py, fn.py, summ.py,
+#        lockstat.py, lockcross.py}
+# Apply: patch -p1 < patches/0027-tools-frame-rate-and-pageoff-measurement.patch
+#
+# m4a2-bootguard.sh: the claim node exists from probe but its attributes (t) only from start, which can lag probe by
+# tens of seconds; the guard now waits CLAIM_NODE_GRACE for t as well instead of failing the core stage and
+# reverting a healthy boot to IntelFB.  m3db-preflight.sh pins the 0023 core and 0025 adapter builds.
+# New tools (paths follow the scripts/README policy: files next to the script are found from its own location):
+#   fps-probe / screen-fps / anim-probe(+anim-summary) / flip-sampler   frames committed vs flips reaching the panel
+#   pass-bench / rt-bench                                               GPU time of a composite pass, render-target cost
+#   passtime-summ / passtime-sizes / ab-probe                           summaries of the plugin's passtime log, A/B runs
+#   display-modes(-all) / list-modes / display-set-mode / display-capture / display-trace   mode lists and switching
+#   e3-check / mark-timeout-watch / eb-measure / sysctl-once            accel and core counters while something runs
+#   e1/                                                                 LaunchDaemon recreating /private/tmp/xemtl-ws-nowait
+#   lockseed-test                                                       IOSurface lock seeds and the accel's device cache
+#   apple-kc/                                                           read Apple's kexts out of a kernel collection
+#                                                                       and its IOSurface lock kdebug trace (ktrace)
+# Build: clang -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo tools/fps-probe.m -o fps-probe
+# (each .m/.c names its frameworks in its header comment).
+#
+--- /dev/null
++++ b/tools/ab-probe.sh
+@@ -0,0 +1,19 @@
++#!/bin/sh
++# ab-probe: fps-probe 1800x1100 for 10 s, twice, with WindowServer's passtime armed; flips/s from the accel and the
++# passtime lines of those runs copied to $1 (docs/page-off-and-compression.md, the CCS A/B).  Needs admin (osascript)
++# to read WindowServer's log, which lives in _windowserver's own TMPDIR.  fps-probe is built next to this script.
++HERE=$(cd "$(dirname "$0")" && pwd)
++OUT=$1; [ -n "$OUT" ] || { echo "usage: $0 out.log"; exit 2; }
++case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
++P=$(pgrep -x WindowServer)
++PT=$(osascript -e "do shell script \"find /private/var/folders -path '*/WindowServer/nvmtl-passtime-$P.log' 2>/dev/null | head -1\" with administrator privileges")
++[ -n "$PT" ] || PT=/dev/null
++L=$(osascript -e "do shell script \"[ -f '$PT' ] && wc -l < '$PT' || echo 0\" with administrator privileges" | tr -d ' ')
++touch /tmp/nvmtl-passtime-request
++for i in 1 2; do
++  f0=$(sysctl -n debug.xegfxaccel_iop_xe_flips); "$HERE/fps-probe" 10 1800 1100 > /dev/null 2>&1
++  f1=$(sysctl -n debug.xegfxaccel_iop_xe_flips); echo "run $i flips/s $(( (f1 - f0) / 10 ))"
++done
++rm -f /tmp/nvmtl-passtime-request
++osascript -e "do shell script \"tail -n +$((L+1)) '$PT' > '$OUT'; chown $(id -u):$(id -g) '$OUT'\" with administrator privileges"
++wc -l < "$OUT"
+--- /dev/null
++++ b/tools/anim-probe.m
+@@ -0,0 +1,102 @@
++// anim-probe: a timeline of the panel during a Dock animation.  Opens a window, minimizes it (Genie, or whatever the
++// Dock's minimize effect is), restores it, and every 20 ms records how many frames reached the panel and the flip
++// worker's GPU-idle wait (XeGfxAccel sysctls) and the GPU clock (debug.xegfx_gt_act, -1 on an older core).  Prints one line per sample with the phase, so a hitch shows up as a
++// run of samples with no flips.  Read-only.
++// Build: clang -fobjc-arc -framework Cocoa anim-probe.m -o anim-probe
++// Usage: anim-probe [rounds=2] [width=900] [height=600]   (points)
++#import <Cocoa/Cocoa.h>
++#include <sys/sysctl.h>
++#include <mach/mach_time.h>
++
++static long long sc(const char *n)
++{
++    long long v = 0;
++    size_t len = sizeof v;
++    if (sysctlbyname(n, &v, &len, NULL, 0) != 0) return -1;
++    if (len == 4) v = (long long)*(int *)&v;
++    return v;
++}
++
++typedef struct { double t; const char *phase; long long flips, idleWaits, forced, idleLastUs, armLastUs, gtMhz; } Sample;
++static Sample gS[4096];
++static int gN;
++static const char *volatile gPhase = "idle";
++static double gT0;
++
++static double now(void)
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info(&tb);
++    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
++}
++
++int main(int argc, char **argv)
++{
++    @autoreleasepool {
++        const int rounds = argc > 1 ? atoi(argv[1]) : 2;
++        const double w = argc > 2 ? atof(argv[2]) : 900, h = argc > 3 ? atof(argv[3]) : 600;
++        [NSApplication sharedApplication];
++        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++        NSWindow *win = [[NSWindow alloc] initWithContentRect:NSMakeRect(60, 60, w, h)
++                                                    styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskMiniaturizable
++                                                      backing:NSBackingStoreBuffered defer:NO];
++        win.title = @"anim-probe";
++        NSView *v = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
++        v.wantsLayer = YES;
++        v.layer.backgroundColor = CGColorCreateGenericRGB(0.2, 0.5, 0.9, 1);
++        win.contentView = v;
++        [win makeKeyAndOrderFront:nil];
++        [NSApp activateIgnoringOtherApps:YES];
++        gT0 = now();
++
++        dispatch_queue_t q = dispatch_queue_create("sampler", DISPATCH_QUEUE_SERIAL);
++        dispatch_async(q, ^{
++            while (gN < 4096) {
++                Sample *s = &gS[gN];
++                s->t = now() - gT0;
++                s->phase = gPhase;
++                s->flips = sc("debug.xegfxaccel_iop_xe_flips");
++                s->idleWaits = sc("debug.xegfxaccel_iop_xe_idle_waits");
++                s->forced = sc("debug.xegfxaccel_iop_xe_idle_forced");
++                s->idleLastUs = sc("debug.xegfxaccel_iop_xe_idle_last_us");
++                s->armLastUs = sc("debug.xegfxaccel_iop_xe_arm_last_us");
++                s->gtMhz = sc("debug.xegfx_gt_act");
++                gN++;
++                usleep(20000);
++            }
++        });
++
++        __block int r = 0;
++        __block void (^step)(void);
++        step = ^{
++            if (r >= rounds) {
++                gPhase = "done";
++                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++                    int n = gN;
++                    printf("t_s\tphase\tflips\tordered\tforced\tidle_last_us\tarm_last_us\tgt_mhz\n");
++                    for (int i = 1; i < n; i++)
++                        printf("%.3f\t%s\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\n", gS[i].t, gS[i].phase,
++                               gS[i].flips - gS[i - 1].flips, gS[i].idleWaits - gS[i - 1].idleWaits,
++                               gS[i].forced - gS[i - 1].forced, gS[i].idleLastUs, gS[i].armLastUs, gS[i].gtMhz);
++                    fflush(stdout);
++                    exit(0);
++                });
++                return;
++            }
++            r++;
++            gPhase = "minimize";
++            [win miniaturize:nil];
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++                gPhase = "restore";
++                [win deminiaturize:nil];
++                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++                    gPhase = "rest";
++                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
++                });
++            });
++        };
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
++        [NSApp run];
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/anim-summary.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/python3
++# 100 ms buckets of an anim-probe run (stdin): flips, ordered flips, forced arms, longest GPU-idle wait, GPU clock range.
++import sys
++from collections import OrderedDict
++b = OrderedDict()
++for l in sys.stdin.read().splitlines()[1:]:
++    f = l.split('\t')
++    k = (round(float(f[0]) // 0.1 * 0.1, 1), f[1])
++    e = b.setdefault(k, [0, 0, 0, 0, [], []])
++    e[0] += int(f[2]); e[1] += int(f[3]); e[2] += int(f[4]); e[3] = max(e[3], int(f[5]))
++    if len(f) > 7 and int(f[7]) > 0: e[4].append(int(f[7]))
++for (t, ph), (fl, o, fo, il, mhz, _) in b.items():
++    if ph in ('minimize', 'restore'):
++        g = '%4d-%4d MHz' % (min(mhz), max(mhz)) if mhz else '   (no clock)'
++        print('%4.1f %-8s flips %2d ordered %2d forced %d idle_max %6d us  %s' % (t, ph, fl, o, fo, il, g))
+--- /dev/null
++++ b/tools/apple-kc/fn.py
+@@ -0,0 +1,19 @@
++import sys, bisect
++base, pref = sys.argv[1], sys.argv[2]
++addrs = [int(l.split()[0], 16) for l in open(base + '.tsyms')]
++names = [l.rstrip('\n') for l in open(base + '.tsyms.d')]
++hits = [i for i, n in enumerate(names) if n.startswith(pref)]
++if not hits: sys.exit('not found: ' + pref)
++i = hits[int(sys.argv[3]) if len(sys.argv) > 3 else 0]
++s, e = addrs[i], addrs[i + 1] if i + 1 < len(addrs) else 1 << 64
++print('## %s  0x%x..0x%x (%d B)%s' % (names[i], s, e, e - s, '  [%d matches]' % len(hits) if len(hits) > 1 else ''))
++on = False
++for l in open(base + '.dis'):
++    t = l.split('\t', 1)[0].strip()
++    try: a = int(t, 16)
++    except ValueError: 
++        if on: print(l, end='')
++        continue
++    if a >= e: break
++    on = a >= s
++    if on: print(l, end='')
+--- /dev/null
++++ b/tools/apple-kc/kcx.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++# Extract one fileset entry of an x86_64 kernel collection as a standalone Mach-O (segments + symtab), for otool/nm.
++import struct, sys
++
++LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_FILESET_ENTRY = 0x19, 0x2, 0xb, 0x80000035
++
++def entries(kc):
++    ncmds, sizeofcmds = struct.unpack_from('<II', kc, 16)
++    off = 32
++    for _ in range(ncmds):
++        cmd, size = struct.unpack_from('<II', kc, off)
++        if cmd == LC_FILESET_ENTRY:
++            vmaddr, fileoff, idoff = struct.unpack_from('<QQI', kc, off + 8)
++            name = kc[off + idoff: kc.index(b'\0', off + idoff)].decode()
++            yield name, vmaddr, fileoff
++        off += size
++
++def extract(kc, fileoff):
++    magic, cpu, sub, ftype, ncmds, sizeofcmds, flags, _ = struct.unpack_from('<IiiIIIII', kc, fileoff)
++    hdr = bytearray(kc[fileoff: fileoff + 32 + sizeofcmds])
++    out = bytearray()
++    segs, symtab, led = [], None, []
++    off = 32
++    for _ in range(ncmds):
++        cmd, size = struct.unpack_from('<II', hdr, off)
++        if cmd == LC_SEGMENT_64:
++            segs.append(off)
++        elif cmd == LC_SYMTAB:
++            symtab = off
++        elif cmd == LC_DYSYMTAB:
++            hdr[off + 8: off + size] = bytes(size - 8)   # indirect tables are not carried over
++        elif cmd in (0x26, 0x29, 0x1e, 0x80000033, 0x80000034):
++            led.append(off)                              # linkedit_data_command: carried over below
++        off += size
++    # lay segments out page by page after the header
++    cur = (len(hdr) + 0xfff) & ~0xfff
++    body = {}
++    for so in segs:
++        name = hdr[so + 8: so + 24].rstrip(b'\0').decode()
++        vmaddr, vmsize, sfoff, sfsize = struct.unpack_from('<QQQQ', hdr, so + 24)
++        nsects = struct.unpack_from('<I', hdr, so + 64)[0]
++        if name == '__LINKEDIT' or sfsize == 0:
++            struct.pack_into('<QQ', hdr, so + 40, 0, 0)
++            continue
++        body[cur] = kc[sfoff: sfoff + sfsize]
++        delta = cur - sfoff
++        struct.pack_into('<Q', hdr, so + 40, cur)
++        for i in range(nsects):
++            s = so + 72 + 80 * i
++            soff = struct.unpack_from('<I', hdr, s + 48)[0]
++            if soff:
++                struct.pack_into('<I', hdr, s + 48, soff + delta)
++            struct.pack_into('<II', hdr, s + 56, 0, 0)      # relocations dropped
++        cur = (cur + sfsize + 0xfff) & ~0xfff
++    if symtab is not None:
++        symoff, nsyms, stroff, strsize = struct.unpack_from('<IIII', hdr, symtab + 8)
++        syms = kc[symoff: symoff + nsyms * 16]
++        strs = kc[stroff: stroff + strsize]
++        body[cur] = syms
++        body[cur + len(syms)] = strs
++        struct.pack_into('<IIII', hdr, symtab + 8, cur, nsyms, cur + len(syms), strsize)
++        cur += len(syms) + strsize
++    for lo in led:
++        doff, dsize = struct.unpack_from('<II', hdr, lo + 8)
++        if dsize:
++            body[cur] = kc[doff: doff + dsize]
++            struct.pack_into('<I', hdr, lo + 8, cur)
++            cur += (dsize + 7) & ~7
++    out = bytearray(cur)
++    out[0: len(hdr)] = hdr
++    for o, b in body.items():
++        out[o: o + len(b)] = b
++    return bytes(out)
++
++kc = open(sys.argv[1], 'rb').read()
++want = sys.argv[2:]
++for name, vmaddr, fileoff in entries(kc):
++    if not want:
++        print(name)
++    elif name in want:
++        data = extract(kc, fileoff)
++        open(name + '.macho', 'wb').write(data)
++        print('%s vmaddr 0x%x -> %s.macho (%d bytes)' % (name, vmaddr, name, len(data)))
+--- /dev/null
++++ b/tools/apple-kc/lockcross.py
+@@ -0,0 +1,11 @@
++# lockcross.py <ktrace.csv> <ws-drawn.txt>: who CPU-locked each surface WindowServer draws (ktrace -f S0x8521 --csv;
++# ws-drawn.txt = the id/size/marks columns of `sysctl -n debug.nvaccel_iop_xe_locks`).  0x85210010 is
++# IOSurface::lockSurface's tracepoint: arg2 surface ID, arg3 lock options (bit 0 read-only), arg4 seed.
++import csv, collections, sys
++drawn = {int(l.split()[0]): (l.split()[1], int(l.split()[2])) for l in open(sys.argv[2])}
++by = collections.defaultdict(collections.Counter)
++for r in csv.DictReader(open(sys.argv[1])):
++    if int(r['debugid']) & ~3 != 0x85210010: continue
++    by[int(r['arg2'])][(r['execname'], 'ro' if int(r['arg3']) & 1 else 'w')] += 1
++for sid, (size, marks) in sorted(drawn.items(), key=lambda x: -x[1][1]):
++    print('%5d %-10s marks %7d  locks %s' % (sid, size, marks, dict(by.get(sid, {})) or '-'))
+--- /dev/null
++++ b/tools/apple-kc/lockstat.py
+@@ -0,0 +1,12 @@
++import csv, sys, collections
++c = collections.Counter(); codes = collections.Counter(); thr = collections.Counter()
++for r in csv.DictReader(open(sys.argv[1])):
++    d = int(r['debugid']); codes['0x%08x' % d] += 1
++    if d & ~3 != 0x85210010: continue
++    ro = 'read-only' if int(r['arg3']) & 1 else 'write'
++    c[(r['execname'], int(r['arg2']), ro)] += 1
++    if r['execname'] == 'WindowServer': thr[(int(r['threadid']), ro)] += 1
++print('event codes:', dict(codes))
++print('locks by process / surface / kind:')
++for (p, s, k), n in sorted(c.items(), key=lambda x: -x[1]): print('  %-22s surface %-5d %-9s %d' % (p, s, k, n))
++print('WindowServer threads:', dict(thr))
+--- /dev/null
++++ b/tools/apple-kc/sl.py
+@@ -0,0 +1,11 @@
++import sys, re
++f, s, n = sys.argv[1], int(sys.argv[2], 16), int(sys.argv[3])
++on = 0
++for l in open(f):
++    t = l.split('\t', 1)[0].strip()
++    try: a = int(t, 16)
++    except ValueError: continue
++    if a >= s: on += 1
++    if on:
++        if re.search(r'literal pool|Objc|callq|_IOSurface|imm =|cmp', l): print(l.rstrip()[:200])
++        if on > n: break
+--- /dev/null
++++ b/tools/apple-kc/summ.py
+@@ -0,0 +1,34 @@
++import sys, re, subprocess
++base, prefs = sys.argv[1], sys.argv[2:]
++addrs = [int(l.split()[0], 16) for l in open(base + '.tsyms')]
++names = [l.rstrip('\n') for l in open(base + '.tsyms.d')]
++amap = dict(zip(addrs, names))
++dis = open(base + '.dis').read().splitlines()
++idx = []
++for k, l in enumerate(dis):
++    t = l.split('\t', 1)[0].strip()
++    try: idx.append((int(t, 16), k))
++    except ValueError: pass
++import bisect
++ia = [a for a, _ in idx]
++for pref in prefs:
++    for i, n in enumerate(names):
++        if not n.startswith(pref): continue
++        s, e = addrs[i], addrs[i + 1] if i + 1 < len(addrs) else 1 << 64
++        print('## %s (%d B)' % (n, e - s))
++        j = bisect.bisect_left(ia, s)
++        seen = []
++        while j < len(idx) and idx[j][0] < e:
++            l = dis[idx[j][1]]
++            m = re.search(r'literal pool for: "(.*)"', l)
++            if m: seen.append('  "' + m.group(1)[:150] + '"')
++            m = re.search(r'callq\s+0x([0-9a-f]+)', l)
++            if m:
++                t = int(m.group(1), 16)
++                if t in amap: seen.append('  -> ' + amap[t][:110])
++            m = re.search(r'callq\s+\*', l)
++            j += 1
++        out = []
++        for x in seen:
++            if not out or out[-1] != x: out.append(x)
++        print('\n'.join(out[:int(__import__('os').environ.get('N', '60'))]))
+--- /dev/null
++++ b/tools/display-capture.sh
+@@ -0,0 +1,69 @@
++#!/bin/bash
++# display-capture.sh [label] -- read-only snapshot of the display stack, as the reference for the XeGfx KMS work.
++# Meant first for a Discrete (dGPU-direct) boot, where NullMoth's NVRMFB drives the built-in panel, and then for the
++# XeGfx boot to compare against.  Writes data/display-<stamp>-<label>/; needs no root (a few items are skipped
++# without it).  Nothing here writes NVRAM, a sysctl, the registry or a display register.
++set -uo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++ROOT=$(dirname "$HERE")
++LABEL=${1:-$( (ioreg -r -c NVRMNVDAFramebuffer -d1 | grep -q NVRMNVDAFramebuffer) && echo discrete || echo igpu)}
++OUT="$ROOT/data/display-$(date +%Y%m%d-%H%M%S)-$LABEL"
++mkdir -p "$OUT"
++note() { printf '%s\n' "$*" | tee -a "$OUT/capture.log"; }
++cap() { local f=$1; shift; "$@" > "$OUT/$f" 2>&1 || note "  ($f exited $?)"; }
++
++note "== display-capture $LABEL -> $OUT"
++{
++    date; sw_vers; uname -a; uptime
++    sysctl kern.boottime kern.bootsessionuuid machdep.cpu.brand_string
++    echo; nvram boot-args
++    echo; nvram -p | grep -E '^(nullmoth|xegfx|xeintelfb|nv)' || true
++    echo; csrutil status 2>&1 | head -3
++} > "$OUT/meta.txt" 2>&1
++
++# kexts and the GPUs
++cap kexts.txt kmutil showloaded --list-only --variant-suffix release
++grep -E -i 'nullmoth|watchthelight|xegfx|NVRM|NVAccel|AppleGraphics|IOGraphics|AGDC|AppleBacklight' "$OUT/kexts.txt" > "$OUT/kexts-display.txt" || true
++cap gpus.txt ioreg -r -k class-code -l -w0 -d1 -x
++cap system-profiler.txt system_profiler SPDisplaysDataType
++cap system-profiler.xml system_profiler -xml SPDisplaysDataType
++
++# the framebuffer, the display and AGDC: full property dumps
++for c in IOFramebuffer IODisplayConnect AppleDisplay IODisplay AppleGraphicsDeviceControl AppleBacklightDisplay \
++         IOAccelerator IOPresentment NVRMNVDAFramebuffer NVRMDisplay XeGfxFramebuffer XeGfxDisplayNub; do
++    ioreg -r -c "$c" -l -w0 > "$OUT/ioreg-$c.txt" 2>&1
++    [ -s "$OUT/ioreg-$c.txt" ] || rm -f "$OUT/ioreg-$c.txt"
++done
++cap ioreg-full.txt ioreg -l -w0
++# the framebuffer properties that matter for modes, scaling and timing, one per line
++grep -E '"(IOFBScalerInfo|IOFBDetailedTimings|IOFBTimingRange|IOFBMemorySize|IOFBCurrentPixelCount|IOFBCurrentPixelClock|IOFBTransform|IOFBConfig|IOFBNeedsRefresh|IOFBProbeOptions|IOFBGammaWidth|IOFBGammaCount|IOFBUIScale|IOFB0Hz|IOFBDisplayModeCount|IOFBMirrorDisplayModeSafe|IOFBCLUTDefer|IOFBDisplayPortTrainingAttribute|IOFBWaitCursorFrames|IODisplayEDID|DisplayVendorID|DisplayProductID|IODisplayPrefsKey|IODisplayParameters|IOFBDependentID|IOFBDependentIndex|NVRM[A-Za-z]*|XeGfx[A-Za-z]*|AAPL,[A-Za-z-]*|backlight-control|IOAccelIndex|IOAccelRevision)"' \
++    "$OUT/ioreg-full.txt" | sed 's/^[ |+-]*//' > "$OUT/fb-key-props.txt" || true
++
++# every mode CoreGraphics offers (HiDPI duplicates included) and the current one
++if [ -x "$HERE/display-modes" ] || clang -fobjc-arc -framework CoreGraphics -framework IOKit -framework Foundation \
++        "$HERE/display-modes.m" -o "$HERE/display-modes" 2> "$OUT/display-modes-build.txt"; then
++    cap display-modes.tsv "$HERE/display-modes"
++    grep -E '^(display|current)' "$OUT/display-modes.tsv" | tee -a "$OUT/capture.log"
++    awk -F'\t' '$1=="mode"{print $3"@"int($4+0.5)}' "$OUT/display-modes.tsv" | sort | uniq -c | sort -rn > "$OUT/raster-refresh-summary.txt"
++fi
++
++# the sysctls each stack publishes
++sysctl -a 2>/dev/null | grep -E '^debug\.(nvrm|nv|xegfx|nmx|agdc)' > "$OUT/sysctl-debug.txt" || true
++
++# kernel log of this boot: the display chain (NVRM/NVKMS, NVRMFB, AGDC, accel, XeGfx) and IOGraphics
++P='process == "kernel" AND (sender BEGINSWITH "NVRM" OR sender BEGINSWITH "NVAccel" OR sender BEGINSWITH "NVDA" OR sender BEGINSWITH "XeGfx" OR sender BEGINSWITH "IOGraphics" OR sender == "AppleDisplay" OR sender BEGINSWITH "AppleBacklight" OR sender BEGINSWITH "AppleGraphicsDevicePolicy" OR sender BEGINSWITH "AppleGraphicsControl")'
++/usr/bin/log show --last boot --predicate "$P" --style compact > "$OUT/kernel-display.log" 2>&1
++grep -E 'NVRM-fb:|NVKMS|nvkms' "$OUT/kernel-display.log" > "$OUT/nvrmfb.log" || true
++# the lines that answer the open XeGfx questions: link rate/lanes, DSC, bpc, modes, scaler, validate/set calls
++grep -i -E 'dsc|link|lane|hbr|rate|bpc|bpp|depth|scal|hidpi|validate|setDisplayMode|setDetailedTimings|mode 0x|timing|edid|ddc|backlight|agdc|vblank|refresh|Hz' \
++    "$OUT/nvrmfb.log" > "$OUT/nvrmfb-keylines.log" || true
++# WindowServer/CoreDisplay this boot (mode decisions, IOPresentment)
++/usr/bin/log show --last boot --predicate 'process == "WindowServer" AND (subsystem BEGINSWITH "com.apple.CoreDisplay" OR subsystem BEGINSWITH "com.apple.SkyLight" OR category CONTAINS[c] "display")' \
++    --style compact > "$OUT/windowserver-display.log" 2>&1
++
++# display preferences macOS chose (scaled mode, refresh)
++cap display-prefs.txt defaults read /Library/Preferences/com.apple.windowserver.displays
++ls -la /Library/Displays/Contents/Resources/Overrides/DisplayVendorID-9e5 > "$OUT/overrides-9e5.txt" 2>&1 || true
++
++note "   kernel-display.log $(wc -l < "$OUT/kernel-display.log") lines, nvrmfb-keylines $(wc -l < "$OUT/nvrmfb-keylines.log" 2>/dev/null || echo 0)"
++note "== done: $OUT"
+--- /dev/null
++++ b/tools/display-modes-all.m
+@@ -0,0 +1,47 @@
++// display-modes-all: every mode SkyLight holds for each online display, including the ones the public
++// CGDisplayCopyAllDisplayModes hides, with the pixel density (2.0 = HiDPI).  Read-only; same private calls as displayplacer.
++// Build: clang -fobjc-arc -framework CoreGraphics -framework Foundation display-modes-all.m -o display-modes-all
++#import <CoreGraphics/CoreGraphics.h>
++#import <Foundation/Foundation.h>
++
++typedef union {
++    uint8_t bytes[0xD4];
++    struct {
++        uint32_t mode;
++        uint32_t flags;
++        uint32_t width;
++        uint32_t height;
++        uint32_t depth;
++        uint32_t dc2[42];
++        uint16_t dc3;
++        uint16_t freq;
++        uint32_t dc4[4];
++        float density;
++    } d;
++} XGModeD4;
++
++extern void CGSGetCurrentDisplayMode(CGDirectDisplayID display, int *modeNum);
++extern void CGSGetNumberOfDisplayModes(CGDirectDisplayID display, int *nModes);
++extern void CGSGetDisplayModeDescriptionOfLength(CGDirectDisplayID display, int idx, XGModeD4 *mode, int length);
++
++int main(void)
++{
++    CGDirectDisplayID ids[16];
++    uint32_t n = 0;
++    if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return 1;
++    for (uint32_t i = 0; i < n; i++) {
++        int count = 0, cur = -1;
++        CGSGetNumberOfDisplayModes(ids[i], &count);
++        CGSGetCurrentDisplayMode(ids[i], &cur);
++        printf("display\t0x%x\tmodes=%d\tcurrent=%d\n", ids[i], count, cur);
++        for (int k = 0; k < count; k++) {
++            XGModeD4 m;
++            memset(&m, 0, sizeof m);
++            CGSGetDisplayModeDescriptionOfLength(ids[i], k, &m, 0xD4);
++            printf("%s\t%d\tpoints=%ux%u\tpixels=%.0fx%.0f\tdensity=%.1f\t%uHz\tdepth=%u\tflags=0x%08x\tid=0x%x\n",
++                   k == cur ? "current" : "mode", k, m.d.width, m.d.height, m.d.width * m.d.density,
++                   m.d.height * m.d.density, m.d.density, m.d.freq, m.d.depth, m.d.flags, m.d.mode);
++        }
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/display-modes.m
+@@ -0,0 +1,42 @@
++// display-modes: read-only list of every online display and every mode CoreGraphics offers it, HiDPI duplicates
++// included, as tab-separated lines (for the Discrete-mode reference capture and the XeGfx comparison).
++// Build: clang -fobjc-arc -framework CoreGraphics -framework IOKit -framework Foundation display-modes.m -o display-modes
++#import <CoreGraphics/CoreGraphics.h>
++#import <Foundation/Foundation.h>
++#import <IOKit/graphics/IOGraphicsTypes.h>
++
++static void printMode(const char *tag, CGDisplayModeRef m)
++{
++    double hz = CGDisplayModeGetRefreshRate(m);
++    printf("%s\t%zux%zu\t%zux%zu\t%.3f\tid=0x%x\tioflags=0x%x\tusable=%d\thidpi=%d\n", tag,
++           CGDisplayModeGetWidth(m), CGDisplayModeGetHeight(m),
++           CGDisplayModeGetPixelWidth(m), CGDisplayModeGetPixelHeight(m), hz,
++           (unsigned)CGDisplayModeGetIODisplayModeID(m), (unsigned)CGDisplayModeGetIOFlags(m),
++           CGDisplayModeIsUsableForDesktopGUI(m) ? 1 : 0,
++           CGDisplayModeGetPixelWidth(m) > CGDisplayModeGetWidth(m) ? 1 : 0);
++}
++
++int main(void)
++{
++    @autoreleasepool {
++        CGDirectDisplayID ids[16];
++        uint32_t n = 0;
++        if (CGGetOnlineDisplayList(16, ids, &n) != kCGErrorSuccess) return 1;
++        NSDictionary *opts = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes : @YES };
++        for (uint32_t i = 0; i < n; i++) {
++            CGDirectDisplayID d = ids[i];
++            CGSize mm = CGDisplayScreenSize(d);
++            printf("display\t0x%x\tvendor=0x%x\tmodel=0x%x\tserial=0x%x\tbuiltin=%d\tmain=%d\tactive=%d\tmm=%.0fx%.0f\tunit=%u\n",
++                   d, CGDisplayVendorNumber(d), CGDisplayModelNumber(d), CGDisplaySerialNumber(d),
++                   CGDisplayIsBuiltin(d), CGDisplayIsMain(d), CGDisplayIsActive(d), mm.width, mm.height,
++                   CGDisplayUnitNumber(d));
++            CGDisplayModeRef cur = CGDisplayCopyDisplayMode(d);
++            if (cur) { printMode("current", cur); CGDisplayModeRelease(cur); }
++            CFArrayRef modes = CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)opts);
++            for (CFIndex k = 0; modes && k < CFArrayGetCount(modes); k++)
++                printMode("mode", (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, k));
++            if (modes) CFRelease(modes);
++        }
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/display-set-mode.m
+@@ -0,0 +1,73 @@
++// display-set-mode: switch the main display to a SkyLight mode, including the "not preset" HiDPI ones the public API
++// hides (same private calls as displayplacer).  Usage:
++//   display-set-mode <points-w> <points-h> <density> <hz>   pick by size/density/refresh, print the old and new index
++//   display-set-mode index <n>                              switch to mode index n (e.g. back to the old one)
++// Build: clang -fobjc-arc -framework CoreGraphics -framework Foundation -F/System/Library/PrivateFrameworks
++//        -framework SkyLight display-set-mode.m -o display-set-mode
++#import <CoreGraphics/CoreGraphics.h>
++#import <Foundation/Foundation.h>
++#include <stdlib.h>
++#include <string.h>
++
++typedef union {
++    uint8_t bytes[0xD4];
++    struct {
++        uint32_t mode;
++        uint32_t flags;
++        uint32_t width;
++        uint32_t height;
++        uint32_t depth;
++        uint32_t dc2[42];
++        uint16_t dc3;
++        uint16_t freq;
++        uint32_t dc4[4];
++        float density;
++    } d;
++} XGModeD4;
++
++extern void CGSGetCurrentDisplayMode(CGDirectDisplayID display, int *modeNum);
++extern void CGSGetNumberOfDisplayModes(CGDirectDisplayID display, int *nModes);
++extern void CGSGetDisplayModeDescriptionOfLength(CGDirectDisplayID display, int idx, XGModeD4 *mode, int length);
++extern CGError CGSConfigureDisplayMode(CGDisplayConfigRef config, CGDirectDisplayID display, int modeNum);
++
++static int switchTo(CGDirectDisplayID d, int idx)
++{
++    CGDisplayConfigRef cfg;
++    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return 1;
++    CGError e = CGSConfigureDisplayMode(cfg, d, idx);
++    if (e != kCGErrorSuccess) { CGCancelDisplayConfiguration(cfg); fprintf(stderr, "configure %d\n", e); return 1; }
++    e = CGCompleteDisplayConfiguration(cfg, kCGConfigurePermanently);
++    if (e != kCGErrorSuccess) { fprintf(stderr, "complete %d\n", e); return 1; }
++    return 0;
++}
++
++int main(int argc, char **argv)
++{
++    CGDirectDisplayID d = CGMainDisplayID();
++    int count = 0, cur = -1, want = -1;
++    CGSGetNumberOfDisplayModes(d, &count);
++    CGSGetCurrentDisplayMode(d, &cur);
++    if (argc == 3 && strcmp(argv[1], "index") == 0) {
++        want = atoi(argv[2]);
++    } else if (argc == 5) {
++        uint32_t w = (uint32_t)atoi(argv[1]), h = (uint32_t)atoi(argv[2]), hz = (uint32_t)atoi(argv[4]);
++        float dens = (float)atof(argv[3]);
++        for (int k = 0; k < count; k++) {
++            XGModeD4 m;
++            memset(&m, 0, sizeof m);
++            CGSGetDisplayModeDescriptionOfLength(d, k, &m, 0xD4);
++            if (m.d.width == w && m.d.height == h && m.d.freq == hz && m.d.density > dens - 0.05f && m.d.density < dens + 0.05f) {
++                want = k;
++                break;
++            }
++        }
++    } else {
++        fprintf(stderr, "usage: %s <w> <h> <density> <hz> | index <n>\n", argv[0]);
++        return 2;
++    }
++    if (want < 0 || want >= count) { fprintf(stderr, "no such mode (current %d of %d)\n", cur, count); return 1; }
++    printf("old=%d new=%d\n", cur, want);
++    fflush(stdout);
++    if (want == cur) return 0;
++    return switchTo(d, want);
++}
+--- /dev/null
++++ b/tools/display-trace.sh
+@@ -0,0 +1,60 @@
++#!/bin/bash
++# display-trace.sh start [label] | mark <text> | stop -- record what the display stack does while someone changes
++# modes in System Settings (scaled resolution, refresh rate), locks the screen, sleeps/wakes or plugs a display.
++#   start: snapshot the modes and framebuffer properties, then stream the kernel display log and WindowServer's
++#          CoreDisplay log into data/display-trace-<stamp>-<label>/ in the background
++#   mark:  write a marker line into the trace ("now picking 1920x1200 240 Hz"), so the log can be cut per step
++#   stop:  stop the streams and take the after-snapshot
++# Read-only: nothing here changes a mode, NVRAM or the registry.
++set -uo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++ROOT=$(dirname "$HERE")
++STATE="$ROOT/data/.display-trace-current"
++K='process == "kernel" AND (sender BEGINSWITH "NVRM" OR sender BEGINSWITH "NVAccel" OR sender BEGINSWITH "XeGfx" OR sender BEGINSWITH "IOGraphics" OR sender == "AppleDisplay" OR sender BEGINSWITH "AppleBacklight")'
++W='process == "WindowServer" AND (subsystem BEGINSWITH "com.apple.CoreDisplay" OR subsystem BEGINSWITH "com.apple.SkyLight")'
++
++snap() {
++    local d=$1 tag=$2
++    [ -x "$HERE/display-modes" ] || clang -fobjc-arc -framework CoreGraphics -framework IOKit -framework Foundation \
++        "$HERE/display-modes.m" -o "$HERE/display-modes"
++    "$HERE/display-modes" > "$d/modes-$tag.tsv" 2>&1
++    ioreg -r -c IOFramebuffer -l -w0 > "$d/ioreg-fb-$tag.txt" 2>&1
++    ioreg -r -c AppleDisplay -l -w0 > "$d/ioreg-display-$tag.txt" 2>&1
++    sysctl -a 2>/dev/null | grep -E '^debug\.(nvrm|nv|xegfx)' > "$d/sysctl-$tag.txt"
++    grep -E '^current' "$d/modes-$tag.tsv"
++}
++
++case "${1:-}" in
++start)
++    [ -f "$STATE" ] && { echo "a trace is running: $(cat "$STATE")"; exit 1; }
++    D="$ROOT/data/display-trace-$(date +%Y%m%d-%H%M%S)-${2:-trace}"
++    mkdir -p "$D"
++    snap "$D" before
++    /usr/bin/log stream --predicate "$K" --style compact > "$D/kernel.log" 2>&1 &
++    echo $! > "$D/kernel.pid"
++    /usr/bin/log stream --predicate "$W" --style compact > "$D/windowserver.log" 2>&1 &
++    echo $! > "$D/windowserver.pid"
++    echo "$D" > "$STATE"
++    echo "$(date '+%F %T') start" > "$D/marks.txt"
++    echo "tracing into $D"
++    ;;
++mark)
++    D=$(cat "$STATE" 2>/dev/null) || { echo "no trace running"; exit 1; }
++    shift
++    echo "$(date '+%F %T') $*" | tee -a "$D/marks.txt"
++    snap "$D" "mark$(wc -l < "$D/marks.txt" | tr -d ' ')" > /dev/null
++    ;;
++stop)
++    D=$(cat "$STATE" 2>/dev/null) || { echo "no trace running"; exit 1; }
++    sleep 1
++    for p in kernel windowserver; do kill "$(cat "$D/$p.pid")" 2>/dev/null; rm -f "$D/$p.pid"; done
++    echo "$(date '+%F %T') stop" >> "$D/marks.txt"
++    snap "$D" after
++    rm -f "$STATE"
++    grep -c 'NVRM-fb:' "$D/kernel.log" | sed 's/^/NVRM-fb lines: /'
++    grep -E 'setDisplayMode|validateDetailedTiming|setDetailedTimings|switchMode|applyMode' "$D/kernel.log" | tail -20
++    echo "trace: $D"
++    ;;
++*)
++    echo "usage: $0 start [label] | mark <text> | stop"; exit 2 ;;
++esac
+--- /dev/null
++++ b/tools/e1/com.xegfx.ws-nowait.plist
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>Label</key>
++	<string>com.xegfx.ws-nowait</string>
++	<key>ProgramArguments</key>
++	<array>
++		<string>/bin/sh</string>
++		<string>/usr/local/xegfx/ws-nowait.sh</string>
++	</array>
++	<key>RunAtLoad</key>
++	<true/>
++	<key>KeepAlive</key>
++	<false/>
++	<key>StandardOutPath</key>
++	<string>/var/log/xegfx-ws-nowait.log</string>
++	<key>StandardErrorPath</key>
++	<string>/var/log/xegfx-ws-nowait.log</string>
++</dict>
++</plist>
+--- /dev/null
++++ b/tools/e1/ws-nowait.sh
+@@ -0,0 +1,22 @@
++#!/bin/sh
++# E1 (docs/32-FRAME-RATE.md): WindowServer's XeMTL plugin waits for each composite to finish on the GPU
++# (waitUntilCompleted) unless /private/tmp/xemtl-ws-nowait exists.  XeGfxAccel's deferred flip worker already waits for
++# the GPU before it arms PLANE_SURF (iop_xe_defer=1, iop_xe_wait_idle=1), so that wait only serialises WindowServer
++# against the GPU.  /private/tmp is emptied every boot: recreate the sentinel once the accel's flip ordering is on.
++# The plugin re-reads it every second.  Never creates it while the accel does not order flips after the GPU.
++PATH=/usr/bin:/bin:/usr/sbin:/sbin
++S=/private/tmp/xemtl-ws-nowait
++i=0
++while [ $i -lt 600 ]; do
++    d=$(sysctl -n debug.xegfxaccel_iop_xe_defer 2>/dev/null)
++    w=$(sysctl -n debug.xegfxaccel_iop_xe_wait_idle 2>/dev/null)
++    if [ "$d" = 1 ] && [ "$w" = 1 ]; then
++        touch "$S" && chmod 644 "$S"
++        echo "$(date '+%F %T') sentinel created after ${i}s (defer $d wait_idle $w)"
++        exit 0
++    fi
++    sleep 1
++    i=$((i + 1))
++done
++echo "$(date '+%F %T') accel flip ordering never came on (defer '${d}' wait_idle '${w}'): sentinel not created"
++exit 0
+--- /dev/null
++++ b/tools/e3-check.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++# After the E1-E3 reboot: sentinel, vblank source, flip counters around an fps-probe run.  Read-only.
++cd "$(dirname "$0")"
++echo "== E1 sentinel"; cat /var/log/xegfx-ws-nowait.log 2>/dev/null | tail -1; ls -la /private/tmp/xemtl-ws-nowait 2>&1
++echo "== E3 vblank"; /usr/bin/log show --last boot --predicate 'process == "kernel" AND (eventMessage CONTAINS "E3:" OR eventMessage CONTAINS "vblank source")' --style compact 2>/dev/null | cut -c 1-23,60-220 | tail -6
++ioreg -l -w0 -r -c XeGfxFramebuffer 2>/dev/null | grep -o '"XeGfxVblankCount" = [0-9]*' | head -1
++s() { sysctl -n debug.xegfxaccel_iop_xe_flips debug.xegfxaccel_iop_xe_early_signals debug.xegfxaccel_iop_xe_early_hazards \
++      debug.xegfxaccel_iop_xe_defer_dropped | tr '\n' ' '; }
++echo "== fps (flips early hazards dropped)"
++for sz in "1200 800" "2400 1500"; do
++  a=$(s); t0=$(date +%s); ./fps-probe 8 $sz | tail -1; t1=$(date +%s); b=$(s)
++  echo "  $sz before: $a after: $b ($((t1 - t0)) s)"
++done
++sysctl debug.xegfxaccel_iop_xe_idle_last_us debug.xegfxaccel_iop_xe_arm_last_us debug.xegfxaccel_iop_gap_last_us debug.xegfxaccel_iop_xe_defer_max_depth
++./display-modes-all | grep ^current
+--- /dev/null
++++ b/tools/eb-measure.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/python3
++# §32.10: i915 execbuffer per-stage time around an fps-probe run.  Reads debug.xegfx_eb before and after (sums are
++# cumulative, maxes restart at every read) and prints per-call averages for the run.  Read-only.
++import re, subprocess, sys, os
++D = os.path.dirname(os.path.abspath(__file__))
++def read():
++    t = subprocess.run(['/usr/sbin/sysctl', '-n', 'debug.xegfx_eb'], capture_output=True, text=True).stdout
++    head = re.search(r'calls (\d+) bufs (\d+) \(max (\d+)\) clflush objs (\d+) bytes (\d+)', t)
++    rows = {m[0]: (int(m[1]), int(m[2]), int(m[3])) for m in re.findall(r'^(\S+)\s+n\s+(\d+) sum_us\s+(\d+) max_us\s+(\d+)', t, re.M)}
++    return [int(x) for x in head.groups()], rows
++size = sys.argv[1:3] or ['1200', '800']
++h0, r0 = read()
++probe = subprocess.run([D+'/fps-probe', '8'] + size, capture_output=True, text=True).stdout
++h1, r1 = read()
++calls = h1[0] - h0[0]
++print(probe.strip().splitlines()[-1] if probe.strip() else 'fps-probe: no output')
++print('execbuffer calls %d (%.1f/s), bufs/call %.1f (max %d), clflush objs %d (%.1f MB)' % (calls, calls / 9.0,
++      (h1[1] - h0[1]) / max(calls, 1), h1[2], h1[3] - h0[3], (h1[4] - h0[4]) / 1e6))
++print('%-12s %8s %12s %10s %8s' % ('stage', 'n', 'sum_ms', 'avg_us', 'max_us'))
++for k in r1:
++    n = r1[k][0] - r0.get(k, (0, 0, 0))[0]; us = r1[k][1] - r0.get(k, (0, 0, 0))[1]
++    print('%-12s %8d %12.1f %10.1f %8d' % (k, n, us / 1000.0, us / max(n, 1), r1[k][2]))
+--- /dev/null
++++ b/tools/flip-sampler.pl
+@@ -0,0 +1,10 @@
++#!/usr/bin/perl
++# flip-sampler: every 10 ms for N seconds, the accel's Xe flip count (debug.xegfxaccel_iop_xe_flips) with a timestamp in
++# ms, so a stutter shows as a gap between flips.  Usage: flip-sampler.pl seconds > out.txt
++use strict; use Time::HiRes qw(time sleep);
++my $n = shift || 60; my $t0 = time; my $last = -1;
++while (time - $t0 < $n) {
++    my $f = `/usr/sbin/sysctl -n debug.xegfxaccel_iop_xe_flips`; chomp $f;
++    if ($f != $last) { printf "%.1f %s\n", (time - $t0) * 1000, $f; $last = $f; }
++    sleep 0.01;
++}
+--- /dev/null
++++ b/tools/fps-probe.m
+@@ -0,0 +1,72 @@
++// fps-probe: a window whose layer colour changes on every display-link tick, so WindowServer has to composite and
++// present a new frame each vblank.  Prints the display link's nominal and actual rate and how many frames the app
++// committed, after N seconds.  Read the accel counters around it to see how many of those frames reached the panel.
++// Build: clang -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo fps-probe.m -o fps-probe
++// Usage: fps-probe [seconds=10] [width=1200] [height=800]
++#import <Cocoa/Cocoa.h>
++#import <QuartzCore/QuartzCore.h>
++#import <CoreVideo/CoreVideo.h>
++#include <mach/mach_time.h>
++
++static NSView *gView;
++static volatile int64_t gTicks, gCommits;
++static double gNominal;
++
++static CVReturn tick(CVDisplayLinkRef link, const CVTimeStamp *now, const CVTimeStamp *out, CVOptionFlags f,
++                     CVOptionFlags *fo, void *ctx)
++{
++    (void)link; (void)now; (void)f; (void)fo; (void)ctx;
++    if (gNominal == 0 && out->videoRefreshPeriod)
++        gNominal = (double)out->videoTimeScale / (double)out->videoRefreshPeriod;
++    __sync_fetch_and_add(&gTicks, 1);
++    dispatch_async(dispatch_get_main_queue(), ^{
++        static int k;
++        k++;
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        gView.layer.backgroundColor = CGColorCreateGenericRGB((k & 1) ? 1 : 0, (k >> 1) & 1, (k >> 2) & 1, 1);
++        [CATransaction commit];
++        __sync_fetch_and_add(&gCommits, 1);
++    });
++    return kCVReturnSuccess;
++}
++
++int main(int argc, char **argv)
++{
++    @autoreleasepool {
++        double secs = argc > 1 ? atof(argv[1]) : 10;
++        double w = argc > 2 ? atof(argv[2]) : 1200, h = argc > 3 ? atof(argv[3]) : 800;
++        [NSApplication sharedApplication];
++        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++        NSWindow *win = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, w, h)
++                                                    styleMask:NSWindowStyleMaskTitled
++                                                      backing:NSBackingStoreBuffered defer:NO];
++        win.title = @"fps-probe";
++        gView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
++        gView.wantsLayer = YES;
++        win.contentView = gView;
++        [win makeKeyAndOrderFront:nil];
++        [NSApp activateIgnoringOtherApps:YES];
++
++        CVDisplayLinkRef link;
++        CVDisplayLinkCreateWithActiveCGDisplays(&link);
++        CVDisplayLinkSetOutputCallback(link, tick, NULL);
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++            gTicks = gCommits = 0;
++            uint64_t t0 = mach_absolute_time();
++            CVDisplayLinkStart(link);
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++                CVDisplayLinkStop(link);
++                mach_timebase_info_data_t tb;
++                mach_timebase_info(&tb);
++                double el = (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e9;
++                printf("elapsed %.2f s  display-link nominal %.1f Hz  ticks %.1f/s  commits %.1f/s\n", el, gNominal,
++                       gTicks / el, gCommits / el);
++                fflush(stdout);
++                exit(0);
++            });
++        });
++        [NSApp run];
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/list-modes.m
+@@ -0,0 +1,20 @@
++// list-modes: every mode of the main display (including the ones System Settings hides), with refresh rate, the
++// pixel size behind it (HiDPI backing) and whether it is the current one.  Read-only.
++// Build: clang -fobjc-arc -framework CoreGraphics -framework Foundation list-modes.m -o list-modes
++#import <CoreGraphics/CoreGraphics.h>
++#import <Foundation/Foundation.h>
++int main(void)
++{
++    CGDirectDisplayID d = CGMainDisplayID();
++    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(d);
++    NSDictionary *opt = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
++    NSArray *modes = CFBridgingRelease(CGDisplayCopyAllDisplayModes(d, (__bridge CFDictionaryRef)opt));
++    for (id m in modes) {
++        CGDisplayModeRef r = (__bridge CGDisplayModeRef)m;
++        printf("%c %4zux%-4zu px %4zux%-4zu %7.2f Hz id %d usable %d\n", CGDisplayModeGetIODisplayModeID(r) == CGDisplayModeGetIODisplayModeID(cur) ? '*' : ' ',
++               CGDisplayModeGetWidth(r), CGDisplayModeGetHeight(r), CGDisplayModeGetPixelWidth(r), CGDisplayModeGetPixelHeight(r),
++               CGDisplayModeGetRefreshRate(r), CGDisplayModeGetIODisplayModeID(r), CGDisplayModeIsUsableForDesktopGUI(r));
++    }
++    CGDisplayModeRelease(cur);
++    return 0;
++}
+--- /dev/null
++++ b/tools/lockseed-test.c
+@@ -0,0 +1,79 @@
++// lockseed-test: does a user-space IOSurfaceLock reach the kernel's IOSurface::lockSurface (and bump its lock seed)?
++// Creates a surface, reads its kernel lock/unlock seeds through XeGfxAccel's DRM client (selector 3), locks it
++// read-only 3 times and read-write 2 times, and reads the seeds again.  Expect +5 locks if every lock goes through
++// the kernel (docs/36-APPLE-INTEL-DRIVER.md §36.9: what the accel's lock watch counts).
++// Build: clang -framework IOSurface -framework IOKit -framework CoreFoundation lockseed-test.c -o lockseed-test
++#include <IOKit/IOKitLib.h>
++#include <IOSurface/IOSurfaceRef.h>
++#include <CoreFoundation/CoreFoundation.h>
++#include <stdio.h>
++#include <string.h>
++
++static io_connect_t open_xgdr(void)
++{
++    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("NMXAccel"));
++    io_connect_t c = 0;
++    if (!s) return 0;
++    if (IOServiceOpen(s, mach_task_self(), 0x58474452u /* 'XGDR' */, &c) != KERN_SUCCESS) c = 0;
++    IOObjectRelease(s);
++    return c;
++}
++
++static int seeds(io_connect_t c, uint32_t id, uint64_t *ls, uint64_t *us)
++{
++    uint64_t in = id, out[2] = { 0, 0 };
++    uint32_t n = 2;
++    kern_return_t kr = IOConnectCallScalarMethod(c, 3, &in, 1, out, &n);
++    *ls = out[0]; *us = out[1];
++    return kr == KERN_SUCCESS;
++}
++
++// §36.12: with an observer device cache of the accel's made current (selector 4), a CPU lock should call its control
++// function: op 0 (page-off) then op 2 (wait); a second lock without making it current again should call nothing.
++static void dc(io_connect_t c, uint32_t id, const char *what)
++{
++    uint64_t in = id, out[3] = { 0, 0, 0 };
++    uint32_t n = 3;
++    kern_return_t kr = IOConnectCallScalarMethod(c, 4, &in, 1, out, &n);
++    printf("  %-44s kr 0x%x  page-off %llu  wait %llu  other %llu\n", what, kr, out[0], out[1], out[2]);
++}
++
++int main(int argc, char **argv)
++{
++    int w = 64, h = 64, bpe = 4;
++    CFNumberRef nw = CFNumberCreate(NULL, kCFNumberIntType, &w), nh = CFNumberCreate(NULL, kCFNumberIntType, &h),
++                nb = CFNumberCreate(NULL, kCFNumberIntType, &bpe);
++    const void *k[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement };
++    const void *v[] = { nw, nh, nb };
++    CFDictionaryRef p = CFDictionaryCreate(NULL, k, v, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    IOSurfaceRef s = IOSurfaceCreate(p);
++    io_connect_t c = open_xgdr();
++    uint64_t l0, u0, l1, u1;
++    if (!s || !c) { fprintf(stderr, "surface %p, XGDR client %u\n", (void *)s, c); return 1; }
++    const uint32_t id = IOSurfaceGetID(s);
++    if (!seeds(c, id, &l0, &u0)) { fprintf(stderr, "selector 3 refused (old accel?)\n"); return 1; }
++    for (int i = 0; i < 3; i++) { IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL); IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL); }
++    for (int i = 0; i < 2; i++) { IOSurfaceLock(s, 0, NULL); ((volatile char *)IOSurfaceGetBaseAddress(s))[0] = (char)i; IOSurfaceUnlock(s, 0, NULL); }
++    seeds(c, id, &l1, &u1);
++    printf("surface %u: lock seed %llu -> %llu (+%llu), unlock seed %llu -> %llu (+%llu) after 3 read-only + 2 write locks\n",
++           id, l0, l1, l1 - l0, u0, u1, u1 - u0);
++    if (argc > 1 && !strcmp(argv[1], "--dc")) {
++        printf("device cache (selector 4; each call makes the cache current again and prints the counts before it):\n");
++        dc(c, id, "attach + current");
++        IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL); IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
++        IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL); IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
++        dc(c, id, "after 2 read-only locks (expect +1 page-off)");
++        IOSurfaceLock(s, 0, NULL); ((volatile char *)IOSurfaceGetBaseAddress(s))[1] = 7; IOSurfaceUnlock(s, 0, NULL);
++        dc(c, id, "after 1 write lock");
++        IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL); IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
++        dc(c, id, "after 1 read-only lock");
++        dc(c, id | 0x80000000u, "release our cache (bit 31)");
++        CFRelease(s); s = NULL;
++        IOSurfaceRef t = IOSurfaceCreate(p);
++        const uint32_t id2 = IOSurfaceGetID(t);
++        dc(c, id2, "another surface: attach + current");
++        dc(c, id2 | 0x80000000u, "release it again, no lock in between");
++        CFRelease(t);
++    }
++    return 0;
++}
+--- a/tools/m3db-preflight.sh
++++ b/tools/m3db-preflight.sh
+@@ -35,9 +35,9 @@
+ # ---------------------------------------------------------------- pins
+ # 与本轮审计候选及 AuxKC UUID 校验后的装机 sha 对齐。
+ # accel 同时校验本轮修复二进制 pin 与已验证的 Xe Metal personality。
+-PIN_CORE=41e96cec5b437b957428a3fb129dcae465a6343a9d8b7f8b4785c5272df5646e
++PIN_CORE=b4f5881deb2597714b7a8a40a0ee6741740097201a3a55fecd62c68c25fe64cb
+ # M3d-b: downstream controller, registration, import and present audit fixes.
+-PIN_ADAPTER=ab7e9ec86a58d9c4e6dd3a11b8fe1cb8feb599602f05473157782b971f5d71e8
++PIN_ADAPTER=ec3be6125c56bb68d5b3880ab922e50480d1ff1cfd5f6f60982f7f57ffc6a7b9
+ PIN_AGDC=93d175c1e1ce17974cf182d26717c6232bddb21c5172f0a7c3c7b06a9762f57a
+ PIN_INTELFB=4adce586aa112e6ab9bb9ab9592f632f68055266c17f6c2bb3db518ff7d6b30e
+ 
+--- a/tools/m4a2-bootguard.sh
++++ b/tools/m4a2-bootguard.sh
+@@ -809,7 +809,10 @@
+     # Do not fail a stage while the claim node itself has not appeared yet:
+     # launchd may start us before the framebuffer probe publishes the claim
+     # (the claim node's own t is the true boot reference for every stage).
+-    if [ "${CLAIM_PRESENT:-0}" = 0 ] && [ "$(elapsed)" -lt "$CLAIM_NODE_GRACE" ]; then
++    # The same while the claim node exists but has not started: probe publishes it, its attributes (t among them)
++    # come from start, and start can lag probe by tens of seconds -- 2026-10-30 22:50 the guard failed the core
++    # stage at 21 s on a claim with no t (start came 50 s after probe) and reverted a healthy boot to IntelFB.
++    if { [ "${CLAIM_PRESENT:-0}" = 0 ] || [ -z "${CLAIM_T:-}" ]; } && [ "$(elapsed)" -lt "$CLAIM_NODE_GRACE" ]; then
+         return 1
+     fi
+     if [ -n "${CLAIM_T:-}" ]; then
+--- /dev/null
++++ b/tools/mark-timeout-watch.sh
+@@ -0,0 +1,9 @@
++#!/bin/sh
++# §32.15: prints a timestamped line whenever a surface-mark wait times out (100 ms) or the flip worker's longest mark
++# wait grows, with the snapshot and idle counters next to it.  Read-only.  Usage: mark-timeout-watch.sh [seconds=1800]
++end=$(( $(date +%s) + ${1:-1800} )); last=""
++while [ "$(date +%s)" -lt "$end" ]; do
++    cur=$(sysctl -n debug.xegfxaccel_surface_gpu_timeouts debug.xegfxaccel_iop_xe_mark_max_us debug.xegfxaccel_iop_xe_snap_timeouts debug.xegfxaccel_iop_xe_idle_forced | tr '\n' ' ')
++    [ "$cur" != "$last" ] && echo "$(date +%H:%M:%S) timeouts/mark_max_us/snap_timeouts/idle_forced $cur"
++    last=$cur; sleep 0.5
++done
+--- /dev/null
++++ b/tools/pass-bench.m
+@@ -0,0 +1,124 @@
++// pass-bench: GPU time of one WindowServer-like composite pass (3840x2400 BGRA8, load action Load, a full-screen quad
++// that samples a 3840x2400 source and blends over the target) on XeMTL, with the target and the source each either an
++// IOSurface-backed texture (what WindowServer renders into and samples) or a private texture.  Wall time per pass over
++// N passes with one wait at the end, so it is the GPU throughput.  Read-only.
++// Build: clang -fobjc-arc -framework Foundation -framework Metal -framework IOSurface pass-bench.m -o pass-bench
++// Usage: pass-bench [passes=60] [width=3840] [height=2400]
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#import <IOSurface/IOSurface.h>
++#include <mach/mach_time.h>
++
++static const char *kSrc =
++    "#include <metal_stdlib>\nusing namespace metal;\n"
++    "struct V { float4 p [[position]]; float2 uv; };\n"
++    "vertex V vs(uint i [[vertex_id]]) { float2 q = float2((i << 1) & 2, i & 2); V v; v.p = float4(q * 2 - 1, 0, 1); v.uv = float2(q.x, 1 - q.y); return v; }\n"
++    "fragment float4 fs_tex(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { return t.sample(s, v.uv) * 0.5; }\n"
++    "fragment float4 fs_fill(V v [[stage_in]]) { return float4(0.2, 0.4, 0.6, 0.5); }\n";
++
++static double now(void)
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info(&tb);
++    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
++}
++
++// kind 0 private (tiled), 1 IOSurface (linear, the surface's own pages), 2/3 linear in a private/shared MTLBuffer
++static id<MTLTexture> tex(id<MTLDevice> d, int w, int h, int surface)
++{
++    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
++    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++    if (!surface) { td.storageMode = MTLStorageModePrivate; return [d newTextureWithDescriptor:td]; }
++    if (surface >= 2) {
++        const NSUInteger rb = ((NSUInteger)w * 4 + 255) & ~(NSUInteger)255;
++        id<MTLBuffer> b = [d newBufferWithLength:rb * h options:surface == 2 ? MTLResourceStorageModePrivate : MTLResourceStorageModeShared];
++        td.storageMode = surface == 2 ? MTLStorageModePrivate : MTLStorageModeShared;
++        return [b newTextureWithDescriptor:td offset:0 bytesPerRow:rb];
++    }
++    NSDictionary *p = @{ (id)kIOSurfaceWidth: @(w), (id)kIOSurfaceHeight: @(h), (id)kIOSurfaceBytesPerElement: @4,
++                         (id)kIOSurfacePixelFormat: @((unsigned)'BGRA'), (id)kIOSurfaceBytesPerRow: @(((w * 4) + 63) & ~63) };
++    IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)p);
++    td.storageMode = MTLStorageModeManaged;
++    id<MTLTexture> t = [d newTextureWithDescriptor:td iosurface:s plane:0];
++    CFRelease(s);
++    return t;
++}
++
++int main(int argc, char **argv)
++{
++    @autoreleasepool {
++        const int n = argc > 1 ? atoi(argv[1]) : 60, w = argc > 2 ? atoi(argv[2]) : 3840, h = argc > 3 ? atoi(argv[3]) : 2400;
++        id<MTLDevice> d = nil;   // the Intel GPU WindowServer composites on, not the default (discrete) device
++        for (id<MTLDevice> x in MTLCopyAllDevices()) {
++            printf("device: %s\n", x.name.UTF8String);
++            if (!d && ([x.name containsString:@"Intel"] || [x.name containsString:@"Xe"])) d = x;
++        }
++        if (!d) { fprintf(stderr, "no Intel device\n"); return 1; }
++        NSError *e = nil;
++        id<MTLLibrary> lib = [d newLibraryWithSource:@(kSrc) options:nil error:&e];
++        if (!lib) { fprintf(stderr, "library: %s\n", e.description.UTF8String); return 1; }
++        id<MTLRenderPipelineState> ps[2];
++        for (int k = 0; k < 2; k++) {
++            MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
++            pd.vertexFunction = [lib newFunctionWithName:@"vs"];
++            pd.fragmentFunction = [lib newFunctionWithName:k ? @"fs_fill" : @"fs_tex"];
++            pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
++            pd.colorAttachments[0].blendingEnabled = YES;
++            pd.colorAttachments[0].sourceRGBBlendFactor = pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
++            pd.colorAttachments[0].destinationRGBBlendFactor = pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++            ps[k] = [d newRenderPipelineStateWithDescriptor:pd error:&e];
++            if (!ps[k]) { fprintf(stderr, "pipeline: %s\n", e.description.UTF8String); return 1; }
++        }
++        id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
++        id<MTLCommandQueue> q = [d newCommandQueue];
++        id<MTLBuffer> noise = [d newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared];
++        { uint32_t *p = noise.contents, x = 2463534242u; for (size_t i = 0; i < (size_t)w * h; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; p[i] = x; } }
++        void (^fill)(id<MTLTexture>) = ^(id<MTLTexture> t) {
++            id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
++            [b copyFromBuffer:noise sourceOffset:0 sourceBytesPerRow:w * 4 sourceBytesPerImage:(NSUInteger)w * h * 4 sourceSize:MTLSizeMake(w, h, 1)
++                    toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
++            [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
++        };
++        const int layers = getenv("LAYERS") ? atoi(getenv("LAYERS")) : 4;
++        printf("%s, %dx%d, %d passes each, %d full-screen layers per pass, random content\n", d.name.UTF8String, w, h, n, layers);
++        const char *nm[4] = { "private", "iosurface", "linbuf-prv", "linbuf-shr" };
++        for (int round = 0; round < 1; round++) for (int shader = 1; shader >= 0; shader--)
++            for (int dst = 0; dst < 4; dst++)
++                for (int src = 0; src < (shader ? 1 : 2); src++) {
++                    id<MTLTexture> T = tex(d, w, h, dst), S = shader ? nil : tex(d, w, h, src);
++                    if (!T) { printf("%-9s target: not available\n", nm[dst]); continue; }
++                    fill(T); if (S) fill(S);
++                    double best = 1e9, gpu = -1;
++                    for (int rep = 0; rep < 3; rep++) {
++                        double t0 = now();
++                        id<MTLCommandBuffer> last = nil;
++                        NSMutableArray *all = [NSMutableArray new];
++                        for (int i = 0; i < n; i++) {
++                            id<MTLCommandBuffer> cb = [q commandBuffer];
++                            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
++                            rp.colorAttachments[0].texture = T;
++                            rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
++                            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++                            id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
++                            [en setRenderPipelineState:ps[shader]];
++                            if (!shader) { [en setFragmentTexture:S atIndex:0]; [en setFragmentSamplerState:smp atIndex:0]; }
++                            for (int k = 0; k < layers; k++) [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++                            [en endEncoding];
++                            [cb commit];
++                            [all addObject:cb];
++                            last = cb;
++                        }
++                        [last waitUntilCompleted];
++                        const double ms = (now() - t0) / n;
++                        if (ms < best) best = ms;
++                        NSMutableArray *g = [NSMutableArray new];
++                        for (id<MTLCommandBuffer> c in all) if (c.GPUEndTime > c.GPUStartTime) [g addObject:@((c.GPUEndTime - c.GPUStartTime) * 1e3)];
++                        [g sortUsingSelector:@selector(compare:)];
++                        if (g.count) gpu = [g[g.count / 2] doubleValue];
++                    }
++                    if (shader) printf("fill blend      -> %-9s  %6.2f ms/pass wall  %6.2f ms gpu (median)\n", nm[dst], best, gpu);
++                    else printf("sample %-9s-> %-9s  %6.2f ms/pass wall  %6.2f ms gpu (median)\n", nm[src], nm[dst], best, gpu);
++                }
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/passtime-sizes.py
+@@ -0,0 +1,19 @@
++# passtime-sizes: per (target size, shader pair) pass time and per-draw time, and the cb distribution, for one or two
++# passtime logs with draw counts (§36.12 genie captures).  Usage: passtime-sizes.py a.log [b.log]
++import re, sys, collections
++def load(f):
++    d = collections.defaultdict(list); cb = collections.defaultdict(float)
++    for l in open(f):
++        m = re.match(r'cb (\d+) pass \d+ (\d+x\d+) fmt \d+ gpu_us ([\d.]+) gap_us [\d.]+ fs (\w+) (\w+) \w+ \w+ draws (\d+)', l)
++        if m: d[(m[2], m[4] + ' ' + m[5])].append((float(m[3]) / 1e3, int(m[6]))); cb[m[1]] += float(m[3]) / 1e3
++    return d, sorted(cb.values())
++logs = [load(f) for f in sys.argv[1:]]
++for f, (d, v) in zip(sys.argv[1:], logs):
++    print('%s: %d cbs  p50 %.2f p90 %.2f p99 %.1f max %.1f ms; >8 ms %d, >12 ms %d' % (f.split('/')[-2], len(v), v[len(v)//2], v[int(.9*len(v))], v[int(.99*len(v))], v[-1], sum(1 for x in v if x > 8), sum(1 for x in v if x > 12)))
++keys = [('3840x2340', '394291c7 44d03494'), ('3979x2479', '394291c7 44d03494'), ('4067x2567', '394291c7 44d03494'), ('3979x2479', 'c8ba9c29 c8f53aed'), ('3840x2400', 'f1c2052c 00000000'), ('3840x2400', '394291c7 44d03494')]
++for k in keys:
++    out = []
++    for d, _ in logs:
++        r = sorted(d.get(k, []))
++        out.append('n=%4d med %6.2f ms max %6.2f, %6.0f us/draw' % (len(r), r[len(r)//2][0], r[-1][0], sorted(x[0] * 1e3 / max(x[1], 1) for x in r)[len(r)//2]) if r else 'n=   0')
++    print('%-10s %-18s | %s' % (k[0], k[1], ' | '.join(out)))
+--- /dev/null
++++ b/tools/passtime-summ.py
+@@ -0,0 +1,13 @@
++# passtime-summ: summarise a WindowServer nvmtl-passtime log (§32.17): per-cb GPU time and time per target size.
++import sys, re, statistics as st
++from collections import defaultdict
++cb, size = defaultdict(float), defaultdict(lambda: [0, 0.0])
++for l in open(sys.argv[1]):
++    m = re.match(r'cb (\d+) pass \d+ (\d+x\d+) fmt \d+ gpu_us ([\d.]+)', l)
++    if not m: continue
++    cb[int(m[1])] += float(m[3]); size[m[2]][0] += 1; size[m[2]][1] += float(m[3])
++v = sorted(cb.values()); tot = sum(v)
++q = lambda p: v[min(len(v) - 1, int(p * len(v)))]
++print('%d cbs, %d passes, GPU %.1f ms total; per cb p50 %.2f p90 %.2f max %.2f ms' % (len(v), sum(n for n, _ in size.values()), tot / 1e3, q(.5) / 1e3, q(.9) / 1e3, v[-1] / 1e3))
++for s, (n, us) in sorted(size.items(), key=lambda x: -x[1][1])[:6]:
++    print('  %-10s %5d passes  avg %6.2f ms  %4.1f%% of GPU' % (s, n, us / n / 1e3, 100 * us / tot))
+--- /dev/null
++++ b/tools/rt-bench.c
+@@ -0,0 +1,361 @@
++// rt-bench: GPU time of a WindowServer-like pass on the Intel GPU straight through ANV (no XeMTL in between):
++// a 3840x2400 B8G8R8A8 render target, load op LOAD, LAYERS full-screen triangles of a constant colour blended over it
++// (premultiplied over), random initial content.  The target is, in turn:
++//   optimal tiling in each device memory type, linear tiling in each memory type, and linear tiling on imported host
++//   pages (VK_EXT_external_memory_host, the i915 userptr that IOSurface pages become).
++// So the cost of the IOSurface target splits into layout (optimal vs linear in the same memory) and memory (device
++// memory vs imported pages, both linear).  GPU time from timestamps, median of PASSES.  Read-only.
++// Build: clang -O1 -I<Vulkan-Headers>/include rt-bench.c -o rt-bench -L/Library/GPUBundles/xemtl -lvulkan.1
++// Run:   VK_ICD_FILENAMES=/Library/GPUBundles/xemtl/intel_icd.json ./rt-bench [passes=30] [layers=4]
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#define W 3840
++#define H 2400
++#define CK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s:%d %s = %d\n", __FILE__, __LINE__, #x, r_); exit(1); } } while (0)
++
++// Hand-assembled SPIR-V 1.0.  vs: gl_Position = vec4(float((i << 1) & 2) * 2 - 1, float(i & 2) * 2 - 1, 0, 1).
++static const uint32_t kVs[] = {
++    0x07230203, 0x00010000, 0, 40, 0,
++    (2 << 16) | 17, 1,                                           // OpCapability Shader
++    (3 << 16) | 14, 0, 1,                                        // OpMemoryModel Logical GLSL450
++    (7 << 16) | 15, 0, 1, 0x6e69616d, 0, 2, 3,                   // OpEntryPoint Vertex %1 "main" %2 %3
++    (4 << 16) | 71, 2, 11, 42,                                   // OpDecorate %2 BuiltIn VertexIndex
++    (4 << 16) | 71, 3, 11, 0,                                    // OpDecorate %3 BuiltIn Position
++    (2 << 16) | 19, 4,                                           // %4 void
++    (3 << 16) | 33, 5, 4,                                        // %5 fn void
++    (4 << 16) | 21, 6, 32, 1,                                    // %6 int
++    (3 << 16) | 22, 7, 32,                                       // %7 float
++    (4 << 16) | 23, 8, 7, 4,                                     // %8 vec4
++    (4 << 16) | 32, 9, 1, 6,                                     // %9 ptr Input int
++    (4 << 16) | 32, 10, 3, 8,                                    // %10 ptr Output vec4
++    (4 << 16) | 59, 9, 2, 1,                                     // %2 var Input
++    (4 << 16) | 59, 10, 3, 3,                                    // %3 var Output
++    (4 << 16) | 43, 6, 11, 1,                                    // %11 int 1
++    (4 << 16) | 43, 6, 12, 2,                                    // %12 int 2
++    (4 << 16) | 43, 7, 13, 0x40000000,                           // %13 float 2.0
++    (4 << 16) | 43, 7, 14, 0x3f800000,                           // %14 float 1.0
++    (4 << 16) | 43, 7, 15, 0,                                    // %15 float 0.0
++    (5 << 16) | 54, 4, 1, 0, 5,                                  // %1 = OpFunction void None %5
++    (2 << 16) | 248, 16,                                         // OpLabel
++    (4 << 16) | 61, 6, 17, 2,                                    // %17 = load i
++    (5 << 16) | 196, 6, 18, 17, 11,                              // %18 = i << 1
++    (5 << 16) | 199, 6, 19, 18, 12,                              // %19 = & 2
++    (5 << 16) | 199, 6, 20, 17, 12,                              // %20 = i & 2
++    (4 << 16) | 111, 7, 21, 19,                                  // %21 = float
++    (4 << 16) | 111, 7, 22, 20,                                  // %22 = float
++    (5 << 16) | 133, 7, 23, 21, 13,                              // %23 = *2
++    (5 << 16) | 133, 7, 24, 22, 13,                              // %24 = *2
++    (5 << 16) | 131, 7, 25, 23, 14,                              // %25 = -1
++    (5 << 16) | 131, 7, 26, 24, 14,                              // %26 = -1
++    (7 << 16) | 80, 8, 27, 25, 26, 15, 14,                       // %27 = vec4(x, y, 0, 1)
++    (3 << 16) | 62, 3, 27,                                       // store
++    (1 << 16) | 253, (1 << 16) | 56,                             // OpReturn OpFunctionEnd
++};
++// fs: out vec4 c (location 0) = vec4(0.2, 0.4, 0.6, 0.5)
++static const uint32_t kFs[] = {
++    0x07230203, 0x00010000, 0, 20, 0,
++    (2 << 16) | 17, 1,
++    (3 << 16) | 14, 0, 1,
++    (6 << 16) | 15, 4, 1, 0x6e69616d, 0, 2,                      // OpEntryPoint Fragment %1 "main" %2
++    (3 << 16) | 16, 1, 7,                                        // OpExecutionMode OriginUpperLeft
++    (4 << 16) | 71, 2, 30, 0,                                    // OpDecorate %2 Location 0
++    (2 << 16) | 19, 4,
++    (3 << 16) | 33, 5, 4,
++    (3 << 16) | 22, 7, 32,
++    (4 << 16) | 23, 8, 7, 4,
++    (4 << 16) | 32, 10, 3, 8,
++    (4 << 16) | 59, 10, 2, 3,
++    (4 << 16) | 43, 7, 11, 0x3e4ccccd,                           // 0.2
++    (4 << 16) | 43, 7, 12, 0x3ecccccd,                           // 0.4
++    (4 << 16) | 43, 7, 13, 0x3f19999a,                           // 0.6
++    (4 << 16) | 43, 7, 14, 0x3f000000,                           // 0.5
++    (7 << 16) | 44, 8, 15, 11, 12, 13, 14,                       // OpConstantComposite
++    (5 << 16) | 54, 4, 1, 0, 5,
++    (2 << 16) | 248, 16,
++    (3 << 16) | 62, 2, 15,
++    (1 << 16) | 253, (1 << 16) | 56,
++};
++
++static VkDevice dev; static VkPhysicalDevice pd; static VkQueue queue; static VkCommandPool pool;
++static VkPhysicalDeviceMemoryProperties mp; static float tsPeriod;
++static VkRenderPass rp; static VkPipeline pipe; static VkBuffer noise; static VkDeviceMemory noiseMem;
++static PFN_vkGetMemoryHostPointerPropertiesEXT hostProps; static uint32_t gFam;
++
++static uint32_t memType(uint32_t bits, VkMemoryPropertyFlags want)
++{
++    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
++    return UINT32_MAX;
++}
++static VkShaderModule shader(const uint32_t *code, size_t len)
++{
++    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, len, code };
++    VkShaderModule m; CK(vkCreateShaderModule(dev, &ci, NULL, &m)); return m;
++}
++static VkCommandBuffer begin(void)
++{
++    VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
++    VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev, &ai, &cb));
++    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
++    CK(vkBeginCommandBuffer(cb, &bi)); return cb;
++}
++static void finish(VkCommandBuffer cb)
++{
++    CK(vkEndCommandBuffer(cb));
++    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL };
++    CK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); CK(vkQueueWaitIdle(queue));
++    vkFreeCommandBuffers(dev, pool, 1, &cb);
++}
++static int cmpd(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
++
++// kind: 0 optimal in memory type mt, 1 linear in memory type mt, 2 linear on imported host pages,
++//       3 Tile4 (DRM modifier I915_FORMAT_MOD_4_TILED, row pitch 15360) on imported host pages, 4 optimal on host pages
++#define MOD_4_TILED 0x0100000000000009ull
++static void run(int kind, uint32_t mt, int passes, int layers)
++{
++    VkSubresourceLayout pl0 = { 0, 0, (VkDeviceSize)W * 4, 0, 0 };
++    VkImageDrmFormatModifierExplicitCreateInfoEXT mod = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, NULL, MOD_4_TILED, 1, &pl0 };
++    VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, kind == 3 ? &mod : NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
++    const VkImageTiling tiling = kind == 3 ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT : (kind == 1 || kind == 2) ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, kind >= 2 ? &ext : NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM,
++        { W, H, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, tiling,
++        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
++    VkImage img; { VkResult cr = vkCreateImage(dev, &ii, NULL, &img); if (cr != VK_SUCCESS) { printf("  kind %d: image refused (%d)\n", kind, cr); return; } }
++    VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img, &mr);
++    VkDeviceMemory mem; void *host = NULL;
++    char what[160];
++    if (kind >= 2) {
++        size_t sz = (mr.size + 65535) & ~(size_t)65535;
++        if (posix_memalign(&host, 65536, sz)) exit(1);
++        memset(host, 0x5a, sz);
++        VkMemoryHostPointerPropertiesEXT hp = { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
++        CK(hostProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hp));
++        uint32_t t = memType(hp.memoryTypeBits & mr.memoryTypeBits, 0);
++        VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host };
++        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, sz, t };
++        if (t == UINT32_MAX || vkAllocateMemory(dev, &ai, NULL, &mem) != VK_SUCCESS) { printf("  kind %d: host import refused (bits %#x & %#x)\n", kind, hp.memoryTypeBits, mr.memoryTypeBits); return; }
++        snprintf(what, sizeof what, "%s on imported host pages (type %u, size %llu)", kind == 3 ? "Tile4  " : kind == 4 ? "optimal" : "linear ", t, (unsigned long long)mr.size);
++    } else {
++        if (!(mr.memoryTypeBits & (1u << mt))) { vkDestroyImage(dev, img, NULL); return; }
++        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, mt };
++        CK(vkAllocateMemory(dev, &ai, NULL, &mem));
++        const VkMemoryPropertyFlags f = mp.memoryTypes[mt].propertyFlags;
++        snprintf(what, sizeof what, "%s in memory type %u (%s%s%s%s)", kind ? "linear " : "optimal", mt,
++                 f & 1 ? "DEVICE_LOCAL " : "", f & 2 ? "HOST_VISIBLE " : "", f & 4 ? "COHERENT " : "", f & 8 ? "CACHED" : "");
++    }
++    { VkResult br = vkBindImageMemory(dev, img, mem, 0); if (br != VK_SUCCESS) { printf("  kind %d: bind refused (%d)\n", kind, br); return; } }
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM,
++        { 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    VkImageView view; CK(vkCreateImageView(dev, &vi, NULL, &view));
++    VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, rp, 1, &view, W, H, 1 };
++    VkFramebuffer fb; CK(vkCreateFramebuffer(dev, &fi, NULL, &fb));
++
++    // random content, then GENERAL for the passes
++    VkCommandBuffer cb = begin();
++    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++    VkBufferImageCopy cp = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { W, H, 1 } };
++    vkCmdCopyBufferToImage(cb, noise, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
++    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++    finish(cb);
++
++    VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * (uint32_t)passes, 0 };
++    VkQueryPool qp; CK(vkCreateQueryPool(dev, &qi, NULL, &qp));
++    cb = begin();
++    vkCmdResetQueryPool(cb, qp, 0, 2 * passes);
++    for (int p = 0; p < passes; p++) {
++        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * p);
++        VkRenderPassBeginInfo rbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, rp, fb, { { 0, 0 }, { W, H } }, 0, NULL };
++        vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
++        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++        for (int l = 0; l < layers; l++) vkCmdDraw(cb, 3, 1, 0, 0);
++        vkCmdEndRenderPass(cb);
++        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * p + 1);
++    }
++    finish(cb);
++    uint64_t *ts = calloc(2 * passes, 8); double *ms = calloc(passes, sizeof *ms);
++    CK(vkGetQueryPoolResults(dev, qp, 0, 2 * passes, 16 * passes, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
++    for (int p = 0; p < passes; p++) ms[p] = (double)(ts[2 * p + 1] - ts[2 * p]) * tsPeriod / 1e6;
++    qsort(ms, passes, sizeof *ms, cmpd);
++    printf("  %-62s %7.2f ms gpu (median), min %.2f\n", what, ms[passes / 2], ms[0]);
++    free(ts); free(ms);
++    vkDestroyQueryPool(dev, qp, NULL); vkDestroyFramebuffer(dev, fb, NULL); vkDestroyImageView(dev, view, NULL);
++    vkDestroyImage(dev, img, NULL); vkFreeMemory(dev, mem, NULL); free(host);
++}
++
++// The tiled-shadow alternative: what one optimal -> linear copy of the whole target costs (vkCmdCopyImage, blorp)
++static void copybench(int passes)
++{
++    VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
++    VkImage im[2]; VkDeviceMemory mm[2]; void *host = NULL;
++    for (int k = 0; k < 2; k++) {
++        VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, k ? &ext : NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM,
++            { W, H, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, k ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL,
++            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
++        CK(vkCreateImage(dev, &ii, NULL, &im[k]));
++        VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, im[k], &mr);
++        VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, NULL };
++        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, memType(mr.memoryTypeBits, 0) };
++        if (k) { size_t sz = (mr.size + 65535) & ~(size_t)65535; if (posix_memalign(&host, 65536, sz)) exit(1); memset(host, 0x33, sz); imp.pHostPointer = host; ai.pNext = &imp; ai.allocationSize = sz; }
++        CK(vkAllocateMemory(dev, &ai, NULL, &mm[k])); CK(vkBindImageMemory(dev, im[k], mm[k], 0));
++    }
++    VkCommandBuffer cb = begin();
++    VkImageMemoryBarrier b[2];
++    for (int k = 0; k < 2; k++) b[k] = (VkImageMemoryBarrier){ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++        VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im[k], { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, b);
++    VkBufferImageCopy cp = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { W, H, 1 } };
++    vkCmdCopyBufferToImage(cb, noise, im[0], VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
++    finish(cb);
++    VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * (uint32_t)passes, 0 };
++    VkQueryPool qp; CK(vkCreateQueryPool(dev, &qi, NULL, &qp));
++    cb = begin();
++    vkCmdResetQueryPool(cb, qp, 0, 2 * passes);
++    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
++    VkImageCopy ic = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { W, H, 1 } };
++    for (int p = 0; p < passes; p++) {
++        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * p);
++        vkCmdCopyImage(cb, im[0], VK_IMAGE_LAYOUT_GENERAL, im[1], VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
++        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * p + 1);
++    }
++    finish(cb);
++    uint64_t *ts = calloc(2 * passes, 8); double *ms = calloc(passes, sizeof *ms);
++    CK(vkGetQueryPoolResults(dev, qp, 0, 2 * passes, 16 * passes, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
++    for (int p = 0; p < passes; p++) ms[p] = (double)(ts[2 * p + 1] - ts[2 * p]) * tsPeriod / 1e6;
++    qsort(ms, passes, sizeof *ms, cmpd);
++    printf("  queue family %u: %-46s %7.2f ms gpu (median), min %.2f\n", gFam, "copy optimal -> linear image on host pages", ms[passes / 2], ms[0]);
++    {   VkExternalMemoryBufferCreateInfo eb = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT };
++        const size_t sz = ((size_t)W * H * 4 + 65535) & ~(size_t)65535; void *hb; if (posix_memalign(&hb, 65536, sz)) exit(1); memset(hb, 0x44, sz);
++        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb, 0, sz, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
++        VkBuffer buf; CK(vkCreateBuffer(dev, &bci, NULL, &buf));
++        VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, buf, &br);
++        VkImportMemoryHostPointerInfoEXT imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hb };
++        VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, sz, memType(br.memoryTypeBits, 0) };
++        VkDeviceMemory bm; CK(vkAllocateMemory(dev, &ai, NULL, &bm)); CK(vkBindBufferMemory(dev, buf, bm, 0));
++        cb = begin();
++        vkCmdResetQueryPool(cb, qp, 0, 2 * passes);
++        VkBufferImageCopy bc = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { W, H, 1 } };
++        for (int p = 0; p < passes; p++) {
++            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * p);
++            vkCmdCopyImageToBuffer(cb, im[0], VK_IMAGE_LAYOUT_GENERAL, buf, 1, &bc);
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * p + 1);
++        }
++        finish(cb);
++        CK(vkGetQueryPoolResults(dev, qp, 0, 2 * passes, 16 * passes, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
++        for (int p = 0; p < passes; p++) ms[p] = (double)(ts[2 * p + 1] - ts[2 * p]) * tsPeriod / 1e6;
++        qsort(ms, passes, sizeof *ms, cmpd);
++        printf("  queue family %u: %-46s %7.2f ms gpu (median), min %.2f\n", gFam, "copy optimal -> buffer on host pages", ms[passes / 2], ms[0]);
++    }
++}
++
++int main(int argc, char **argv)
++{
++    const int passes = argc > 1 ? atoi(argv[1]) : 30, layers = argc > 2 ? atoi(argv[2]) : 4;
++    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "rt-bench", 1, NULL, 0, VK_API_VERSION_1_3 };
++    const char *iext[] = { "VK_KHR_portability_enumeration" };
++    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR, &app, 0, NULL, 1, iext };
++    VkInstance inst;
++    if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS) { ici.flags = 0; ici.enabledExtensionCount = 0; CK(vkCreateInstance(&ici, NULL, &inst)); }
++    uint32_t n = 8; VkPhysicalDevice pds[8]; CK(vkEnumeratePhysicalDevices(inst, &n, pds));
++    pd = NULL;
++    for (uint32_t i = 0; i < n && !pd; i++) { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i], &p); if (p.vendorID == 0x8086) pd = pds[i]; }
++    if (!pd) { fprintf(stderr, "no Intel device\n"); return 1; }
++    VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props); tsPeriod = props.limits.timestampPeriod;
++    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++    printf("%s, %dx%d B8G8R8A8, %d full-screen blended layers per pass, %d passes\n", props.deviceName, W, H, layers, passes);
++    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) printf("  memory type %u: flags %#x heap %u\n", i, mp.memoryTypes[i].propertyFlags, mp.memoryTypes[i].heapIndex);
++    float pri = 1;
++    uint32_t nq = 8; VkQueueFamilyProperties qf[8]; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
++    for (uint32_t i = 0; i < nq; i++) printf("  queue family %u: flags %#x count %u\n", i, qf[i].queueFlags, qf[i].queueCount);
++    const uint32_t fam = getenv("QF") ? (uint32_t)atoi(getenv("QF")) : 0; gFam = fam;
++    // PRIO=low|high: the queue's global priority (low needs no privilege), to see whether the GPU scheduler orders work
++    VkDeviceQueueGlobalPriorityCreateInfoKHR gp = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR, NULL,
++        getenv("PRIO") && !strcmp(getenv("PRIO"), "high") ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR : VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR };
++    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, getenv("PRIO") ? &gp : NULL, 0, fam, 1, &pri };
++    const char *dext[] = { "VK_KHR_external_memory", "VK_EXT_external_memory_host", "VK_EXT_image_drm_format_modifier", "VK_KHR_global_priority" };
++    VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qci, 0, NULL, getenv("PRIO") ? 4 : 3, dext, NULL };
++    CK(vkCreateDevice(pd, &dci, NULL, &dev));
++    vkGetDeviceQueue(dev, fam, 0, &queue);
++    hostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
++    VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, fam };
++    CK(vkCreateCommandPool(dev, &pci, NULL, &pool));
++
++    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)W * H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
++    CK(vkCreateBuffer(dev, &bci, NULL, &noise));
++    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, noise, &br);
++    VkMemoryAllocateInfo bai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, br.size, memType(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) };
++    CK(vkAllocateMemory(dev, &bai, NULL, &noiseMem)); CK(vkBindBufferMemory(dev, noise, noiseMem, 0));
++    uint32_t *px; CK(vkMapMemory(dev, noiseMem, 0, VK_WHOLE_SIZE, 0, (void **)&px));
++    for (uint32_t i = 0, x = 2463534242u; i < (uint32_t)W * H; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; px[i] = x; }
++    vkUnmapMemory(dev, noiseMem);
++
++    VkAttachmentDescription ad = { 0, VK_FORMAT_B8G8R8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
++        VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL };
++    VkAttachmentReference ar = { 0, VK_IMAGE_LAYOUT_GENERAL };
++    VkSubpassDescription sd = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, 0, NULL, 1, &ar, NULL, NULL, 0, NULL };
++    VkRenderPassCreateInfo rci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, 1, &ad, 1, &sd, 0, NULL };
++    CK(vkCreateRenderPass(dev, &rci, NULL, &rp));
++    VkPipelineLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
++    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &lci, NULL, &pl));
++    VkPipelineShaderStageCreateInfo st[2] = {
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, shader(kVs, sizeof kVs), "main", NULL },
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, shader(kFs, sizeof kFs), "main", NULL } };
++    VkPipelineVertexInputStateCreateInfo vis = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ias = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0 };
++    VkViewport vp = { 0, 0, W, H, 0, 1 }; VkRect2D sc = { { 0, 0 }, { W, H } };
++    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, &vp, 1, &sc };
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, 0, 0, VK_POLYGON_MODE_FILL,
++        VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, 0, 0, 0, 0, 1 };
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT };
++    VkPipelineColorBlendAttachmentState ba = { 1, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD,
++        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD, 0xf };
++    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba };
++    VkGraphicsPipelineCreateInfo gci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, st, &vis, &ias, NULL, &vps, &rs, &ms, NULL, &cbs, NULL, pl, rp, 0 };
++    CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe));
++
++    if (getenv("LAT")) {   // LAT=n: n tiny submissions (one timestamp), wall time from submit to fence: the GPU's response time
++        const int nl = atoi(getenv("LAT")) > 0 ? atoi(getenv("LAT")) : 50;
++        double *ms = calloc(nl, sizeof *ms), *sub = calloc(nl, sizeof *sub);
++        for (int i = 0; i < nl; i++) {
++            VkCommandBuffer cb = begin();
++            VkMemoryBarrier mb0 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 1, &mb0, 0, NULL, 0, NULL);
++            CK(vkEndCommandBuffer(cb));
++            VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; VkFence f; CK(vkCreateFence(dev, &fci, NULL, &f));
++            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL };
++            struct timespec a, m, z; clock_gettime(CLOCK_MONOTONIC, &a);
++            CK(vkQueueSubmit(queue, 1, &si, f)); clock_gettime(CLOCK_MONOTONIC, &m);
++            int polls = 0;
++            if (getenv("POLL")) { while (vkGetFenceStatus(dev, f) == VK_NOT_READY) polls++; }   // busy poll instead of the kernel wait
++            else CK(vkWaitForFences(dev, 1, &f, VK_TRUE, 5000000000ull));
++            clock_gettime(CLOCK_MONOTONIC, &z);
++            ms[i] = (z.tv_sec - a.tv_sec) * 1e3 + (z.tv_nsec - a.tv_nsec) / 1e6;
++            sub[i] = (m.tv_sec - a.tv_sec) * 1e3 + (m.tv_nsec - a.tv_nsec) / 1e6;
++            (void)polls;
++            vkDestroyFence(dev, f, NULL); vkFreeCommandBuffers(dev, pool, 1, &cb);
++            struct timespec sl = { 0, 20000000 }; nanosleep(&sl, NULL);
++        }
++        qsort(ms, nl, sizeof *ms, cmpd); qsort(sub, nl, sizeof *sub, cmpd);
++        printf("  vkQueueSubmit alone: median %.2f ms, p90 %.2f ms, max %.2f ms\n", sub[nl / 2], sub[nl * 9 / 10], sub[nl - 1]);
++        printf("  tiny submit -> done: median %.2f ms, p90 %.2f ms, max %.2f ms (%d samples)\n", ms[nl / 2], ms[nl * 9 / 10], ms[nl - 1], nl);
++        return 0;
++    }
++    if (!fam) {
++        for (uint32_t t = 0; t < mp.memoryTypeCount; t++) run(0, t, passes, layers);
++        for (uint32_t t = 0; t < mp.memoryTypeCount; t++) run(1, t, passes, layers);
++        run(2, 0, passes, layers);
++        run(3, 0, passes, layers);
++        run(4, 0, passes, layers);
++    }
++    copybench(passes);
++    return 0;
++}
+--- /dev/null
++++ b/tools/screen-fps.m
+@@ -0,0 +1,73 @@
++// screen-fps: how many new frames WindowServer puts on the main display per second.  A ScreenCaptureKit stream with no
++// minimum frame interval is handed a "complete" frame for every screen update (idle ones are skipped), so the count is
++// the compositor's real output rate.  Prints the rate, the longest gap and 100 ms buckets.  Read-only; needs Screen
++// Recording permission for the app that runs it.
++// Build: clang -fobjc-arc -framework Foundation -framework ScreenCaptureKit -framework CoreMedia screen-fps.m -o screen-fps
++// Usage: screen-fps [seconds=6]
++#import <Foundation/Foundation.h>
++#import <ScreenCaptureKit/ScreenCaptureKit.h>
++#import <CoreMedia/CoreMedia.h>
++#include <mach/mach_time.h>
++
++static double now(void)
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info(&tb);
++    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
++}
++
++static int gBucket[1024], gN;
++static double gT0, gLast, gMaxGap;
++
++@interface Counter : NSObject <SCStreamOutput>
++@end
++@implementation Counter
++- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sb ofType:(SCStreamOutputType)type
++{
++    if (type != SCStreamOutputTypeScreen) return;
++    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, false);
++    if (!att || !CFArrayGetCount(att)) return;
++    NSDictionary *a = (__bridge NSDictionary *)CFArrayGetValueAtIndex(att, 0);
++    if ([a[SCStreamFrameInfoStatus] integerValue] != SCFrameStatusComplete) return;
++    const double t = now();
++    if (!gT0) gT0 = t;
++    if (gLast && t - gLast > gMaxGap) gMaxGap = t - gLast;
++    gLast = t; gN++;
++    const int b = (int)((t - gT0) * 10);
++    if (b >= 0 && b < 1024) gBucket[b]++;
++}
++@end
++
++int main(int argc, char **argv)
++{
++    @autoreleasepool {
++        const double secs = argc > 1 ? atof(argv[1]) : 6;
++        dispatch_semaphore_t got = dispatch_semaphore_create(0);
++        __block SCShareableContent *content = nil; __block NSError *err = nil;
++        [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *c, NSError *e) { content = c; err = e; dispatch_semaphore_signal(got); }];
++        dispatch_semaphore_wait(got, DISPATCH_TIME_FOREVER);
++        if (!content.displays.count) { fprintf(stderr, "no shareable display (Screen Recording permission?) %s\n", err.description.UTF8String); return 1; }
++        SCDisplay *disp = content.displays[0];
++        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:disp excludingWindows:@[]];
++        SCStreamConfiguration *cfg = [SCStreamConfiguration new];
++        cfg.width = disp.width / 4; cfg.height = disp.height / 4;   // small: the copy must not be what limits the rate
++        cfg.minimumFrameInterval = kCMTimeZero;
++        cfg.queueDepth = 8; cfg.showsCursor = NO;
++        SCStream *s = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:nil];
++        Counter *c = [Counter new];
++        dispatch_queue_t q = dispatch_queue_create("frames", DISPATCH_QUEUE_SERIAL);
++        if (![s addStreamOutput:c type:SCStreamOutputTypeScreen sampleHandlerQueue:q error:&err]) { fprintf(stderr, "output: %s\n", err.description.UTF8String); return 1; }
++        [s startCaptureWithCompletionHandler:^(NSError *e) { err = e; dispatch_semaphore_signal(got); }];
++        dispatch_semaphore_wait(got, DISPATCH_TIME_FOREVER);
++        if (err) { fprintf(stderr, "start: %s\n", err.description.UTF8String); return 1; }
++        [NSThread sleepForTimeInterval:secs];
++        [s stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(got); }];
++        dispatch_semaphore_wait(got, DISPATCH_TIME_FOREVER);
++        dispatch_sync(q, ^{});
++        printf("%d frames in %.1f s = %.1f/s, longest gap %.1f ms (display %ldx%ld)\nper 100 ms:", gN, secs, gN / secs,
++               gMaxGap * 1e3, (long)disp.width, (long)disp.height);
++        for (int i = 0; i < (int)(secs * 10) && i < 1024; i++) printf(" %d", gBucket[i]);
++        printf("\n");
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/sysctl-once.c
+@@ -0,0 +1,13 @@
++// sysctl-once: reads a string sysctl with one call into a large buffer.  sysctl(8) asks the size first, and the core's
++// counters that restart at every read (debug.xegfx_eb, debug.xegfx_rq) would then print an empty second read.
++// Build: clang sysctl-once.c -o sysctl-once      Usage: sysctl-once debug.xegfx_rq
++#include <stdio.h>
++#include <sys/sysctl.h>
++int main(int argc, char **argv)
++{
++    static char buf[65536];
++    size_t n = sizeof buf - 1;
++    if (argc < 2 || sysctlbyname(argv[1], buf, &n, NULL, 0) != 0) { perror(argc > 1 ? argv[1] : "usage: sysctl-once name"); return 1; }
++    buf[n] = 0; fputs(buf, stdout);
++    return 0;
++}
