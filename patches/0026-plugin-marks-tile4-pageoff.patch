@@ -1,0 +1,1348 @@
+# 0026 XeMTL plugin: WindowServer surface marks, Tile4 scanout, page-off with compressed private copies
+#
+# Base:  plugin/ after 0005 + 0006 + 0007 (NvGfx xe 0.0.35)
+# Files: plugin/NVMTLEventSync.m, plugin/NVMTLObjects.h, plugin/NVMTLObjects.m, plugin/XeMTLDevice.m,
+#        plugin/nvmtl_vk.c, plugin/nvmtl_vk.h
+# Apply: patch -p1 < patches/0026-plugin-marks-tile4-pageoff.patch
+#
+# Needs the 0024 accelerator (DRM client selectors 1-8; with an older one every feature below stays off).
+#   - surface marks (§32.15): WindowServer's composites mark their surfaces pending at commit and ready when the GPU
+#     finished, so the accel orders the flip after the composite and WindowServer itself never waits
+#     (/private/tmp/xemtl-ws-nowait, recreated at boot by tools/e1); WindowServer's queue runs at HIGH GPU priority
+#     (VK_KHR_global_priority) so an app's long batch cannot hold a composite
+#   - Tile4 scanout (§32.16): scanout surfaces are drawn Tile4 when the accel turns it on and re-laid out in place
+#     on the GPU when that changes
+#   - page-off (§36.12, §37): WindowServer render targets (BGRA8, >= 1024x600, not scanout) are drawn into a private
+#     optimal-tiling image -- Tile4 with ANV's CCS render compression (aux-map) -- instead of the linear pages.
+#     After a composite the accel's device cache is made current; a CPU lock or a scan-out of the surface makes the
+#     page-off thread copy the image back to the pages.  A surface paged off more than 4 times a second, or that
+#     becomes a scanout surface, goes back to an image over its pages.
+#   - coherence (§37.8): a surface keeps a private copy only while that copy is its one root texture in the process;
+#     a later root that cannot share it sends it back to the pages first; a copy going away writes back under the
+#     surface's sync and a new root waits for it.  A copy that lived < 2 s or was never drawn is not made again.
+#   - defaults (§37.10): page-off on, copies made at once.  Off: /Library/GPUBundles/.xemtl-no-pageoff (or
+#     /private/tmp/xemtl-no-pageoff until the next boot); promotion after 3 s / 100 commits instead:
+#     /Library/GPUBundles/.xemtl-pageoff-lazy.  Experiments: /private/tmp/xemtl-noccs (INTEL_DEBUG=noccs),
+#     /private/tmp/xemtl-pageoff-fastclear (clear never-written surfaces instead of uploading -- blanks screenshots).
+#   - passtime (/tmp/nvmtl-passtime-request) logs per-pass GPU time, shader pair and draw count.
+# Status: in daily use: screenshots correct, fps-probe 82-131 flips/s at 240 Hz, the Dock "genie" effect's busiest
+# seconds 85-89 flips/s (60 before).
+#
+--- a/plugin/NVMTLEventSync.m
++++ b/plugin/NVMTLEventSync.m
+@@ -92,7 +92,7 @@
+     if (!ws) return NO;
+     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+     if (atomic_load(&nvmtl_ws_marks_on) < 0 || now - atomic_load(&nvmtl_ws_marks_checked) > 1000000000ull) {
+-        const int on = nvmtl_vk_surface_gpu_mark(0, 0) == 0;   // surface 0: a probe the kernel answers and ignores
++        const int on = nvmtl_vk_surface_gpu_mark2(0, 0, 0) == 0;   // surface 0: a probe the kernel answers and ignores (and says whether Tile4 is on)
+         if (on != atomic_exchange(&nvmtl_ws_marks_on, on))
+             nvlog("WindowServer frame completion: %s", on ? "the swap waits in NVAccel (no composite wait here)" : "waiting for each composite here");
+         atomic_store(&nvmtl_ws_marks_checked, now);
+@@ -100,7 +100,8 @@
+     return atomic_load(&nvmtl_ws_marks_on) == 1;
+ }
+ static const void *const nvmtl_ws_marks_key = &nvmtl_ws_marks_key;
+-static void nvmtl_ws_mark(uint32_t sid, BOOL pending) { (void)nvmtl_vk_surface_gpu_mark(sid, pending); }
++// §32.16: a pending mark also tells the accelerator the layout this commit draws the surface in (Tile4 or linear)
++static void nvmtl_ws_mark(uint32_t sid, BOOL pending, BOOL tile4) { (void)nvmtl_vk_surface_gpu_mark2(sid, pending ? 1 : 0, tile4); }
+ // Marking WindowServer's surfaces newest in VRAM at commit is only safe when NVAccel's page-off waits for a pending
+ // surface (NVAccelSurfaceWait). Without that wait a CPU lock or a copied present pages the surface off while the GPU
+ // is still drawing it: blank window panes, a torn band, a Dock without its icons. Such an accelerator (a package that
+@@ -160,7 +161,7 @@
+         [holds->ids removeObject:n];
+         [nvmtl_ws_pending_holds removeObject:n];
+         if ([nvmtl_ws_pending_holds countForObject:n]) return;
+-        nvmtl_ws_mark(sid, NO);
++        nvmtl_ws_mark(sid, NO, NO);
+         NSArray *waiting = nvmtl_ws_deferred[n];
+         if (waiting) { [settled addObjectsFromArray:waiting]; [nvmtl_ws_deferred removeObjectForKey:n]; }
+     }
+@@ -193,14 +194,17 @@
+ // (nvmtl_surface_register_writes): a record stamped before the move matched nothing, every frame's read of the surface
+ // still in flight took the CPU path (page-off, wait, 8 MB upload) on the compositor's thread, and a 144 Hz desktop ran
+ // at 90 frames a second.
++static void nvmtl_tile4_after_commit(XeMTLCommandBuffer *cb);   // <wtl> §32.16, at the end of this file
+ static void nvmtl_ws_mark_pending(XeMTLCommandBuffer *cb) {
+     if (!nvmtl_ws_kernel_waits()) return;
+-    NSMutableSet *ids = nil;
++    NSMutableSet *ids = nil, *tile4 = nil;
+     for (XeMTLSubmissionPart *part in cb->_parts) {
+         if (![part isKindOfClass:[XeMTLSubmissionPart class]]) continue;
+         for (XeMTLTexture *t in part->surfaces) if (t->_surf) {
+             if (!ids) ids = [NSMutableSet new];
+             [ids addObject:@(IOSurfaceGetID(t->_surf))];
++            const XeMTLTexture *root = t->_parent ? t->_parent : t;   // a view's flag is a copy; the root's is current
++            if (root->_tile4) { if (!tile4) tile4 = [NSMutableSet new]; [tile4 addObject:@(IOSurfaceGetID(t->_surf))]; }
+         }
+     }
+     if (!ids) return;
+@@ -217,7 +221,7 @@
+     }
+     @synchronized (nvmtl_ws_lock()) {
+         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
+-        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES); }
++        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES, [tile4 containsObject:n]); }
+     }
+     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ }
+@@ -714,6 +718,7 @@
+         [nvmtl_pending_buffers addObject:self];
+         nvmtl_pump_buffers();
+     }
++    nvmtl_tile4_after_commit(self);   // <wtl> §32.16
+ }
+ @end
+ 
+@@ -857,4 +862,173 @@
+         else [condition wait];
+     }
+     BOOL done = *storage >= wanted; [condition unlock]; return done;
++}
++
++// <wtl> §32.16 Tile4 scanout: copy a surface's content from a texture in one layout to a texture in the other, both over
++// the same pages (XeMTLDevice.m nvmtlNewSurfaceTexture).  Everything committed before has to finish first -- some of it
++// may still draw the surface in the old layout -- so the pending command buffers are waited for (500 ms at most; a
++// buffer that never completes, one waiting for an event a later one signals, fails the re-layout instead of hanging).
++// Then the content goes through a private copy, since source and destination share the pages, and that is waited for
++// too.  Once per surface and layout change.  1 on success.
++int nvmtl_tile4_relayout(id<MTLDevice> dev, XeMTLTexture *from, XeMTLTexture *to)
++{
++    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), deadline = t0 + 500000000ull;
++    NSArray *before; @synchronized ([XeMTLCommandBuffer class]) { before = [nvmtl_pending_buffers copy]; }
++    for (XeMTLCommandBuffer *cb in before)
++        while (cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError) {
++            if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) > deadline) { nvlog("Tile4: re-layout gave up: earlier work still running after 500 ms"); return 0; }
++            usleep(200);
++        }
++    static id<MTLCommandQueue> q; static dispatch_once_t once;
++    dispatch_once(&once, ^{ q = [dev newCommandQueue]; });
++    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:from->_fmt width:from->_i.w height:from->_i.h mipmapped:NO];
++    td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
++    id<MTLTexture> tmp = [dev newTextureWithDescriptor:td];
++    id<MTLCommandBuffer> cb = [q commandBuffer];
++    if (!q || !tmp || !cb) { nvlog("Tile4: re-layout: no queue, temporary or command buffer"); return 0; }
++    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder]; [b copyFromTexture:from toTexture:tmp]; [b endEncoding];
++    b = [cb blitCommandEncoder]; [b copyFromTexture:tmp toTexture:to]; [b endEncoding];
++    [cb commit];
++    while (cb.status != MTLCommandBufferStatusCompleted && cb.status != MTLCommandBufferStatusError) {
++        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) > deadline + 500000000ull) { nvlog("Tile4: re-layout copy not done after 1 s"); return 0; }
++        usleep(200);
++    }
++    if (cb.status == MTLCommandBufferStatusError) { nvlog("Tile4: re-layout copy failed: %s", cb.error.description.UTF8String ?: "?"); return 0; }
++    nvlog("Tile4: re-layout of %ux%u took %.1f ms", from->_i.w, from->_i.h, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
++    return 1;
++}
++// </wtl>
++
++// <wtl> §32.16: WindowServer keeps the textures of its scanout surfaces, so they are re-laid out where they are used:
++// after a commit that drew a surface whose layout is not the one it should have now (it became a scanout surface, or
++// Tile4 was switched), on the committing thread before it encodes the next frame.  A new image in the other layout is
++// made over the same pages, the content copied across (nvmtl_tile4_relayout), and the root texture's image swapped for
++// it; views made of the old image are made again at their next use (_imgGen).  The old image goes 5 s later.
++static void nvmtl_tile4_inplace(XeMTLTexture *r, int want)
++{
++    static _Atomic int fails;
++    if (atomic_load(&fails) >= 3) return;
++    const uint32_t sid = IOSurfaceGetID(r->_surf);
++    XeMTLTexture *to = [XeMTLTexture new]; to->_tile4 = want ? YES : NO;
++    if (nvmtl_surface_image_create(to, r->_surf, r->_plane, r->_i.w, r->_i.h, r->_i.fmt, r->_i.bpp, 0, r->_i.storage ? 1 : 0)
++        || !to->_hostImg || (to->_tile4 ? 1 : 0) != want) {
++        atomic_fetch_add(&fails, 1); nvlog("Tile4: surface %u: no %s image over its pages", sid, want ? "Tile4" : "linear"); return; }
++    to->_q = r->_q; to->_surf = r->_surf; CFRetain(to->_surf); to->_surfOwned = YES; to->_plane = r->_plane;
++    to->_fmt = r->_fmt; to->_usage = r->_usage; to->_stex = to->_i.storage != 0;
++    if (!nvmtl_tile4_relayout([r device], r, to)) { atomic_fetch_add(&fails, 1); return; }
++    @synchronized (r) {
++        const nvk_image old = r->_i; r->_i = to->_i; to->_i = old;
++        r->_tile4 = want ? YES : NO; to->_tile4 = want ? NO : YES;
++        r->_imgGen++;
++    }
++    nvmtl_vk_tile4_content_set(sid, want);
++    (void)nvmtl_vk_surface_gpu_mark2(sid, 2, want);	// the accelerator scans it with the new layout
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
++                   ^{ (void)to; });	// holds the old image until then
++    nvlog("Tile4: surface %u %ux%u re-laid out in place %s -> %s", sid, r->_i.w, r->_i.h, want ? "linear" : "Tile4", want ? "Tile4" : "linear");
++}
++// <wtl> §36.12: a surface with a private copy that turned out to be scanned out (or that the CPU reads every frame) goes
++// back to an image over its own pages: the copy is drawn into those pages (nvmtl_tile4_relayout: the earlier work is
++// waited for), the root's image is swapped for the new one as in nvmtl_tile4_inplace, and our device cache is released.
++// From then on it is an ordinary surface again (and a scanout surface may be re-laid out Tile4 in place as before).
++static void nvmtl_po_demote(XeMTLTexture *r)
++{
++    static _Atomic int fails;
++    const uint32_t sid = IOSurfaceGetID(r->_surf);
++    r->_poDemote = NO;
++    if (atomic_load(&fails) >= 3) return;
++    XeMTLTexture *to = [XeMTLTexture new]; to->_tile4 = NO;
++    if (nvmtl_surface_image_create(to, r->_surf, r->_plane, r->_i.w, r->_i.h, r->_i.fmt, r->_i.bpp, 0, r->_i.storage ? 1 : 0) || !to->_hostImg) {
++        atomic_fetch_add(&fails, 1); nvlog("page-off: surface %u: no image over its pages -- keeps its private copy", sid); return; }
++    to->_q = r->_q; to->_surf = r->_surf; CFRetain(to->_surf); to->_surfOwned = YES; to->_plane = r->_plane;
++    to->_fmt = r->_fmt; to->_usage = r->_usage; to->_stex = to->_i.storage != 0;
++    if (!nvmtl_tile4_relayout([r device], r, to)) { atomic_fetch_add(&fails, 1); nvlog("page-off: surface %u: copy to its pages failed -- keeps its private copy", sid); return; }
++    @synchronized (nvmtl_surface_sync(r)) {
++        @synchronized (r) {
++            const nvk_image old = r->_i; r->_i = to->_i; to->_i = old;
++            const nvk_buffer hb = r->_hostBuf; const int8_t hs = r->_hostState;
++            r->_hostBuf = to->_hostBuf; r->_hostState = to->_hostState; to->_hostBuf = hb; to->_hostState = hs;
++            r->_hostImg = YES; to->_hostImg = NO; r->_po = NO; r->_imgGen++;
++            r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
++        }
++    }
++    nvmtl_vk_po_detach(sid);
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
++                   ^{ (void)to; });	// holds the private image until then
++    nvlog("page-off: surface %u %ux%u back to an image over its pages (%s)", sid, r->_i.w, r->_i.h,
++          nvmtl_vk_is_scanout(sid) ? "it is scanned out" : r->_poCount > 4 ? "the CPU reads it often" : "another root needs its pages");
+ }
++// A WindowServer surface that would take a private copy is first drawn over its own pages, and is promoted only after
++// it has lived 3 s and been drawn by 100 commits: WindowServer's screenshot and capture surfaces live well under a second
++// and are read by other processes without a lock that pages off (16:05 screenshot: blank where the copy was newer).
++// The copy is made from the pages on the GPU (nvmtl_tile4_relayout) and swapped in as nvmtl_po_demote does in reverse;
++// the surface's pages stay imported (r->_hostBuf) for the page-off copies.
++static void nvmtl_po_promote(XeMTLTexture *r)
++{
++    static _Atomic int fails;
++    const uint32_t sid = IOSurfaceGetID(r->_surf);
++    r->_poCand = NO;
++    if (atomic_load(&fails) >= 3) return;
++    XeMTLTexture *to = [XeMTLTexture new]; to->_tile4 = NO; to->_poWant = YES;   // a private image, not one over the pages
++    if (nvmtl_surface_image_create(to, r->_surf, r->_plane, r->_i.w, r->_i.h, r->_i.fmt, r->_i.bpp, 0, r->_i.storage ? 1 : 0) || to->_hostImg || to->_vramOn) {
++        atomic_fetch_add(&fails, 1); nvlog("page-off: surface %u: no private image -- stays over its pages", sid); return; }
++    to->_poWant = NO;
++    to->_q = r->_q; to->_surf = r->_surf; CFRetain(to->_surf); to->_surfOwned = YES; to->_plane = r->_plane;
++    to->_fmt = r->_fmt; to->_usage = r->_usage; to->_stex = to->_i.storage != 0;
++    if (!nvmtl_tile4_relayout([r device], r, to)) { atomic_fetch_add(&fails, 1); nvlog("page-off: surface %u: copy from its pages failed -- stays over them", sid); return; }
++    @synchronized (nvmtl_surface_sync(r)) {
++        @synchronized (r) {
++            const nvk_image old = r->_i; r->_i = to->_i; to->_i = old;
++            r->_hostImg = NO; r->_po = YES; r->_poDrawn = NO; r->_imgGen++;
++            r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
++        }
++    }
++    nvmtl_po_register(r);
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
++                   ^{ (void)to; });	// holds the image over the pages until then
++    nvlog("page-off: surface %u %ux%u promoted to a private copy after %u commits", sid, r->_i.w, r->_i.h, r->_poDraws);
++}
++// §37.7: a second root that cannot share the private copy is about to be made over the surface: the copy goes back to
++// the pages first, so both roots then read and write the same pages
++void nvmtl_po_demote_now(XeMTLTexture *r)
++{
++    if (r && r->_po && !r->_hostImg) { r->_poDemote = NO; nvmtl_po_demote(r); }
++}
++// </wtl>
++static void nvmtl_tile4_after_commit(XeMTLCommandBuffer *cb)
++{
++    static int ws = -1;
++    if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
++    if (!ws) return;
++    NSMutableArray *roots = nil; NSMutableArray *wants = nil;
++    for (XeMTLSubmissionPart *part in cb->_parts) {
++        if (![part isKindOfClass:[XeMTLSubmissionPart class]]) continue;
++        for (XeMTLTexture *t in part->surfaces) {
++            XeMTLTexture *r = t->_parent ? t->_parent : t;
++            if (r->_po && r->_surf && !r->_hostImg && ![roots containsObject:r] &&
++                (r->_poDemote || nvmtl_vk_is_scanout((uint32_t)IOSurfaceGetID(r->_surf)))) {   // <wtl> §36.12
++                if (!roots) { roots = [NSMutableArray new]; wants = [NSMutableArray new]; }
++                [roots addObject:r]; [wants addObject:@(-1)]; continue;
++            }
++            if (r->_poCand && r->_hostImg && !r->_tile4 && ![roots containsObject:r] && ++r->_poDraws >= 100 &&   // <wtl> §36.12
++                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - r->_poBornNs >= 3000000000ull) {
++                if (!roots) { roots = [NSMutableArray new]; wants = [NSMutableArray new]; }
++                [roots addObject:r]; [wants addObject:@(-2)]; continue;
++            }
++            if (!r->_surf || !r->_hostImg || r->_vramOn || [roots containsObject:r]) continue;
++            const int want = nvmtl_tile4_want(r->_surf, r->_plane, r->_i.w, r->_i.h, r->_i.fmt);
++            if (want == (r->_tile4 ? 1 : 0)) continue;
++            if (!roots) { roots = [NSMutableArray new]; wants = [NSMutableArray new]; }
++            [roots addObject:r]; [wants addObject:@(want)];
++        }
++    }
++    for (NSUInteger i = 0; i < roots.count; i++) {
++        if ([wants[i] intValue] == -2) {   // <wtl> §36.12
++            XeMTLTexture *r = roots[i]; const uint32_t sid = IOSurfaceGetID(r->_surf);
++            if (nvmtl_vk_po_on() && !nvmtl_vk_is_scanout(sid) && !nvmtl_po_denied(r->_surf) && !nvmtl_roots_others(r->_surf, r)) nvmtl_po_promote(r);
++            else r->_poCand = NO;
++        } else if ([wants[i] intValue] < 0) nvmtl_po_demote(roots[i]);   // <wtl> §36.12
++        else nvmtl_tile4_inplace(roots[i], [wants[i] intValue]);
++    }
++}
++// </wtl>
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -48,6 +48,12 @@
+   nvk_buffer _vramBuf; BOOL _vramOn;
+   nvk_buffer _hostBuf; int8_t _hostState;   // the surface's own pages imported (Intel/AMD); -1 refused
+   BOOL _hostImg;   // the image itself lives in those pages: no copies in or out
++  BOOL _tile4;     // <wtl> §32.16: that image is Tile4 (a scanout surface of WindowServer's), not linear
++  uint32_t _imgGen, _t4gen;   // <wtl> §32.16: the root's image generation (bumped when it is swapped in place), and the one this texture's own views were made of
++  BOOL _po, _poWant, _poDemote;   // <wtl> §36.12: the image is a private copy of WindowServer's surface, paged off to its pages on demand
++  uint32_t _poCount; uint64_t _poWinNs;   // <wtl> §36.12: page-offs in the current one-second window
++  BOOL _poDrawn; uint64_t _poBornNs;      // <wtl> §36.12: the GPU drew the copy (it must reach the pages before it goes), and when it was made
++  BOOL _poCand; uint32_t _poDraws;        // <wtl> §36.12: drawn over its pages until it proves long-lived (nvmtl_po_promote); commits drawing it
+   BOOL _stex;
+   uint64_t _resid;
+   NSUInteger _usage;
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -1185,7 +1185,42 @@
+ }
+ extern int nvmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
+ - (nvk_image *)nvi { return _parent ? [_parent nvi] : &_i; }
++// <wtl> §32.16: the root's image was swapped in place (a scanout surface changed layout, nvmtl_tile4_inplace): the views
++// this texture made of the old image are made again of the new one.  The old ones go 5 s later -- command buffers in
++// flight may still use them.
++static void nvmtl_t4_view_later(void *view)
++{
++    if (!view) return;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
++                   ^{ nvmtl_vk_image_view_destroy(view); });
++}
++- (void)nvmtlT4Revalidate {
++    XeMTLTexture *root = _parent ? _parent : self;
++    @synchronized (self) {
++        if (_t4gen == root->_imgGen) return;
++        extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
++        uint32_t vkf = 0, bpp = 0; int a8 = 0;
++        if (!nvmtl_pixfmt_public(_fmt, &vkf, &bpp, &a8)) {
++            const uint8_t s4[4] = { (uint8_t)_swz.red, (uint8_t)_swz.green, (uint8_t)_swz.blue, (uint8_t)_swz.alpha };
++            if (_ownView) {   // a view's own image view; swizzled when it came from newTextureView...swizzle: (no _swzView then)
++                void *nv = NULL;
++                const int bad = (_hasSwz && !_swzView)
++                    ? nvmtl_vk_image_view_create_range_swz([self nvi], vkf, a8, _baseLevel, _mips, _baseSlice, _viewSlices, _viewType, s4, &nv)
++                    : nvmtl_vk_image_view_create_range([self nvi], vkf, a8, _baseLevel, _mips, _baseSlice, _viewSlices, _viewType, &nv);
++                if (!bad) { nvmtl_t4_view_later(_ownView); _ownView = nv; }
++                else nvlog("Tile4: a view of a re-laid-out surface could not be made again");
++            }
++            if (_swzView) {   // the descriptor's swizzle (nvmtl_texture_desc_swizzle)
++                void *nv = NULL;
++                if (!nvmtl_vk_image_view_create_range_swz([self nvi], vkf, a8, 0, 0, 0, 0, _viewType ? _viewType : 2u, s4, &nv)) { nvmtl_t4_view_later(_swzView); _swzView = nv; }
++            }
++        }
++        _t4gen = root->_imgGen;
++    }
++}
++// </wtl>
+ - (void *)nvview {
++    { XeMTLTexture *r_ = _parent ? _parent : self; if (r_->_imgGen != _t4gen) [self nvmtlT4Revalidate]; }   // <wtl> §32.16
+     nvk_image *image = [self nvi];
+     if (image->fmt == VK_FORMAT_D16_UNORM_S8_UINT || image->fmt == VK_FORMAT_D24_UNORM_S8_UINT || image->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+         uint32_t format = 0, aspect = 0;
+@@ -1199,7 +1234,9 @@
+     }
+     return _ownView ? _ownView : image->view;
+ }
+-- (void *)nvsampleview { return _swzView ? _swzView : [self nvview]; }
++- (void *)nvsampleview {
++    { XeMTLTexture *r_ = _parent ? _parent : self; if (r_->_imgGen != _t4gen) [self nvmtlT4Revalidate]; }   // <wtl> §32.16
++    return _swzView ? _swzView : [self nvview]; }
+ /* MTLTextureDescriptor.swizzle applies when the texture is sampled or read, not to attachments or shader writes, so it
+  * gets a view of its own for the sampled binds and the identity view stays for everything else. IconServices hands
+  * gray + alpha image layers over as RG8 with swizzle (r, r, r, g); with the swizzle dropped, alpha landed in green. */
+@@ -1222,19 +1259,29 @@
+ }
+ - (id<MTLHeap>)heap { return _heap ?: _subHeap; }
+ - (NSUInteger)heapOffset { return _heapOffset; }
++static void nvmtl_po_gone(XeMTLTexture *r);   // <wtl> §36.12
++#include <objc/objc-sync.h>
++static id nvmtl_surface_sync(XeMTLTexture *t);   // <wtl> §37.7
+ - (void)dealloc {
++    // <wtl> §37.7: a private copy going away holds its surface's sync from here until its write-back is done, so a new
++    // root (nvmtl_surface_barrier) cannot start drawing the pages before the old copy has landed on them
++    id poSync = (!_parent && _po && _surf) ? nvmtl_surface_sync(self) : nil;
++    if (poSync) objc_sync_enter(poSync);
+     if (_sampledDepthView) nvmtl_vk_image_view_destroy(_sampledDepthView);
+     nvmtl_tex_objs_gone++;
+     if (_tbView || _tbAlias) { nvmtl_vk_texel_view_destroy(_tbAlias, _tbView); _tbView = _tbAlias = NULL; }
+     if (_resid) nvmtl_resid_texture_gone(_resid);
+     if (_ownView) nvmtl_vk_image_view_destroy(_ownView);
+     if (_swzView) nvmtl_vk_image_view_destroy(_swzView);
++    if (!_parent && _po && _surf) nvmtl_po_gone(self);   // <wtl> §36.12: the copy reaches the pages before the image goes
++    if (poSync) objc_sync_exit(poSync);   // <wtl> §37.7
+     if (!_parent && _parkable && _subHeap && _i.img) nvmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
+     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+     if (!_parent) nvmtl_vk_image_destroy(&_i);
+     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
+     if (!_parent && _vramOn) { nvmtl_vk_buffer_destroy(&_vramBuf); _vramOn = NO; }
+-    if (!_parent && _hostState > 0) { nvmtl_vk_buffer_destroy(&_hostBuf); _hostState = 0; }
++    if (!_parent && _hostState > 0) { if (!nvmtl_vk_surface_host_put(&_hostBuf)) nvmtl_vk_buffer_destroy(&_hostBuf); _hostState = 0; }
++    if (!_parent && _po && _surf) nvmtl_vk_po_detach((uint32_t)IOSurfaceGetID(_surf));   // <wtl> §36.12: our device cache goes
+     if (_surfOwned && _surf) CFRelease(_surf);
+     if (_subHeap) { XeMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
+                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
+@@ -1303,7 +1350,7 @@
+     if (r->_hostState < 0 || nvmtl_host_off_sentinel() || !nvmtl_vk_surface_host_on() || IOSurfaceGetPlaneCount(r->_surf) > 1) return -1;
+     void *b0 = IOSurfaceGetBaseAddress(r->_surf);
+     if (!r->_hostState) {
+-        if (nvmtl_vk_surface_host_import(b0, IOSurfaceGetAllocSize(r->_surf), &r->_hostBuf)) {
++        if (nvmtl_vk_surface_host_get(r->_surf, &r->_hostBuf)) {
+             r->_hostState = -1; static unsigned nr; if (nr++ < 6) nvlog("surface host import refused (%ux%u surface %u) - staged copies", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf));
+             return -1; }
+         r->_hostState = 1;
+@@ -1312,12 +1359,141 @@
+     const int rc = nvmtl_vk_image_xfer_host(r->_q, &r->_i, &r->_hostBuf, off, row, to_image);
+     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("surface %s through host import #%u: %ux%u surface %u rc %d", to_image ? "in" : "out", n, r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), rc);
+     return rc;
++}
++// </wtl>
++// <wtl> §36.12 page-off (docs/36-APPLE-INTEL-DRIVER.md).  WindowServer surfaces with a private copy, by surface ID (weak),
++// and the thread that serves the accelerator's page-off requests: it copies the private image into the surface's pages
++// (nvmtl_surface_host_xfer, a GPU copy on the device queue, which runs after everything committed before) and reports
++// back.  It takes no IOSurface lock and no surface sync: the request comes from inside some thread's IOSurfaceLock.
++// A surface paged off more than 4 times in a second (a capture surface the CPU reads every frame) is marked for
++// demotion to an image over its pages (nvmtl_po_demote, NVMTLEventSync.m).
++static NSMapTable *g_po_roots;
++static pthread_mutex_t g_po_mu = PTHREAD_MUTEX_INITIALIZER;
++static _Atomic uint64_t g_po_served, g_po_failed;
++XeMTLTexture *nvmtl_po_root(uint32_t sid)
++{
++    if (!sid || !g_po_roots) return nil;
++    pthread_mutex_lock(&g_po_mu); XeMTLTexture *t = [g_po_roots objectForKey:@(sid)]; pthread_mutex_unlock(&g_po_mu);
++    return t;
++}
++// §37.7 coherence: every root texture this process makes over a surface (weakly, keyed by the IOSurfaceRef, which each
++// root retains).  A surface takes a private copy only while that copy is its ONE root: another root would read and write
++// the pages under it (17:19 and 17:24 screenshots: the copy written back over what the other root had drawn).
++static NSMapTable *g_surf_roots;
++void nvmtl_roots_add(XeMTLTexture *t)
++{
++    if (!t || !t->_surf || t->_parent) return;
++    pthread_mutex_lock(&g_po_mu);
++    if (!g_surf_roots) g_surf_roots = [NSMapTable strongToStrongObjectsMapTable];
++    NSValue *k = [NSValue valueWithPointer:t->_surf];
++    NSHashTable *set = [g_surf_roots objectForKey:k];
++    if (!set) { set = [NSHashTable weakObjectsHashTable]; [g_surf_roots setObject:set forKey:k]; }
++    [set addObject:t];
++    if (g_surf_roots.count > 4096) {   // drop the entries whose roots are all gone
++        NSMutableArray *dead = [NSMutableArray new];
++        for (NSValue *v in g_surf_roots) if (![[g_surf_roots objectForKey:v] anyObject]) [dead addObject:v];
++        for (NSValue *v in dead) [g_surf_roots removeObjectForKey:v];
++    }
++    pthread_mutex_unlock(&g_po_mu);
++}
++// §37.7: a root that is going away writes its private copy back to the pages inside its dealloc, under the surface's
++// sync -- after it has already left the weak root table.  A new root waits here for that write-back before it is used,
++// or the write-back could land over what the new root draws (17:28: one screenshot right, the next wrong).
++void nvmtl_surface_barrier(XeMTLTexture *t)
++{
++    if (t && t->_surf) @synchronized (nvmtl_surface_sync(t)) { }
++}
++// live roots over s other than except
++int nvmtl_roots_others(IOSurfaceRef s, XeMTLTexture *except)
++{
++    int n = 0;
++    pthread_mutex_lock(&g_po_mu);
++    NSHashTable *set = g_surf_roots ? [g_surf_roots objectForKey:[NSValue valueWithPointer:s]] : nil;
++    for (XeMTLTexture *r in set) if (r != except) n++;
++    pthread_mutex_unlock(&g_po_mu);
++    return n;
++}
++static void *nvmtl_po_service(void *arg)
++{
++    (void)arg;
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++    for (;;) @autoreleasepool {
++        const uint64_t req = nvmtl_vk_po_wait(1000);
++        if (!req) continue;
++        const uint32_t sid = (uint32_t)(req >> 32), seq = (uint32_t)req;
++        XeMTLTexture *r = nvmtl_po_root(sid);
++        int ok = 0; const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        if (r && r->_po && r->_surf && IOSurfaceGetID(r->_surf) == sid)
++            ok = nvmtl_surface_host_xfer(r, IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane), 0) == 0;
++        nvmtl_vk_po_done(sid, seq, ok);
++        const uint64_t n = atomic_fetch_add(ok ? &g_po_served : &g_po_failed, 1) + 1;
++        if (r && ok) {
++            const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++            if (now - r->_poWinNs > 1000000000ull) { r->_poWinNs = now; r->_poCount = 0; }
++            if (++r->_poCount > 4 && !r->_poDemote) { r->_poDemote = YES; nvlog("page-off: surface %u paged off %u times in a second -- back to its pages", sid, r->_poCount); }
++        }
++        if (n <= 16 || n % 1000 == 0)
++            nvlog("page-off: surface %u %s in %.2f ms (%llu served, %llu failed)", sid, ok ? "copied to its pages" : "NOT copied (no copy of ours)",
++                  (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, (unsigned long long)atomic_load(&g_po_served), (unsigned long long)atomic_load(&g_po_failed));
++    }
++    return NULL;
++}
++// A surface whose private copy went within 2 s of being made, or was never drawn (WindowServer wraps some surfaces
++// it only samples in short-lived render-target textures: each one would be a new 36 MB copy and a full upload), is
++// not given another one: the last 64 such surfaces, by ID and surface.
++static struct { uint32_t sid; const void *surf; } g_po_deny[64];
++static unsigned g_po_ndeny;
++int nvmtl_po_denied(IOSurfaceRef s)
++{
++    const uint32_t sid = IOSurfaceGetID(s); int hit = 0;
++    pthread_mutex_lock(&g_po_mu);
++    for (unsigned i = 0; i < 64 && !hit; i++) hit = g_po_deny[i].sid == sid && g_po_deny[i].surf == (const void *)s;
++    pthread_mutex_unlock(&g_po_mu);
++    return hit;
++}
++static void nvmtl_po_gone(XeMTLTexture *r)
++{
++    const uint32_t sid = IOSurfaceGetID(r->_surf);
++    const double life = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - r->_poBornNs) / 1e9;
++    int rc = 0;
++    if (r->_poDrawn) {   // the kernel may still hold the copy current: write it to the pages now, while the image is here
++        @synchronized (nvmtl_surface_sync(r)) { rc = nvmtl_surface_host_xfer(r, IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane), 0); }
++        if (rc) nvlog("page-off: surface %u: copy to its pages FAILED as its copy went (rc %d)", sid, rc);
++    }
++    const int deny = !r->_poDrawn || life < 2.0;
++    if (deny) { pthread_mutex_lock(&g_po_mu); g_po_deny[g_po_ndeny++ % 64].sid = sid; g_po_deny[(g_po_ndeny - 1) % 64].surf = (const void *)r->_surf; pthread_mutex_unlock(&g_po_mu); }
++    static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) < 256)
++        nvlog("page-off: surface %u: private copy gone after %.2f s, %s%s", sid, life, r->_poDrawn ? "drawn, copied to its pages" : "never drawn",
++              deny ? " -- no more copies for it" : "");
+ }
++// the surface's pages imported once, here, before the page-off thread or surface-in can race to do it; without them
++// the texture stays an ordinary private image (copied out after every write)
++int nvmtl_po_prepare(XeMTLTexture *t)
++{
++    if (t->_hostState == 0) t->_hostState = nvmtl_vk_surface_host_get(t->_surf, &t->_hostBuf) ? -1 : 1;
++    return t->_hostState > 0;
++}
++void nvmtl_po_register(XeMTLTexture *t)
++{
++    static dispatch_once_t once;
++    pthread_mutex_lock(&g_po_mu);
++    if (!g_po_roots) g_po_roots = [NSMapTable strongToWeakObjectsMapTable];
++    [g_po_roots setObject:t forKey:@(IOSurfaceGetID(t->_surf))];
++    t->_poBornNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    const NSUInteger n = g_po_roots.count;
++    pthread_mutex_unlock(&g_po_mu);
++    dispatch_once(&once, ^{ pthread_t th; if (pthread_create(&th, NULL, nvmtl_po_service, NULL) == 0) pthread_detach(th); });
++    nvlog("page-off: surface %u %ux%u drawn into a private copy (%lu surfaces)", (unsigned)IOSurfaceGetID(t->_surf), t->_i.w, t->_i.h, (unsigned long)n);
++}
+ // </wtl>
+ - (void)nvmtlSurfaceIn {
+     XeMTLTexture *r = _parent ? _parent : self;
+     if (!r->_surf) return;
+     if (r->_hostImg) { r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES; return; }   // CPU writes are already in the image
++    // <wtl> §36.12: the copy is behind only when the CPU wrote the pages since (a write unlock moves the seed); the
++    // seed moved by our own device cache is recorded with it (nvmtlSurfaceOutDirtied:), under the same sync
++    if (r->_po && r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed) return;
++    // </wtl>
+     @synchronized (nvmtl_surface_sync(r)) {
+     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
+     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
+@@ -1327,6 +1503,18 @@
+           r->_surfSeed = now; r->_surfSynced = YES; g_surfin_skip++;
+           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
+           return; } }
++    // <wtl> §37.3 phase 1: a private copy of a surface nobody has written (seed 0) could start cleared, not uploaded --
++    // but WindowServer fills its screenshot surfaces without moving the seed (17:19: the clear blanked them), so only
++    // with /private/tmp/xemtl-pageoff-fastclear (experiment)
++    if (r->_po && !r->_surfSynced && IOSurfaceGetSeed(r->_surf) == 0 && access("/private/tmp/xemtl-pageoff-fastclear", F_OK) == 0) {
++        extern int nvmtl_vk_image_zero(nvk_queue *q, nvk_image *img);
++        if (!nvmtl_vk_image_zero(r->_q, &r->_i)) {
++            r->_surfSeed = 0; r->_surfSynced = YES; r->_surfGen = vgen;
++            static _Atomic unsigned nz; if (atomic_fetch_add(&nz, 1) < 16) nvlog("page-off: surface %u %ux%u: new, cleared instead of uploaded", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h);
++            return;
++        }
++    }
++    // </wtl>
+     uint32_t seed = 0;
+     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
+     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+@@ -1373,6 +1561,18 @@
+ - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
+     XeMTLTexture *r = _parent ? _parent : self;
+     if (!r->_surf) return YES;
++    // <wtl> §36.12: no copy, no seed lock -- the accelerator's device cache is made current (the GPU copy is newer) and the
++    // pages are brought up to date when someone locks or scans them.  If the accelerator refuses, copy now as before.
++    if (r->_po) {
++        @synchronized (nvmtl_surface_sync(r)) {
++            if (nvmtl_vk_po_current((uint32_t)IOSurfaceGetID(r->_surf))) {
++                r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES; r->_poDrawn = YES;
++                return YES;
++            }
++        }
++        static unsigned nf; if (nf++ < 8) nvlog("page-off: surface %u: the accelerator took no current mark -- copied out now", (unsigned)IOSurfaceGetID(r->_surf));
++    }
++    // </wtl>
+     if (r->_hostImg) {   // the GPU wrote the surface's pages themselves; a write lock only moves the seed for other processes
+         uint32_t seed = 0;
+         if (!nvmtl_noseed() && IOSurfaceLock(r->_surf, 0, NULL) == kIOReturnSuccess) IOSurfaceUnlock(r->_surf, 0, &seed);
+--- a/plugin/XeMTLDevice.m
++++ b/plugin/XeMTLDevice.m
+@@ -1023,18 +1023,21 @@
+     // <wtl>
+     // Intel/AMD: the image is laid over the surface's own pages (explicit linear layout, the surface's bytesPerRow), so
+     // what the GPU draws is in the surface when the command buffer completes, and CPU writes need no upload (I-108).
+-    if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_host_on()) {
++    if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_host_on() && !t->_poWant) {
+         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
+         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0
+-            && !nvmtl_vk_surface_host_import(IOSurfaceGetBaseAddress(surf), IOSurfaceGetAllocSize(surf), &t->_hostBuf)) {
+-            if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &t->_hostBuf, 0, row, &t->_i)) {
++            && !nvmtl_vk_surface_host_get(surf, &t->_hostBuf)) {
++            // §32.16: a scanout surface is drawn Tile4 (t->_tile4 asks for it; the caller reads back what it got)
++            if (t->_tile4 && nvmtl_vk_image_create_buffer_alias_tile4(w, h, vkf, bpp, a8, stex, 1, &t->_hostBuf, 0, row, &t->_i)) t->_tile4 = NO;
++            if (t->_tile4 || !nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &t->_hostBuf, 0, row, &t->_i)) {
+                 t->_hostState = 1; t->_hostImg = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
+                 static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                     nvmtl_xd_add(XD_SURF_IMPORT, 1);
+                     nvlog("surface %u %ux%u pitch %zu -> an image in the surface's own pages (no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+                 return 0;
+             }
+-            nvmtl_vk_buffer_destroy(&t->_hostBuf); t->_hostState = 0;
++            if (!nvmtl_vk_surface_host_put(&t->_hostBuf)) nvmtl_vk_buffer_destroy(&t->_hostBuf);
++            t->_hostState = 0;
+         }
+     }
+     // </wtl>
+@@ -1062,8 +1065,66 @@
+         { const uint64_t _t0 = mach_absolute_time(); nvmtl_xd_add(XD_SURF_REQ, 1);
+           id<MTLTexture> _tt = [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
+           nvmtl_xd_time(XD_SURF_US, _t0); return _tt; }
++    }
++}
++// <wtl> §32.16 Tile4 scanout: which layout a texture over WindowServer's surface should have.  A scanout surface (the
++// accelerator flipped it lately) that fills a whole BGRA8 surface with 128-byte-aligned rows is drawn Tile4 into its own
++// pages: a linear render target costs ANV 8-13x the GPU time (tools/rt-bench.c).  Everything else stays linear.
++static int nvmtl_tile4_want(IOSurfaceRef surf, NSUInteger plane, size_t w, size_t h, uint32_t vkf)
++{
++    static int ws = -1;
++    if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
++    if (!ws || !surf || plane != 0 || IOSurfaceGetPlaneCount(surf) > 1 || !nvmtl_vk_surface_host_on()) return 0;
++    if (vkf != VK_FORMAT_B8G8R8A8_UNORM && vkf != VK_FORMAT_B8G8R8A8_SRGB) return 0;
++    const size_t row = IOSurfaceGetBytesPerRow(surf);
++    if (w != IOSurfaceGetWidth(surf) || h != IOSurfaceGetHeight(surf) || row != w * 4 || row % 128 || w < 1024) return 0;
++    return nvmtl_vk_tile4_scanout(IOSurfaceGetID(surf));
++}
++extern int nvmtl_tile4_relayout(id<MTLDevice> dev, XeMTLTexture *from, XeMTLTexture *to);
++// §36.12 page-off (docs/36-APPLE-INTEL-DRIVER.md): a full-size BGRA8 surface WindowServer draws into, that is not a
++// scanout surface, gets a private image (optimal tiling: Tile4 on this GPU) instead of an image over its pages.  The
++// pages stay linear; the accelerator's device cache pages the copy off into them when the CPU locks the surface or the
++// display scans it (nvmtl_po_*, NVMTLObjects.m).
++// §37.3 phase 1 / §37.7 / §37.10: a new surface gets its private (compressed) copy at once by default (the accelerator
++// refuses the current mark while the surface is locked; a surface with another root gets none).  With
++// /Library/GPUBundles/.xemtl-pageoff-lazy or /private/tmp/xemtl-pageoff-lazy: the third plugin's promotion after 3 s and 100 commits.
++static int nvmtl_po_eager(void)
++{
++    static _Atomic uint64_t checked; static _Atomic int on = 1;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (now - atomic_load(&checked) > 1000000000ull) {
++        atomic_store(&checked, now);
++        const int v = access("/Library/GPUBundles/.xemtl-pageoff-lazy", F_OK) != 0 && access("/private/tmp/xemtl-pageoff-lazy", F_OK) != 0;
++        if (v != atomic_exchange(&on, v)) nvlog("page-off: private copies %s", v ? "at once (eager)" : "after 3 s and 100 commits");
+     }
++    return atomic_load(&on);
+ }
++static int nvmtl_po_want(IOSurfaceRef surf, NSUInteger plane, size_t w, size_t h, uint32_t vkf, NSUInteger usage)
++{
++    if (!surf || plane != 0 || IOSurfaceGetPlaneCount(surf) > 1 || !(usage & MTLTextureUsageRenderTarget)) return 0;
++    if (vkf != VK_FORMAT_B8G8R8A8_UNORM && vkf != VK_FORMAT_B8G8R8A8_SRGB) return 0;
++    if (w != IOSurfaceGetWidth(surf) || h != IOSurfaceGetHeight(surf) || IOSurfaceGetBytesPerRow(surf) < w * 4 || w < 1024 || h < 600) return 0;
++    if (nvmtl_vk_is_scanout(IOSurfaceGetID(surf))) return 0;
++    extern int nvmtl_po_denied(IOSurfaceRef s);
++    return nvmtl_vk_po_on() && !nvmtl_po_denied(surf);
++}
++void nvmtl_po_register(XeMTLTexture *t);
++void nvmtl_roots_add(XeMTLTexture *t);
++int nvmtl_roots_others(IOSurfaceRef s, XeMTLTexture *except);
++void nvmtl_po_demote_now(XeMTLTexture *r);
++void nvmtl_surface_barrier(XeMTLTexture *t);
++int nvmtl_po_prepare(XeMTLTexture *t);
++XeMTLTexture *nvmtl_po_root(uint32_t sid);
++// </wtl>
++// §37.7 diagnosis: every texture WindowServer makes over a large surface, and what it became (first 600)
++static void nvmtl_roots_log(IOSurfaceRef surf, size_t w, size_t h, MTLTextureDescriptor *d, const char *what)
++{
++    static int ws = -1; static _Atomic unsigned n;
++    if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer");
++    if (!ws || !surf || w < 1024 || h < 600 || atomic_fetch_add(&n, 1) >= 600) return;
++    nvlog("roots: surface %u %zux%zu fmt %lu usage 0x%lx seed %u roots %d: %s", (unsigned)IOSurfaceGetID(surf), w, h,
++          (unsigned long)d.pixelFormat, (unsigned long)d.usage, IOSurfaceGetSeed(surf), nvmtl_roots_others(surf, nil), what);
++}
+ - (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
+     // Compatible GPU storage is not compatible raw IOSurface XR encoding.
+     // Keep this previously unsupported import closed until conversion exists;
+@@ -1084,6 +1145,50 @@
+     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+     NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+     XeMTLTexture *backing = key ? [cache objectForKey:key] : nil;
++    // <wtl> §36.12: a surface with a private copy has ONE copy, whatever 4-byte format a wrapper asks for
++    if (surf && !backing && bpp == 4) {
++        XeMTLTexture *po = nvmtl_po_root(IOSurfaceGetID(surf));
++        if (po && po->_po && po->_surf == surf && po->_plane == plane && po->_i.w == w && po->_i.h == h) backing = po;
++    }
++    const BOOL poWant = surf && !backing && nvmtl_po_want(surf, plane, w, h, vkf, d.usage) && !nvmtl_roots_others(surf, nil);   // §37.7: the one root
++    // </wtl>
++    // <wtl> §32.16: textures over a surface always have the layout its content is in.  When a scanout surface should
++    // change layout (it became one, or Tile4 was switched off), a new backing in the other layout is made over the same
++    // pages and the content is copied across on the GPU first; if that fails the surface keeps the layout it has.
++    {
++        static _Atomic int t4fail;   // three failed re-layouts: no more attempts (each one waits for the GPU)
++        const uint32_t sid = surf ? IOSurfaceGetID(surf) : 0;
++        const int have0 = (backing && backing->_hostImg) ? backing->_tile4 : (sid ? nvmtl_vk_tile4_content(sid) : 0);
++        const int want = atomic_load(&t4fail) >= 3 ? have0 : nvmtl_tile4_want(surf, plane, w, h, vkf);
++        const int have = have0;
++        if (sid && (backing == nil || backing->_hostImg) && want != have) {
++            XeMTLTexture *from = backing, *to = [XeMTLTexture new];
++            if (!from) {
++                from = [XeMTLTexture new]; from->_tile4 = have ? YES : NO;
++                if (nvmtl_surface_image_create(from, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex) || !from->_hostImg || from->_tile4 != (have != 0)) from = nil;
++                else { from->_q = nvmtl_device_queue(); from->_surf = surf; CFRetain(surf); from->_surfOwned = YES; from->_plane = plane; from->_fmt = d.pixelFormat; from->_usage = d.usage; }
++            }
++            to->_tile4 = want ? YES : NO;
++            if (!from) atomic_fetch_add(&t4fail, 1);
++            if (from && !nvmtl_surface_image_create(to, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex) && to->_hostImg
++                && to->_tile4 == (want != 0)) {
++                to->_q = nvmtl_device_queue(); to->_surf = surf; CFRetain(surf); to->_surfOwned = YES; to->_plane = plane;
++                to->_fmt = d.pixelFormat; to->_stex = to->_i.storage != 0; to->_usage = d.usage; to->_ropt = t->_ropt; to->_fbo = t->_fbo;
++                nvmtl_texture_desc_swizzle(to, d);
++                if (nvmtl_tile4_relayout(self, from, to)) {
++                    nvmtl_vk_tile4_content_set(sid, want);
++                    (void)nvmtl_vk_surface_gpu_mark2(sid, 2, want);	// the accelerator scans it with the new layout
++                    [cache setObject:to forKey:key]; nvmtl_roots_add(to);   // <wtl> §37.7
++                    backing = to;
++                    nvlog("Tile4: surface %u %zux%zu re-laid out %s -> %s", sid, w, h, have ? "Tile4" : "linear", want ? "Tile4" : "linear");
++                } else { atomic_fetch_add(&t4fail, 1);
++                    nvlog("Tile4: surface %u: re-layout %s -> %s failed; it stays %s", sid, have ? "Tile4" : "linear", want ? "Tile4" : "linear", have ? "Tile4" : "linear"); }
++            }
++            t->_tile4 = have ? YES : NO;	// a new texture below takes the content's layout
++            if (backing == to) t->_tile4 = want ? YES : NO;
++        } else t->_tile4 = have ? YES : NO;
++    }
++    // </wtl>
+     // Failed BAR imports use a private image. Repeated wrappers of the same
+     // surface must share that image, just as successful family imports do,
+     // whether a wrapper reads it or writes it (the image is made writable).
+@@ -1093,11 +1198,21 @@
+         XeMTLTexture *alias = (XeMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+         if (alias) {
+             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
++            alias->_tile4 = backing->_tile4;   // <wtl> §32.16
+             nvmtl_texture_desc_swizzle(alias, d);
+             if(surf)nvmtl_vk_diag_surface([alias nvi],IOSurfaceGetID(surf));
++            nvmtl_roots_log(surf, w, h, d, backing->_po ? "view of its private copy" : "view of a root");
+             return alias;
+         }
+     }
++    // <wtl> §37.7: a new root over a surface whose private copy it cannot share: the copy goes back to the pages first
++    const char *how = NULL;
++    if (surf) {
++        XeMTLTexture *po = nvmtl_po_root(IOSurfaceGetID(surf));
++        if (po && po->_po && po->_surf == surf) { nvmtl_po_demote_now(po); how = "new root, its private copy demoted first"; }
++    }
++    // </wtl>
++    t->_poWant = poWant && nvmtl_po_eager();   // <wtl> §36.12: over its pages first; a private copy only once it proves long-lived (nvmtl_po_promote)
+     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
+         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
+     t->_q = nvmtl_device_queue();
+@@ -1108,7 +1223,13 @@
+     t->_stex = t->_i.storage != 0;
+     t->_usage = d.usage;
+     nvmtl_texture_desc_swizzle(t, d);
++    if (t->_poWant && !t->_hostImg && !t->_vramOn && nvmtl_po_prepare(t)) { t->_po = YES; nvmtl_po_register(t); }   // <wtl> §36.12: eager
++    else if (poWant && t->_hostImg && !t->_vramOn && !t->_tile4) { t->_poCand = YES; t->_poBornNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }   // <wtl> §36.12
++    t->_poWant = NO;
+     if (key && !t->_vramOn) [cache setObject:t forKey:key];
++    nvmtl_roots_add(t);   // <wtl> §37.7
++    nvmtl_surface_barrier(t);   // <wtl> §37.7: a write-back of a root going away finishes first
++    nvmtl_roots_log(surf, w, h, d, how ? how : t->_po ? "new root, private copy" : t->_hostImg ? "new root over its pages" : "new root, other");
+     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
+           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
+     return t; }
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -81,10 +81,14 @@
+     return v;
+ }
+ /* the vendor of the accelerator a Metal device was made on (0 if the port is neither of ours); the first one wins */
++static io_service_t g_nmx_accel;   /* <wtl> §32.15: the AMD/Intel accelerator, for the WindowServer surface marks */
+ uint16_t nvmtl_vk_set_accelerator(mach_port_t accel)
+ {
+     uint16_t v = 0;
+-    if (accel && IOObjectConformsTo(accel, "NMXAccel")) { v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0; }
++    if (accel && IOObjectConformsTo(accel, "NMXAccel")) {
++        v = nvmtl_pci_vendor_of(accel); if (v != 0x1002 && v != 0x8086) v = 0;
++        if (v && !g_nmx_accel && IOObjectRetain(accel) == KERN_SUCCESS) g_nmx_accel = accel;
++    }
+     else if (accel && IOObjectConformsTo(accel, "NVAccel")) v = 0x10de;
+     if (v && !g_vendor) g_vendor = v;
+     return v;
+@@ -713,6 +717,15 @@
+             }
+         }
+     }
++    // <wtl> §37.3 phase 0: /private/tmp/xemtl-noccs turns ANV's render compression (CCS) off for this process, to
++    // measure what it saves.  Read once, before the driver loads (INTEL_DEBUG is parsed when it starts).
++    if (access("/private/tmp/xemtl-noccs", F_OK) == 0) {
++        const char *was = getenv("INTEL_DEBUG"); char v[256];
++        snprintf(v, sizeof v, "%s%snoccs", was && *was ? was : "", was && *was ? "," : "");
++        setenv("INTEL_DEBUG", v, 1);
++        nvlog("vk: render compression OFF (INTEL_DEBUG=%s, /private/tmp/xemtl-noccs)", v);
++    }
++    // </wtl>
+     g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
+     if (g_lib) {
+         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
+@@ -784,21 +797,22 @@
+     float prio = 1.0f;
+     VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, g_qfam, 1, &prio };
+ 
+-    static const char *kWant[16] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
++    static const char *kWant[17] = { "VK_EXT_extended_dynamic_state3", "VK_EXT_depth_clip_enable", "VK_EXT_memory_budget",
+                                     "VK_KHR_acceleration_structure", "VK_KHR_ray_query", "VK_KHR_deferred_host_operations",
+                                     "VK_EXT_external_memory_host",
+                                     "VK_EXT_image_drm_format_modifier",
+                                     "VK_KHR_external_memory_fd",
+                                     "VK_EXT_mutable_descriptor_type", "VK_KHR_cooperative_matrix", "VK_EXT_calibrated_timestamps", "VK_EXT_sample_locations", "VK_KHR_pipeline_executable_properties",
+-                                    "VK_EXT_provoking_vertex", "VK_KHR_vertex_attribute_divisor" };
+-    const char *exts[16]; uint32_t next = 0; int have[16] = {0};
++                                    "VK_EXT_provoking_vertex", "VK_KHR_vertex_attribute_divisor",
++                                    "VK_KHR_global_priority" };
++    const char *exts[17]; uint32_t next = 0; int have[17] = {0};
+     uint32_t na = 0;
+     if (pvkEnumerateDeviceExtensionProperties &&
+         pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, NULL) == VK_SUCCESS && na) {
+         VkExtensionProperties *props = calloc(na, sizeof *props);
+         if (props && pvkEnumerateDeviceExtensionProperties(g_pdev, NULL, &na, props) == VK_SUCCESS)
+             for (uint32_t i = 0; i < na; i++)
+-                for (int w = 0; w < 16; w++)
++                for (int w = 0; w < 17; w++)
+                     if (!have[w] && !strcmp(props[i].extensionName, kWant[w])) { have[w] = 1; exts[next++] = kWant[w]; }
+         free(props);
+     }
+@@ -981,7 +995,21 @@
+     nvlog("vk: tessellation %s, vertex-stage stores %s", g_tess ? "AVAILABLE" : "ABSENT", supported.vertexPipelineStoresAndAtomics ? "on" : "off");
+     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, g_dyn3 ? (const void *)&dyn3 : (const void *)&v11, 0,
+                                1, &qci, 0, NULL, next, next ? exts : NULL, &enabled };
+-    VKCK(pvkCreateDevice(g_pdev, &dci, NULL, &g_dev), "vkCreateDevice");
++    // <wtl> §32.16: WindowServer's queue runs at HIGH priority, so the GuC schedules (and preempts for) its composites
++    // ahead of every app's work; at the default priority one app's long batch held a composite past the flip's 100 ms
++    // bound and the panel froze for that long. The core lets only WindowServer raise it (i915 asks CAP_SYS_NICE); an
++    // older core refuses with NOT_PERMITTED and the queue is made at the default priority, as before.
++    VkDeviceQueueGlobalPriorityCreateInfoKHR qprio = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR, NULL,
++                                                       VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR };
++    const char *me = getprogname(); int made = 0;
++    if (have[16] && me && !strcmp(me, "WindowServer") && !getenv("XEMTL_NO_PRIORITY")) {
++        qci.pNext = &qprio;
++        const VkResult pr = pvkCreateDevice(g_pdev, &dci, NULL, &g_dev);
++        nvlog("vk: WindowServer queue at HIGH GPU priority: %s (VkResult %d)", pr == VK_SUCCESS ? "yes" : "refused, default priority", (int)pr);
++        made = pr == VK_SUCCESS;
++        qci.pNext = NULL;
++    }
++    if (!made) VKCK(pvkCreateDevice(g_pdev, &dci, NULL, &g_dev), "vkCreateDevice");
+     DEVICE_FNS(LOAD_D)
+     if (g_pstat) { p_pstat_props = (PFN_vkGetPipelineExecutablePropertiesKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutablePropertiesKHR");
+                    p_pstat_stats = (PFN_vkGetPipelineExecutableStatisticsKHR)pvkGetDeviceProcAddr(g_dev, "vkGetPipelineExecutableStatisticsKHR");
+@@ -1441,6 +1469,26 @@
+     }
+     return 1;
+ }
++// <wtl> §32.11: every host-pointer import is a new i915 userptr object, pinned on its first submit; a 5 s summary says
++// how many there are, how big, and how many the surface cache saved (nvmtl_vk_surface_host_get).
++static _Atomic uint64_t g_hi_n, g_hi_bytes, g_hi_big, g_hi_last;
++static _Atomic uint64_t g_hc_hits, g_hc_misses, g_hc_evicted, g_hc_full, g_hc_sameid, g_hc_inuse;
++static _Atomic uint32_t g_hc_lastid;
++static void nvmtl_hi_note(size_t size)
++{
++    atomic_fetch_add(&g_hi_n, 1); atomic_fetch_add(&g_hi_bytes, size);
++    if (size >= (1u << 20)) atomic_fetch_add(&g_hi_big, 1);
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), last = atomic_load(&g_hi_last);
++    if (now - last < 5000000000ull || !atomic_compare_exchange_strong(&g_hi_last, (uint64_t *)&last, now)) return;
++    nvlog("vk: host imports so far: %llu (%llu MB, %llu of them >= 1 MB); surface cache %llu hits, %llu imports, %llu freed, %llu uncached; "
++          "misses on a cached ID with another size %llu; %llu entries in use; last miss id %u",
++          (unsigned long long)atomic_load(&g_hi_n), (unsigned long long)(atomic_load(&g_hi_bytes) >> 20),
++          (unsigned long long)atomic_load(&g_hi_big), (unsigned long long)atomic_load(&g_hc_hits),
++          (unsigned long long)atomic_load(&g_hc_misses), (unsigned long long)atomic_load(&g_hc_evicted),
++          (unsigned long long)atomic_load(&g_hc_full), (unsigned long long)atomic_load(&g_hc_sameid), (unsigned long long)atomic_load(&g_hc_inuse),
++          (unsigned)atomic_load(&g_hc_lastid));
++}
++// </wtl>
+ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
+ {
+     if (nvmtl_vk_init()) return -1;
+@@ -1486,6 +1534,7 @@
+         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
+         out->buf = NULL; out->mem = NULL; return -1; }
+     out->map = ptr; out->alloc = size; out->imported = 1; out->mtype1 = mt + 1;
++    nvmtl_hi_note(size);
+     nvmtl_loss_event("host_pointer_import",NULL,0,0,g_state,g_state,0,(uintptr_t)out->buf,(uintptr_t)out->mem,size,0);
+     g_alloc_bytes += size; g_buf_made++;
+     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
+@@ -1903,6 +1952,11 @@
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
+     VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "colour"), "vkAllocateMemory(image)");
+     out->alloc = mr.size;
++    { static _Atomic unsigned nsz;   // <wtl> §37.3 phase 0: with CCS the size is the pixels plus about 1/256 (ANV's compression control buffer)
++      if (w >= 1024 && h >= 600 && mips == 1 && layers <= 1 && atomic_fetch_add(&nsz, 1) < 24)
++          nvlog("ccs: private image %ux%u fmt %u%s: %llu bytes for %llu of pixels (+%lld, align %llu)", w, h, vkfmt, storage ? " storage" : "",
++                (unsigned long long)mr.size, (unsigned long long)w * h * out->bpp, (long long)mr.size - (long long)((uint64_t)w * h * out->bpp),
++                (unsigned long long)mr.alignment); }
+     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory");
+     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
+                                 : (VkComponentMapping){ 0, 0, 0, 0 };
+@@ -1961,11 +2015,151 @@
+    that publishes NVAccelSurfaceWait is asked): 0 marked, 1 the lock was taken, -1 refused */
+ int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane) { return nvmtl_vk_surface_mark_newest(surfaceID, plane, 0x40000000u); }
+ // WindowServer completion mark (NVAccel nvSurfGpuEscape), on NVK's surface escape: 0 = the kernel took it
+-uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
++// <wtl> §32.15 (native-display docs/32-FRAME-RATE.md): on AMD/Intel there is no NVK surface escape; the marks go to
++// XeGfxAccel's DRM client (the 'XGDR' user client WindowServer's libdrm already uses), selector 1 (surface ID, pending).
++// The accelerator takes WindowServer's marks only; an accelerator without the selector answers an error, and
++// WindowServer then waits for its own composites as before (nvmtl_ws_kernel_waits).
++static io_connect_t g_mark_conn;
++static io_connect_t nvmtl_mark_conn(void)
+ {
+-    if (!pnvk_surface_dirty || !g_dev) return 0x80000002u;
++    static int opened;
++    if (!opened) {
++        opened = 1;
++        if (!g_nmx_accel || IOServiceOpen(g_nmx_accel, mach_task_self(), 0x58474452u /* 'XGDR' */, &g_mark_conn) != KERN_SUCCESS)
++            g_mark_conn = 0;
++    }
++    return g_mark_conn;
++}
++static uint32_t nvmtl_nmx_surface_mark(uint32_t surfaceID, int pending)
++{
++    if (!nvmtl_mark_conn()) return 0x80000002u;
++    const uint64_t in[2] = { surfaceID, pending ? 1u : 0u };
++    return (uint32_t)IOConnectCallScalarMethod(g_mark_conn, 1, in, 2, NULL, NULL);
++}
++uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending)
++{
++    if (!pnvk_surface_dirty || !g_dev) return nvmtl_nmx_surface_mark(surfaceID, pending);
+     return pnvk_surface_dirty(g_dev, surfaceID, 0x80000000u | (pending ? 1u : 0u));
++}
++// <wtl> §32.16 Tile4 scanout (native-display docs/32-FRAME-RATE.md).  A linear render target costs ANV 8-13x the GPU
++// time of a tiled one, and WindowServer draws every frame into its scanout surfaces.  Those are drawn Tile4 into their
++// own pages instead and the plane scans them Tile4.  Selector 2 of the accelerator's DRM client is selector 1 plus the
++// layout this commit draws (Tile4 or not; pending 2 = record the layout only); its answer says whether the surface was
++// flipped lately (bit 0, a scanout surface) and whether Tile4 scanout is on (bit 1).  An accelerator without selector 2
++// leaves everything linear.  /private/tmp/xemtl-no-tile4 (checked every second) or XEMTL_NO_TILE4 keep it linear too.
++static _Atomic int g_t4_sel;        // 0 untried, 1 selector 2 answers, -1 it does not
++static _Atomic int g_t4_on;
++static _Atomic uint32_t g_t4_scan[8];
++static _Atomic unsigned g_t4_scan_next;
++uint32_t nvmtl_vk_surface_gpu_mark2(uint32_t surfaceID, int pending, int tile4)
++{
++    if (pnvk_surface_dirty && g_dev) return nvmtl_vk_surface_gpu_mark(surfaceID, pending == 1);
++    if (atomic_load(&g_t4_sel) >= 0 && nvmtl_mark_conn()) {
++        const uint64_t in[3] = { surfaceID, (uint64_t)pending, tile4 ? 1u : 0u };
++        uint64_t out = 0; uint32_t outn = 1;
++        const kern_return_t kr = IOConnectCallScalarMethod(g_mark_conn, 2, in, 3, &out, &outn);
++        if (kr == KERN_SUCCESS) {
++            if (atomic_exchange(&g_t4_sel, 1) != 1) nvlog("Tile4: the accelerator takes layout marks (selector 2), scanout Tile4 %s", (out & 2) ? "on" : "off");
++            atomic_store(&g_t4_on, (out & 2) ? 1 : 0);
++            if ((out & 1) && surfaceID) {
++                int known = 0;
++                for (unsigned i = 0; i < 8; i++) if (atomic_load(&g_t4_scan[i]) == surfaceID) { known = 1; break; }
++                if (!known) {
++                    atomic_store(&g_t4_scan[atomic_fetch_add(&g_t4_scan_next, 1) & 7], surfaceID);
++                    nvlog("Tile4: surface %u is a scanout surface", surfaceID);
++                }
++            }
++            return 0;
++        }
++        if (atomic_load(&g_t4_sel) == 0) { atomic_store(&g_t4_sel, -1); nvlog("Tile4: no selector 2 (0x%x) -- WindowServer's surfaces stay linear", kr); }
++    }
++    return pending == 2 ? 0 : nvmtl_nmx_surface_mark(surfaceID, pending == 1);
++}
++// 1 when surface id is a scanout surface to draw Tile4 now
++int nvmtl_vk_tile4_scanout(uint32_t id)
++{
++    static _Atomic uint64_t checked; static _Atomic int off;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (now - atomic_load(&checked) > 1000000000ull) {
++        atomic_store(&off, getenv("XEMTL_NO_TILE4") != NULL || access("/private/tmp/xemtl-no-tile4", F_OK) == 0);
++        atomic_store(&checked, now);
++    }
++    if (!id || atomic_load(&off) || atomic_load(&g_t4_sel) != 1 || !atomic_load(&g_t4_on)) return 0;
++    for (unsigned i = 0; i < 8; i++) if (atomic_load(&g_t4_scan[i]) == id) return 1;
++    return 0;
++}
++// 1 when the accelerator reported surface id flipped lately, whether or not Tile4 scanout is on
++int nvmtl_vk_is_scanout(uint32_t id)
++{
++    if (!id) return 0;
++    for (unsigned i = 0; i < 8; i++) if (atomic_load(&g_t4_scan[i]) == id) return 1;
++    return 0;
++}
++// §36.12 page-off (native-display docs/36-APPLE-INTEL-DRIVER.md): WindowServer's full-size surfaces are drawn into a
++// private Tile4 copy; their own pages stay linear and are brought up to date only when the CPU locks them or the
++// display scans them -- the accelerator's device cache on the surface asks this process's page-off thread for it.
++// Selector 5 (id): the copy is newer than the pages now; 0 probes.  6 (ms): wait for a request.  7 (id, seq, ok): done.
++// 8 (id): the copy is gone.  Off unless /private/tmp/xemtl-pageoff exists (checked every second); XEMTL_NO_PAGEOFF
++// keeps it off.  A surface that already has a copy keeps it when the switch goes off; new surfaces get none.
++int nvmtl_vk_po_on(void)
++{
++    static int ws = -1, sel = 0; static _Atomic uint64_t checked; static _Atomic int on;
++    if (ws < 0) ws = getprogname() && !strcmp(getprogname(), "WindowServer") && !getenv("XEMTL_NO_PAGEOFF");
++    if (!ws || !nvmtl_vk_surface_host_on()) return 0;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (now - atomic_load(&checked) > 1000000000ull) {
++        atomic_store(&checked, now);
++        // §37.10: on by default (screenshots verified with §37.8's one-root rule); off with /Library/GPUBundles/.xemtl-no-pageoff
++        // (kept across boots) or /private/tmp/xemtl-no-pageoff (until the next boot)
++        int want = access("/Library/GPUBundles/.xemtl-no-pageoff", F_OK) != 0 && access("/private/tmp/xemtl-no-pageoff", F_OK) != 0;
++        if (want && sel == 0) {
++            const uint64_t in = 0;
++            sel = (nvmtl_mark_conn() && IOConnectCallScalarMethod(g_mark_conn, 5, &in, 1, NULL, NULL) == KERN_SUCCESS) ? 1 : -1;
++            nvlog("page-off: the accelerator %s selector 5", sel > 0 ? "takes" : "does NOT take");
++        }
++        if (want != atomic_load(&on)) nvlog("page-off: new private surface copies %s", want && sel > 0 ? "ON" : "off");
++        atomic_store(&on, want);
++    }
++    return atomic_load(&on) && sel > 0;
++}
++int nvmtl_vk_po_current(uint32_t id)
++{
++    const uint64_t in = id;
++    return id && nvmtl_mark_conn() && IOConnectCallScalarMethod(g_mark_conn, 5, &in, 1, NULL, NULL) == KERN_SUCCESS;
++}
++uint64_t nvmtl_vk_po_wait(uint32_t ms)
++{
++    const uint64_t in = ms; uint64_t out = 0; uint32_t n = 1;
++    if (!nvmtl_mark_conn() || IOConnectCallScalarMethod(g_mark_conn, 6, &in, 1, &out, &n) != KERN_SUCCESS) { usleep(100000); return 0; }
++    return out;
++}
++void nvmtl_vk_po_done(uint32_t id, uint32_t seq, int ok)
++{
++    const uint64_t in[3] = { id, seq, ok ? 1u : 0u };
++    if (nvmtl_mark_conn()) (void)IOConnectCallScalarMethod(g_mark_conn, 7, in, 3, NULL, NULL);
++}
++void nvmtl_vk_po_detach(uint32_t id)
++{
++    const uint64_t in = id;
++    if (id && nvmtl_mark_conn()) (void)IOConnectCallScalarMethod(g_mark_conn, 8, &in, 1, NULL, NULL);
++}
++// the layout each surface's content is in now (Tile4 1), as this process last drew or re-laid it out; 32 entries
++static _Atomic uint32_t g_t4_content_id[32];
++static _Atomic int g_t4_content_t4[32];
++int nvmtl_vk_tile4_content(uint32_t id)
++{
++    for (unsigned i = 0; i < 32; i++) if (atomic_load(&g_t4_content_id[i]) == id) return atomic_load(&g_t4_content_t4[i]);
++    return 0;
++}
++void nvmtl_vk_tile4_content_set(uint32_t id, int tile4)
++{
++    static _Atomic unsigned next;
++    for (unsigned i = 0; i < 32; i++) if (atomic_load(&g_t4_content_id[i]) == id) { atomic_store(&g_t4_content_t4[i], tile4); return; }
++    if (!tile4) return;	// linear is what an unknown surface is in
++    const unsigned i = atomic_fetch_add(&next, 1) & 31;
++    atomic_store(&g_t4_content_t4[i], tile4); atomic_store(&g_t4_content_id[i], id);
+ }
++// </wtl>
+ /* 1 when NVAccel publishes NVAccelSurfaceWait: its page-off waits for a surface WindowServer's GPU is still writing */
+ int nvmtl_vk_accel_surface_wait(void)
+ {
+@@ -5014,7 +5208,7 @@
+               VkQueryPool qp; if (pvkCreateQueryPool(g_dev, &qi, NULL, &qp) == VK_SUCCESS) { pvkCmdResetQueryPool(c->cb, qp, 0, 256); c->pt_pool = (void *)qp; } }
+           if (c->pt_pool) { pvkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, (VkQueryPool)c->pt_pool, 2 * c->pt_n);
+               c->pt_w[c->pt_n] = ps->w; c->pt_h[c->pt_n] = ps->h; c->pt_f[c->pt_n] = ncol ? cf[0] : (p->has_depth ? 1000u + p->dfmt : 0u); c->pt_open = 1;
+-              memset(c->pt_fs[c->pt_n], 0, sizeof c->pt_fs[c->pt_n]); }
++              memset(c->pt_fs[c->pt_n], 0, sizeof c->pt_fs[c->pt_n]); c->pt_d[c->pt_n] = 0; }
+       } }
+     pvkCmdBeginRenderPass(c->cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+     c->in_rp = 1;
+@@ -5425,6 +5619,7 @@
+  */
+ #define NVMTL_SEMU_DRAW(c, DRAW) do { \
+     if ((c)->skip_group) break; \
++    if ((c)->pt_open) (c)->pt_d[(c)->pt_n]++; \
+     if (!(c)->semu_layout) { DRAW; break; } \
+     uint32_t z_ = 0; const uint32_t m_ = (c)->st_wmask[0] | (c)->st_wmask[1]; \
+     pvkCmdPushConstants((c)->cb, (VkPipelineLayout)(c)->semu_layout, VK_SHADER_STAGE_FRAGMENT_BIT, NVMTL_STENCIL_EMU_OFFSET, 4, &z_); \
+@@ -5934,8 +6129,8 @@
+             for (unsigned i = 0; pf && i < n; i++) {
+                 const double gpu = (double)((r[2 * i + 1] - r[2 * i]) & mask) * us;
+                 const double gap = i ? (double)((r[2 * i] - r[2 * i - 1]) & mask) * us : 0.0;
+-                fprintf(pf, "cb %llu pass %u %ux%u fmt %u gpu_us %.1f gap_us %.1f fs %08x %08x %08x %08x\n", (unsigned long long)seq, i, c->pt_w[i], c->pt_h[i], c->pt_f[i], gpu, gap,
+-                        c->pt_fs[i][0], c->pt_fs[i][1], c->pt_fs[i][2], c->pt_fs[i][3]);
++                fprintf(pf, "cb %llu pass %u %ux%u fmt %u gpu_us %.1f gap_us %.1f fs %08x %08x %08x %08x draws %u\n", (unsigned long long)seq, i, c->pt_w[i], c->pt_h[i], c->pt_f[i], gpu, gap,
++                        c->pt_fs[i][0], c->pt_fs[i][1], c->pt_fs[i][2], c->pt_fs[i][3], c->pt_d[i]);
+             }
+             if (pf) fflush(pf);
+         }
+@@ -6417,7 +6612,139 @@
+         return 0;
+     }
+     return nvmtl_vk_buffer_import_host(base, alloc & ~(g_host_align - 1), out);
++}
++// <wtl> Surface host-import cache (native-display docs/32-FRAME-RATE.md §32.10).  WindowServer wraps the same IOSurfaces
++// in new MTLTextures every frame; each texture imported the surface's pages again, which is a new i915 userptr object
++// whose first execbuffer pins every page (~7 ms for a 3840x2400 surface) and binds it again (~3 ms) -- most of the
++// ~6 ms an execbuffer took, all of it under the command-buffer class lock.  The import is now shared per IOSurface:
++// textures take a reference (a copy of the nvk_buffer) and give it back on dealloc; the cache holds the IOSurface
++// (CFRetain), so its pages stay the ones the import pinned, and an import nobody uses is freed after 2 s, or sooner when
++// idle imports exceed the byte budget.  XEMTL_NO_SURFACE_CACHE=1 imports per texture as before.
++// Keyed by IOSurface ID and size, not by the IOSurfaceRef: WindowServer looks the same surface up again for every frame,
++// a new ref mapped at a new address each time (the ref-keyed first version missed ~45 times a second on refs whose ID
++// was already cached).  Every ref of an ID is the same kernel surface with the same pages, and the retained ref keeps
++// that surface -- and so its ID -- alive, so the ID cannot name another surface while it is cached.  The GPU reaches
++// the pages through the import; the import's CPU view is the retained ref's mapping, which lives as long as the entry.
++#include <IOSurface/IOSurfaceRef.h>
++#define NVMTL_HC_SLOTS 96
++#define NVMTL_HC_IDLE_NS 2000000000ull
++#define NVMTL_HC_IDLE_BYTES (768ull << 20)
++#define NVMTL_HC_GONE 8
++typedef struct { IOSurfaceRef surf; uint32_t id; void *base; size_t alloc; nvk_buffer b; int refs; uint64_t idle; } nvmtl_hc_ent;
++static nvmtl_hc_ent g_hc[NVMTL_HC_SLOTS];
++static pthread_mutex_t g_hc_lock = PTHREAD_MUTEX_INITIALIZER;
++static int nvmtl_hc_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("XEMTL_NO_SURFACE_CACHE");
++        on = !(e && e[0] == '1');
++        nvlog("vk: surface host imports %s (XEMTL_NO_SURFACE_CACHE=%s)", on ? "shared per IOSurface" : "made per texture", e ? e : "unset");
++    }
++    return on;
++}
++// Under g_hc_lock: takes idle imports past their 2 s, then the oldest idle ones while idle imports exceed the budget,
++// out of the table into gone[] (at most NVMTL_HC_GONE; the rest go next time).  The caller frees them unlocked.
++static unsigned nvmtl_hc_sweep(uint64_t now, nvmtl_hc_ent *gone)
++{
++    unsigned n = 0; uint64_t idle_bytes = 0;
++    for (unsigned i = 0; i < NVMTL_HC_SLOTS && n < NVMTL_HC_GONE; i++) {
++        nvmtl_hc_ent *e = &g_hc[i];
++        if (!e->surf || e->refs) continue;
++        if (now - e->idle > NVMTL_HC_IDLE_NS) { gone[n++] = *e; memset(e, 0, sizeof *e); }
++        else idle_bytes += e->alloc;
++    }
++    while (idle_bytes > NVMTL_HC_IDLE_BYTES && n < NVMTL_HC_GONE) {
++        nvmtl_hc_ent *old = NULL;
++        for (unsigned i = 0; i < NVMTL_HC_SLOTS; i++)
++            if (g_hc[i].surf && !g_hc[i].refs && (!old || g_hc[i].idle < old->idle)) old = &g_hc[i];
++        if (!old) break;
++        idle_bytes -= old->alloc; gone[n++] = *old; memset(old, 0, sizeof *old);
++    }
++    return n;
+ }
++static void nvmtl_hc_free(nvmtl_hc_ent *gone, unsigned n)
++{
++    for (unsigned i = 0; i < n; i++) { nvmtl_vk_buffer_destroy(&gone[i].b); CFRelease(gone[i].surf); }
++    if (n) atomic_fetch_add(&g_hc_evicted, n);
++}
++// The IOSurface's pages as device memory, shared with every other texture on the same surface.  0 on success;
++// give it back with nvmtl_vk_surface_host_put().
++int nvmtl_vk_surface_host_get(IOSurfaceRef surf, nvk_buffer *out)
++{
++    memset(out, 0, sizeof *out);
++    if (!surf) return -1;
++    void *base = IOSurfaceGetBaseAddress(surf);
++    const size_t alloc = IOSurfaceGetAllocSize(surf);
++    const uint32_t id = IOSurfaceGetID(surf);
++    if (!nvmtl_hc_on()) return nvmtl_vk_surface_host_import(base, alloc, out);
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    nvmtl_hc_ent gone[NVMTL_HC_GONE]; unsigned ng;
++    pthread_mutex_lock(&g_hc_lock);
++    for (unsigned i = 0; i < NVMTL_HC_SLOTS; i++) {
++        nvmtl_hc_ent *e = &g_hc[i];
++        if (e->surf && e->id == id && e->alloc == alloc) {
++            e->refs++; *out = e->b;
++            pthread_mutex_unlock(&g_hc_lock);
++            atomic_fetch_add(&g_hc_hits, 1);
++            return 0;
++        }
++    }
++    {
++        unsigned inuse = 0;
++        for (unsigned i = 0; i < NVMTL_HC_SLOTS; i++) {
++            const nvmtl_hc_ent *e = &g_hc[i];
++            if (!e->surf) continue;
++            if (e->refs) inuse++;
++            if (e->id == id) atomic_fetch_add(&g_hc_sameid, 1);	/* same ID, another size: a resized surface */
++        }
++        atomic_store(&g_hc_inuse, inuse); atomic_store(&g_hc_lastid, id);
++    }
++    ng = nvmtl_hc_sweep(now, gone);
++    pthread_mutex_unlock(&g_hc_lock);
++    nvmtl_hc_free(gone, ng);
++    nvk_buffer b;
++    if (nvmtl_vk_surface_host_import(base, alloc, &b)) return -1;
++    atomic_fetch_add(&g_hc_misses, 1);
++    nvk_buffer dup; memset(&dup, 0, sizeof dup);
++    pthread_mutex_lock(&g_hc_lock);
++    nvmtl_hc_ent *slot = NULL;
++    for (unsigned i = 0; i < NVMTL_HC_SLOTS; i++) {
++        nvmtl_hc_ent *e = &g_hc[i];
++        if (e->surf && e->id == id && e->alloc == alloc) { e->refs++; *out = e->b; dup = b; slot = e; break; }  // raced
++        if (!e->surf && !slot) slot = e;
++    }
++    if (slot && !dup.mem) {
++        slot->surf = (IOSurfaceRef)CFRetain(surf); slot->id = id; slot->base = base; slot->alloc = alloc; slot->b = b; slot->refs = 1;
++        slot->idle = 0; *out = b;
++    } else if (!slot) {
++        *out = b; atomic_fetch_add(&g_hc_full, 1);   // table full: this texture owns its own import, as before
++    }
++    pthread_mutex_unlock(&g_hc_lock);
++    if (dup.mem) nvmtl_vk_buffer_destroy(&dup);
++    return 0;
++}
++// Gives a texture's import back.  1 when it was the cache's (b is cleared), 0 when the caller owns it (destroy it).
++int nvmtl_vk_surface_host_put(nvk_buffer *b)
++{
++    if (!b || !b->mem) return 0;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    nvmtl_hc_ent gone[NVMTL_HC_GONE]; unsigned ng; int mine = 0;
++    pthread_mutex_lock(&g_hc_lock);
++    for (unsigned i = 0; i < NVMTL_HC_SLOTS; i++) {
++        nvmtl_hc_ent *e = &g_hc[i];
++        if (e->surf && e->b.mem == b->mem) {
++            if (e->refs > 0 && --e->refs == 0) e->idle = now;
++            mine = 1; break;
++        }
++    }
++    ng = nvmtl_hc_sweep(now, gone);
++    pthread_mutex_unlock(&g_hc_lock);
++    nvmtl_hc_free(gone, ng);
++    if (mine) memset(b, 0, sizeof *b);
++    return mine;
++}
++// </wtl>
+ // to_image: buffer -> image (surface-in), else image -> buffer (surface-out); off/row_bytes locate the plane in hb
+ int nvmtl_vk_image_xfer_host(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t off, size_t row_bytes, int to_image)
+ {
+@@ -6463,6 +6790,24 @@
+         else          __atomic_fetch_add(&g_vk_host_out, 1, __ATOMIC_RELAXED);
+     }
+     return xrc;
++}
++// §37.3 phase 1: a private copy of a surface nobody has written yet (seed 0: its pages are the kernel's zero fill) is
++// cleared to zero instead of uploaded -- with CCS a clear writes almost nothing.  Ends as the upload above does.
++int nvmtl_vk_image_zero(nvk_queue *q, nvk_image *img)
++{
++    if (!img->img || img->bw > 1 || img->bh > 1) return -1;
++    nvk_cmdbuf c; if (nvmtl_vk_cmd_begin(q, &c)) return -1;
++    VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    VkClearColorValue zero; memset(&zero, 0, sizeof zero);
++    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
++    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
++    pvkCmdClearColorImage(c.cb, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
++    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
++    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
++    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    return nvmtl_vk_submit_wait_at(&c, "surface zero (fresh private copy)");
+ }
+ // </wtl>
+ 
+@@ -7571,12 +7916,27 @@
+ }
+ 
+ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
+-                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
++                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out, uint64_t mod);
++static int nvmtl_vk_image_create_buffer_alias_mod(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
++                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out, uint64_t mod);
+ int nvmtl_vk_image_create_buffer_alias(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
+                                        const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out)
+ {
++    return nvmtl_vk_image_create_buffer_alias_mod(w, h, vkfmt, bpp, a8, storage, render, b, offset, row_pitch, out, 0);
++}
++// <wtl> §32.16: the same image over the same pages in Tile4 (I915_FORMAT_MOD_4_TILED), the layout the plane scans
++#define NVMTL_MOD_4_TILED 0x0100000000000009ull
++int nvmtl_vk_image_create_buffer_alias_tile4(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
++                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out)
++{
++    return nvmtl_vk_image_create_buffer_alias_mod(w, h, vkfmt, bpp, a8, storage, render, b, offset, row_pitch, out, NVMTL_MOD_4_TILED);
++}
++// </wtl>
++static int nvmtl_vk_image_create_buffer_alias_mod(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
++                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out, uint64_t mod)
++{
+     nvk_image pending = {0};
+-    int result = nvmtl_vk_image_create_buffer_alias_lifetime_body(w, h, vkfmt, bpp, a8, storage, render, b, offset, row_pitch, &pending);
++    int result = nvmtl_vk_image_create_buffer_alias_lifetime_body(w, h, vkfmt, bpp, a8, storage, render, b, offset, row_pitch, &pending, mod);
+     if (result) { nvmtl_failed_image(&pending); memset(out, 0, sizeof *out); }
+     else { nvmtl_commit_image(&pending); *out = pending; }
+     if(!result)nvmtl_loss_event("buffer_image_alias",NULL,0,0,g_state,g_state,0,
+@@ -7584,8 +7944,14 @@
+     return result;
+ }
+ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
+-                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out)
++                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out, uint64_t mod)
+ {
++    // <wtl> §32.16: Tile4 needs the explicit-layout extension, 128-byte rows and whole 32-row tiles inside the buffer
++    if (mod && (!g_linmod || row_pitch % 128 || (size_t)row_pitch * ((h + 31u) & ~31u) > b->size - offset)) {
++        nvlog("buffer texture: Tile4 %ux%u pitch %zu refused (%s)", w, h, row_pitch, !g_linmod ? "no VK_EXT_image_drm_format_modifier"
++              : row_pitch % 128 ? "rows not a multiple of 128 bytes" : "whole tiles overrun the buffer");
++        return -1; }
++    // </wtl>
+     if (nvmtl_vk_init() || !b || !b->buf || !b->mem || !w || !h) { nvlog("buffer texture: no buffer memory to alias (%ux%u)", w, h); return -1; }
+     { uint32_t bw = 0, bh = 0, bb = 0;
+       if (nvmtl_vk_format_block(vkfmt, &bw, &bh, &bb)) { nvlog("buffer texture: VkFormat %u is block-compressed; a linear alias of it is not built", vkfmt); return -1; } }
+@@ -7599,7 +7965,7 @@
+     PFN_vkGetPhysicalDeviceFormatProperties gfp = (PFN_vkGetPhysicalDeviceFormatProperties)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceFormatProperties");
+     VkFormatProperties fp; memset(&fp, 0, sizeof fp);
+     if (gfp) gfp(g_pdev, (VkFormat)vkfmt, &fp);
+-    VkFormatFeatureFlags lf = fp.linearTilingFeatures;
++    VkFormatFeatureFlags lf = mod ? fp.optimalTilingFeatures : fp.linearTilingFeatures;   // <wtl> Tile4: the tiled features
+     if (!(lf & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { nvlog("buffer texture: VkFormat %u cannot be sampled LINEAR (features 0x%x)", vkfmt, (unsigned)lf); return -1; }
+     int wantS = storage, wantR = render;
+     storage = storage && !a8 && (lf & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
+@@ -7610,7 +7976,7 @@
+     out->storage = storage ? 1 : 0; out->mtl_type = 2; out->layers = 1;
+     VkSubresourceLayout pl = { 0, 0, (VkDeviceSize)row_pitch, 0, 0 };
+     VkImageDrmFormatModifierExplicitCreateInfoEXT eci = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, NULL,
+-        0 , 1, &pl };
++        mod, 1, &pl };
+     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, g_linmod ? (void *)&eci : NULL, 0, VK_IMAGE_TYPE_2D, (VkFormat)vkfmt,
+         { w, h, 1 }, 1, 1, VK_SAMPLE_COUNT_1_BIT, g_linmod ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT : VK_IMAGE_TILING_LINEAR,
+         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+@@ -7632,11 +7998,11 @@
+             pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceImageFormatProperties2");
+         VkImageFormatListCreateInfo qfl = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, 2, vfl };
+         VkPhysicalDeviceImageDrmFormatModifierInfoEXT qmi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, &qfl,
+-            0 , VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
++            mod, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+         VkPhysicalDeviceImageFormatInfo2 qi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, g_linmod ? (void *)&qmi : (void *)&qfl,
+             ici.format, ici.imageType, ici.tiling, ici.usage, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT };
+         VkImageFormatProperties2 qo; memset(&qo, 0, sizeof qo); qo.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+-        VkResult qr = !(pp.linearTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? VK_ERROR_FORMAT_NOT_SUPPORTED
++        VkResult qr = !((mod ? pp.optimalTilingFeatures : pp.linearTilingFeatures) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? VK_ERROR_FORMAT_NOT_SUPPORTED
+                     : gif ? gif(g_pdev, &qi, &qo) : VK_ERROR_EXTENSION_NOT_PRESENT;
+         if (qr == VK_SUCCESS) { ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; ici.pNext = &fl; }
+         else { nvlog("buffer texture: VkFormat %u stays single-format - its sRGB/linear view format %u is refused (linear features 0x%x, VkResult %d%s)",
+@@ -7675,7 +8041,7 @@
+     VKCK(nvmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view), "vkCreateImageView(buffer texture)");
+ 
+     nvlog("buffer texture: %ux%u VkFormat %u pitch %zu bound at %zu (%s, align %llu, size %llu, storage %d, render %d, view pair %u)", w, h, vkfmt, row_pitch, at,
+-          g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vpair);
++          mod ? "Tile4" : g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vpair);
+     return 0;
+ }
+ 
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -80,7 +80,7 @@
+                  unsigned direct_sass;   /* recorded a dispatch of compiled machine code: never reuse this pool */
+                  void *occlusion_pages; uint32_t occlusion_count;
+                  void *timing_pool; nvmtl_gpu_interval timing;
+-                 void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4];
++                 void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4]; uint32_t pt_d[128];
+                  void *counter_recording; unsigned counter_error;
+                  nvmtl_sample_pattern sample_pattern;
+                  void **rvs; unsigned nrv, caprv;
+@@ -219,6 +219,10 @@
+ int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
+ int  nvmtl_vk_surface_host_on(void);
+ int  nvmtl_vk_surface_host_import(void *base, size_t alloc, nvk_buffer *out);
++/* <wtl> §32.10: the import shared per IOSurface (IOSurfaceRef); put returns 1 when the buffer was the cache's */
++struct __IOSurface;
++int  nvmtl_vk_surface_host_get(struct __IOSurface *surf, nvk_buffer *out);
++int  nvmtl_vk_surface_host_put(nvk_buffer *b);
+ void nvmtl_vk_diag_surface(nvk_image *image,uint32_t surfaceID);
+ int  nvmtl_vk_image_xfer_host(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t off, size_t row_bytes, int to_image);
+ int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
+@@ -367,4 +371,17 @@
+ int nvmtl_vk_surface_dirty(uint32_t surfaceID, uint32_t plane);
+ int nvmtl_vk_surface_dirty_try(uint32_t surfaceID, uint32_t plane);
+ uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
++/* §32.16 Tile4 scanout: selector 2 marks (pending 1/0, or 2 = layout only), scanout surfaces, content layouts */
++uint32_t nvmtl_vk_surface_gpu_mark2(uint32_t surfaceID, int pending, int tile4);
++int nvmtl_vk_tile4_scanout(uint32_t surfaceID);
++int nvmtl_vk_is_scanout(uint32_t surfaceID);
++int nvmtl_vk_po_on(void);
++int nvmtl_vk_po_current(uint32_t surfaceID);
++uint64_t nvmtl_vk_po_wait(uint32_t timeoutMs);
++void nvmtl_vk_po_done(uint32_t surfaceID, uint32_t seq, int ok);
++void nvmtl_vk_po_detach(uint32_t surfaceID);
++int nvmtl_vk_tile4_content(uint32_t surfaceID);
++void nvmtl_vk_tile4_content_set(uint32_t surfaceID, int tile4);
++int nvmtl_vk_image_create_buffer_alias_tile4(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
++                                       const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
+ int nvmtl_vk_accel_surface_wait(void);
