@@ -1,0 +1,5775 @@
+# 0023 core: i915 owns the eDP pipe -- K2 boot commit, K3 modesets, J1 joiner, Tile4 plane, C1 cursor, K4 boot mode
+#
+# Base:  the core after 0022
+# Files: gpu/xegfx/shim/src/xnu/xg_kext.cpp, gpu/xegfx/shim/include/xg_i915.h,
+#        gpu/xkpi/src/i915/xg_display_hook.c/.h, gpu/xkpi/src/i915/intel_display_driver.c,
+#        gpu/xkpi/src/i915/intel_modeset_setup.c, gpu/xkpi/src/i915/xg_i915_exec.c, gpu/xkpi/exclude.txt,
+#        gpu/xkpi/src/i915/i915_gem_execbuffer.c (new overlay; the full file, derived from drm-kmod's i915_gem_execbuffer.c)
+# Apply: patch -p1 < patches/0023-core-kms-boot-commit-joiner-cursor.patch
+#
+# Why: scaled HiDPI and 240/300 Hz need i915 to program the panel (HBR3 + DSC, the plane scaler, the pipe joiner);
+# the firmware raster kept by K1 is 60 Hz at the native size only.  NVRAM xegfx-disp-kms picks the stage:
+#   K2a (2)  atomic checks only (drm_atomic_check_only) of the read-out state and of the adapter's scanout geometry
+#   K2  (3)  one boot commit through i915 (DRRS off, 8 bpc, PSR off) with a placeholder framebuffer on the primary
+#            plane; the fixed modes are captured for the adapter afterwards
+#   K3       KAPI v1 additions: getTiming(XG_KMS_FIXED_MODE_BASE + n) returns fixed mode n, setMode(ctx, 0, n) commits
+#            it; a plane-only commit takes a new desktop size (the scaler maps it onto the raster)
+#   J1       when one pipe cannot carry the plane (3840x2400 at 240/300 Hz) pipe A is joined with pipe B;
+#            "xgJoinerInfo" tells the accel where pipe B's plane points so its PLANE_SURF follows every flip
+#   Tile4    xg_display_kms_plane_layout() re-commits the placeholder with the Tile4 modifier (plane only), so
+#            WindowServer's Tile4 frames are scanned correctly; DPT is off (enable_dpt=0)
+#   C1       hardware cursor: one commit puts i915's cursor plane on the joiner seam, then CUR_POS/CUR_CTL/CUR_BASE
+#            are written per pipe by KAPI reserved[6] cursorImage / reserved[7] cursorMove (image pre-scaled to the
+#            raster); every commit re-applies them
+#   K4       boot mode: NVRAM xegfx-disp-bootmode ('XBM1', refresh mHz, desktop w, h; written by the adapter) makes
+#            the boot commit run that fixed mode and desktop (joined when needed) instead of the 60 Hz preferred mode;
+#            getTiming(XG_KMS_BOOT_STATE_INDEX) reports it so the adapter adopts it without a modeset.  A refused mode
+#            falls back to the K2 commit.
+# Also: backlight and vblank-wait KAPI calls, GPU clock read-out / minimum-frequency pin (xg_i915_gt_text, debug
+# sysctls) and per-stage execbuffer timing (debug.xegfx_eb).  Without the NVRAM keys behaviour is that of 0022.
+# Status: in daily use on ARL-HX (Xe-LPG): boots straight into 1920x1200 HiDPI at 240 Hz (3840x2400, joined).
+#
+--- a/gpu/xegfx/shim/src/xnu/xg_kext.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_kext.cpp
+@@ -45,6 +45,7 @@
+ unsigned int xg_display_kms_kapi_size(void);
+ unsigned int xg_display_kms_kapi_version(void);
+ void xg_display_set_measured_timing(const void *data, unsigned int len);
++void xg_display_set_boot_mode(unsigned int refresh_mhz, unsigned int width, unsigned int height);
+ int xg_display_aux_probe(void);
+ unsigned int xg_display_edid_get(const void **data);
+ unsigned int xg_display_dpcd_get(const void **data);
+@@ -165,6 +166,9 @@
+ }
+ 
+ /* "xgDrmIoctl" (minor, cmd, user arg, int *errno): DRM for WindowServer, through XeGfxAccel's user client */
++extern "C" int xg_display_kms_joiner_info(unsigned int *active, unsigned int *delta, unsigned int *gen);
++extern "C" int xg_display_kms_plane_layout(int want, int *cur);
++
+ IOReturn
+ XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
+ {
+@@ -189,10 +193,40 @@
+ 		int err = xg_flip_unmap((unsigned int)(uintptr_t)p1, (unsigned long long)(uintptr_t)p2);
+ 		return (err == 0 ? kIOReturnSuccess : kIOReturnError);
+ 	}
++	/* "xgJoinerInfo" (unsigned *active, unsigned *pipe-B PLANE_SURF delta, unsigned *gen): J1 -- while pipe A is joined
++	 * with pipe B, every PLANE_SURF_1_A write needs PLANE_SURF_1_B = the same frame + delta (xg_display_hook.c). */
++	if (name && name->isEqualTo("xgJoinerInfo") && p1 && p2) {
++		int err = xg_display_kms_joiner_info((unsigned int *)p1, (unsigned int *)p2, (unsigned int *)p3);
++		return (err == 0 ? kIOReturnSuccess : kIOReturnNotReady);
++	}
++	/* "xgPlaneLayout" (int want, int *cur out): §32.16 -- the primary plane scans Tile4 (1) or linear (0) frames; want
++	 * < 0 only reads it.  A change re-commits the placeholder (plane-only) and re-reads the joiner delta. */
++	if (name && name->isEqualTo("xgPlaneLayout") && p2) {
++		int err = xg_display_kms_plane_layout((int)(intptr_t)p1, (int *)p2);
++		return (err == 0 ? kIOReturnSuccess : err == -EAGAIN ? kIOReturnNotReady : kIOReturnError);
++	}
+ 	/* "xgFlipQuery" (int *idle out): 1 when the GPU finished everything it was given (0 busy, -ENODEV only when
+ 	 * no i915 device is bound); the accelerator's deferred flip worker polls this before it arms a frame. */
+ 	if (name && name->isEqualTo("xgFlipQuery") && p1) {
+ 		*(int *)p1 = xg_i915_idle();
++		return kIOReturnSuccess;
++	}
++	/*
++	 * §32.14 per-frame flip ordering: "xgFlipSnapshot" (void **out): the last request of every active timeline, taken
++	 * when the compositor's transaction arrives (no sleep).  "xgFlipSnapWait" (snap, timeout ms, int *result,
++	 * unsigned *fences): 1 all done, 0 timeout, -1 overflowed -- wait for idle instead (thread context, sleeps).
++	 * "xgFlipSnapFree" (snap).
++	 */
++	if (name && name->isEqualTo("xgFlipSnapshot") && p1) {
++		*(void **)p1 = xg_i915_flip_snapshot();
++		return (*(void **)p1 != nullptr ? kIOReturnSuccess : kIOReturnNoMemory);
++	}
++	if (name && name->isEqualTo("xgFlipSnapWait") && p1 && p3) {
++		*(int *)p3 = xg_i915_flip_snap_wait(p1, (unsigned int)(uintptr_t)p2, (unsigned int *)p4);
++		return kIOReturnSuccess;
++	}
++	if (name && name->isEqualTo("xgFlipSnapFree")) {
++		xg_i915_flip_snap_free(p1);
+ 		return kIOReturnSuccess;
+ 	}
+ 	/* "xgTrace" (const char *line): XeGfxAccel's state, stored with the console trace (thread context only) */
+@@ -979,6 +1013,7 @@
+ }
+ 
+ static uint32_t gBootSurf;	/* PLANE_SURF_1_A after i915 ran: the boot surface's GGTT offset */
++static uint32_t gKmsLevel;	/* NVRAM xegfx-disp-kms as applied this boot (claim boots only); 3 = K2 commits */
+ 
+ /* after i915 has run: the panel must still scan out the boot surface through the same GGTT entry, and pipe A must
+  * still count frames; otherwise the desktop is black even though WindowServer looks fine */
+@@ -1007,7 +1042,15 @@
+ 		xg_put(d, "plane-surf-1-a", surf);
+ 		xg_put(d, "ggtt-pte-surf", pte, 64);
+ 		xg_put(d, "frmcount-delta", f1 - f0);
+-		rc = (gSurfPte && pte != gSurfPte) ? -71 : (f1 == f0 ? -70 : 1);
++		/*
++		 * K2 (kms=3) commits a modeset of i915's own onto a placeholder framebuffer, so the plane no longer scans
++		 * the boot surface by design: what must hold then is that pipe A runs again, which the frame counter shows.
++		 */
++		if (gKmsLevel >= 3) {
++			xg_put(d, "k2-committed", 1, 8);
++			rc = f1 == f0 ? -70 : 1;
++		} else
++			rc = (gSurfPte && pte != gSurfPte) ? -71 : (f1 == f0 ? -70 : 1);
+ 		xg_put(d, "result", (uint32_t)rc);
+ 		if (gResident)
+ 			gResident->setProperty("XeGfxPost", d);
+@@ -1168,7 +1211,8 @@
+ 				xg_i915_map_init();
+ 				rc = xg_gt_check();
+ 			}
+-			if (rc == 1 && gPipeLit && gBootSurf && xg_boot_fb_size) {
++			/* under K2 nothing scans the boot surface any more, and its GGTT range is i915's placeholder now */
++			if (rc == 1 && gPipeLit && gBootSurf && xg_boot_fb_size && gKmsLevel < 3) {
+ 				int err = xg_i915_reserve_bootfb(gBootSurf, xg_boot_fb_size);
+ 
+ 				IOLog("XeGfx: boot surface GGTT 0x%x + %llu reserved: %d\n", gBootSurf, xg_boot_fb_size, err);
+@@ -1395,16 +1439,97 @@
+ static int
+ xegfx_disp_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+ {
+-	char buf[4096];
+-	int n = xg_display_dump_text(buf, (int)sizeof(buf));
++	/* K2a.3 filled 4 KB; the K2 commit lines come last, so the text gets a heap buffer of the dump's own size */
++	const int max = 16384;
++	char *buf = (char *)IOMalloc(max);
++	int n, err;
+ 
+-	if (n <= 0)
+-		return ENOENT;
+-	return SYSCTL_OUT(req, buf, n);
++	if (buf == nullptr)
++		return ENOMEM;
++	n = xg_display_dump_text(buf, max);
++	err = n <= 0 ? ENOENT : SYSCTL_OUT(req, buf, n);
++	IOFree(buf, max);
++	return err;
+ }
+ SYSCTL_PROC(_debug, OID_AUTO, xegfx_disp, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+     xegfx_disp_sysctl, "A", "M1a: VBT dump left by the i915 display overlay (read-only)");
+ 
++/* §32.13: the GPU clock -- readout, the actual MHz alone (for samplers), and the minimum (write MHz to pin it up) */
++static int
++xegfx_gt_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++	char b[256];
++	int n = xg_i915_gt_text(b, sizeof(b));
++
++	if (n < 0)
++		return ENODEV;
++	if ((size_t)n >= sizeof(b))
++		n = (int)sizeof(b) - 1;
++	return SYSCTL_OUT(req, b, n + 1);
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_gt, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
++    xegfx_gt_sysctl, "A", "GPU clock: SLPC, actual/requested/min/max/RP0/RP1/RPn/boost MHz");
++static int
++xegfx_gt_act_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++	int v = xg_i915_gt_act_mhz();
++
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_gt_act, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
++    xegfx_gt_act_sysctl, "I", "actual GPU clock, MHz (0 while the GT sleeps)");
++static int
++xegfx_gt_min_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++	int v = xg_i915_gt_min_mhz(0), err;
++
++	err = sysctl_handle_int(nullptr, &v, 0, req);
++	if (err || req->newptr == USER_ADDR_NULL)
++		return err;
++	v = xg_i915_gt_min_mhz(v);
++	return v < 0 ? EINVAL : 0;
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_gt_min, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0,
++    xegfx_gt_min_sysctl, "I", "GPU minimum clock, MHz (write to set; i915 clamps it to RPn..max)");
++
++/* §32.10: per-stage i915 execbuffer timing (i915_gem_execbuffer.c overlay); the maxes restart at every read */
++extern "C" int xg_eb_stats_text(char *out, int max);
++static int
++xegfx_eb_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++	const int max = 2048;
++	char *buf = (char *)IOMalloc(max);
++	int n, err;
++
++	if (buf == nullptr)
++		return ENOMEM;
++	n = xg_eb_stats_text(buf, max);
++	err = n <= 0 ? ENOENT : SYSCTL_OUT(req, buf, n + 1);
++	IOFree(buf, max);
++	return err;
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_eb, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
++    xegfx_eb_sysctl, "A", "i915 execbuffer time per stage (sum/max us; maxes restart at every read)");
++
++/* §32.16: per-request queued->ready->done time, WindowServer vs the rest (i915_gem_execbuffer.c overlay) */
++extern "C" int xg_rq_stats_text(char *out, int max);
++static int
++xegfx_rq_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++	const int max = 4096;
++	char *buf = (char *)IOMalloc(max);
++	int n, err;
++
++	if (buf == nullptr)
++		return ENOMEM;
++	n = xg_rq_stats_text(buf, max);
++	err = n <= 0 ? ENOENT : SYSCTL_OUT(req, buf, n + 1);
++	IOFree(buf, max);
++	return err;
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_rq, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
++    xegfx_rq_sysctl, "A", "i915 request time queued->ready->done, WindowServer vs others (maxes and slow list restart at every read)");
++
+ /* M3d: explicit alloc/get/free exercise of the optional scanout KAPI (write to run, read the report) */
+ extern "C" int xg_display_kms_scanout_selftest(char *out, int max);
+ static char gScanoutTest[512];
+@@ -1476,6 +1601,11 @@
+ 	&sysctl__debug_xegfx_kms_scanout,
+ 	&sysctl__debug_xegfx_boot,
+ 	&sysctl__debug_xegfx_timing,
++	&sysctl__debug_xegfx_eb,
++	&sysctl__debug_xegfx_rq,
++	&sysctl__debug_xegfx_gt,
++	&sysctl__debug_xegfx_gt_act,
++	&sysctl__debug_xegfx_gt_min,
+ };
+ 
+ /* Linux's struct va_format, the argument of "%pV" */
+@@ -1774,6 +1904,31 @@
+ 	}
+ 	o->release();
+ 	return armed;
++}
++
++/* K4: NVRAM xegfx-disp-bootmode, 16 bytes LE: 'XBM1', refresh mHz, desktop width, height (the adapter writes it) */
++static bool
++xg_nvram_boot_mode(uint32_t *mhz, uint32_t *w, uint32_t *h)
++{
++	IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane);
++	bool ok = false;
++
++	if (o == nullptr)
++		return false;
++	if (OSObject *v = o->copyProperty("xegfx-disp-bootmode")) {
++		OSData *d = OSDynamicCast(OSData, v);
++		const uint8_t *p = d != nullptr ? (const uint8_t *)d->getBytesNoCopy() : nullptr;
++
++		if (p != nullptr && d->getLength() == 16 && xg_le32(p) == 0x314d4258u) {
++			*mhz = xg_le32(p + 4);
++			*w = xg_le32(p + 8);
++			*h = xg_le32(p + 12);
++			ok = *mhz != 0;
++		}
++		v->release();
++	}
++	o->release();
++	return ok;
+ }
+ 
+ /* same /options lookup, as a number (4-byte LE data, OSNumber, or a single byte); absent reads 0 */
+@@ -2049,17 +2204,39 @@
+ 			 * gate on compat.linuxkpi.i915_xegfx_kms).  Claim boots only; anything else keeps the display off.
+ 			 */
+ 			{
++				/* 1 = K1 read-only adoption, 2 = K2a: K1 + atomic check only, 3 = K2: + one 60 Hz commit; higher -> 3 */
+ 				uint32_t kms = xg_nvram_u32("xegfx-disp-kms");
++				if (kms > 3)
++					kms = 3;
+ 				if (kms >= 1) {
+ 					char *dd = (char *)strstr_kpi(xg_env, "i915_disable_display=1");
++					char kv[192];
+ 					if (dd != nullptr)
+ 						dd[sizeof("i915_disable_display=") - 1] = '0';
+-					strlcat(xg_env, " compat.linuxkpi.i915_xegfx_no_display=0 compat.linuxkpi.i915_xegfx_kms=1",
+-					    sizeof(xg_env));
+-					IOLog("XeGfx: K1 staged eDP takeover armed by NVRAM xegfx-disp-kms=%u (read-only adoption)\n", kms);
++					/*
++					 * K2a+: no PSR -- the accel writes PLANE_SURF itself and DMC is missing (docs/03-PLAN §30.6).
++					 * No DPT either (§32.16): a Tile4 plane then reads the GGTT directly, so the accel's slots
++					 * work for Tile4 frames as they do for linear ones (with DPT, PLANE_SURF names a page table).
++					 */
++					snprintf(kv, sizeof(kv), " compat.linuxkpi.i915_xegfx_no_display=0 compat.linuxkpi.i915_xegfx_kms=%u%s",
++					    kms, kms >= 2 ? " compat.linuxkpi.i915_enable_psr=0 compat.linuxkpi.i915_enable_dpt=0" : "");
++					strlcat(xg_env, kv, sizeof(xg_env));
++					IOLog("XeGfx: staged eDP takeover armed by NVRAM xegfx-disp-kms=%u (%s)\n", kms,
++					    kms == 1 ? "K1 read-only adoption" : kms == 2 ? "K2a read-only adoption + atomic check" :
++					    "K2 adoption + atomic check + 60 Hz commit");
+ 				}
++				gKmsLevel = kms;
+ 				if (gResident)
+-					gResident->setProperty("XeGfxKmsLevel", (unsigned long long)(kms >= 1 ? 1 : 0), 32);
++					gResident->setProperty("XeGfxKmsLevel", (unsigned long long)kms, 32);
++				if (kms >= 3) {
++					uint32_t mhz = 0, bw = 0, bh = 0;
++
++					if (xg_nvram_boot_mode(&mhz, &bw, &bh)) {
++						xg_display_set_boot_mode(mhz, bw, bh);
++						IOLog("XeGfx: K4 boot mode from NVRAM xegfx-disp-bootmode: %u.%03u Hz, desktop %ux%u\n",
++						    mhz / 1000, mhz % 1000, bw, bh);
++					}
++				}
+ 			}
+ 			gBootArmed = 1;
+ 			gBootPhase = XG_BOOT_WAITING;
+--- a/gpu/xegfx/shim/include/xg_i915.h
++++ b/gpu/xegfx/shim/include/xg_i915.h
+@@ -50,6 +50,12 @@
+ int xg_i915_reserve_bootfb(unsigned long long offset, unsigned long long size);
+ /* 1 when every uabi engine is idle, 0 busy, -ENODEV without an i915 device; does not sleep */
+ int xg_i915_idle(void);
++int xg_i915_gt_text(char *out, int max);
++int xg_i915_gt_act_mhz(void);
++int xg_i915_gt_min_mhz(int set_mhz);
++void *xg_i915_flip_snapshot(void);
++int xg_i915_flip_snap_wait(void *snap, unsigned int timeout_ms, unsigned int *fences);
++void xg_i915_flip_snap_free(void *snap);
+ #define XG_FLIP_MAX_SLOTS	8
+ /* zero-copy scanout: reserve GGTT slots, then point one slot's PTEs at a frame's physical pages; 0 or -errno */
+ int xg_flip_init(unsigned long long surface_bytes, unsigned int slots, unsigned long long *ggtt_out,
+--- a/gpu/xkpi/src/i915/xg_display_hook.c
++++ b/gpu/xkpi/src/i915/xg_display_hook.c
+@@ -27,7 +27,7 @@
+ extern int preemption_enabled(void);
+ extern int ml_get_interrupts_enabled(void);
+ 
+-#define XG_DISPLAY_DUMP_MAX	8192
++#define XG_DISPLAY_DUMP_MAX	16384	/* K2a.3 overflowed 8 KB with the K1 readout + checks */
+ 
+ static int	gXgDispLevel = -1;
+ static char	gXgDispDump[XG_DISPLAY_DUMP_MAX];
+@@ -213,6 +213,57 @@
+ 
+ #define XG_KMS_KAPI_SIZE		136U
+ #define XG_KMS_KAPI_FLAG_READ_ONLY	(1U << 0)
++/*
++ * K3 additive modeset extension (same table, version 1): getTiming(fbIndex = XG_KMS_FIXED_MODE_BASE + n) returns the
++ * panel's fixed mode n as the same 13 words, and setMode(ctx, 0, n) commits it through i915 (docs/03-PLAN §30.17).
++ * Both answer NOT_READY until a K2 (kms>=3) boot has committed once; a reader that only knows v1 never sets the bit.
++ */
++#define XG_KMS_KAPI_FLAG_MODESET	(1U << 2)
++#define XG_KMS_FIXED_MODE_BASE		0x100U
++#define XG_KMS_MAX_FIXED_MODES		4
++/*
++ * K4 boot mode (native-display docs/32-FRAME-RATE.md §32.20): the boot commit runs the mode the adapter last set
++ * (NVRAM xegfx-disp-bootmode: refresh and desktop) instead of the panel's 60 Hz.  getTiming(fbIndex =
++ * XG_KMS_BOOT_STATE_INDEX) returns what the boot committed: word 0 XG_KMS_BOOT_STATE_TAG, 1 the fixed mode index, 2/3
++ * the desktop on the plane, 4 its pitch, 5 joined, 6 1 when it is the saved mode.  NOT_FOUND on an older core.
++ */
++#define XG_KMS_BOOT_STATE_INDEX		0x200U
++#define XG_KMS_BOOT_STATE_TAG		0x4b340001U
++/*
++ * A1 additive scaled-desktop extension (same table, version 1): reserved[3] is setPlane(ctx, width, height, pitch),
++ * which puts a width x height desktop (linear XRGB8888, pitch bytes per row) on the primary plane scaled onto the
++ * current raster -- i915 assigns the plane scaler and recomputes the watermarks.  NOT_READY before a K2 commit.
++ */
++#define XG_KMS_KAPI_FLAG_PLANE		(1U << 3)
++#define XG_KMS_PLANE_MAX_W		3840U	/* the 1920x1200 HiDPI backing */
++#define XG_KMS_PLANE_MAX_H		2400U
++static unsigned int xg_kms_fixed_mode_timing(unsigned int n, unsigned int *out13);
++static unsigned int xg_kms_boot_state(unsigned int *out13);
++static unsigned int xg_kms_set_mode(void *ctx, unsigned int fb_index, unsigned int mode_id);
++static unsigned int xg_kms_set_plane(void *ctx, unsigned int width, unsigned int height, unsigned int pitch);
++static unsigned int xg_kms_cursor_image(void *ctx, const unsigned int *argb, unsigned int width, unsigned int height,
++    unsigned int pitch);
++static unsigned int xg_kms_cursor_move(void *ctx, int x, int y, unsigned int visible);
++static void xg_kms_cursor_reapply(void);
++/*
++ * B1 additive backlight extension (same table, version 1): reserved[4] is backlight(ctx, set, &percent) -- set >= 0
++ * sets the panel brightness to that percent through i915's own backlight (intel_backlight_set_acpi(), the path the
++ * ACPI/OpRegion brightness requests take), set < 0 only reads; percent returns the level now.
++ */
++#define XG_KMS_KAPI_FLAG_BACKLIGHT	(1U << 4)
++static unsigned int xg_kms_backlight(void *ctx, int set_percent, unsigned int *percent_out);
++/*
++ * E3 additive vblank extension (same table, version 1; native-display docs/32-FRAME-RATE.md): reserved[5] is
++ * waitVblank(ctx, last, timeoutUs, &count, &ageNs).  It blocks until pipe A's vblank count is no longer `last` (or the
++ * timeout), then returns the count and how long ago, by i915's own scanline-corrected vblank timestamp, that vblank
++ * happened.  An age rather than a time: ktime in this kext counts from its own load, the adapter's clocks do not.
++ * BUSY when the pipe is off (a modeset in flight) or no vblank came in time.
++ */
++#define XG_KMS_KAPI_FLAG_VBLANK		(1U << 5)
++static unsigned int xg_kms_wait_vblank(void *ctx, unsigned long long last, unsigned int timeout_us,
++    unsigned long long *count_out, unsigned long long *age_ns_out);
++struct intel_panel;
++static unsigned int xg_kms_backlight_pct(const struct intel_panel *panel);
+ 
+ #define XG_KMS_TIMING_TAG		0x4b350001U
+ #define XG_KMS_TIMING_WORDS		13
+@@ -405,6 +456,10 @@
+ 	(void)ctx;
+ 	if (out13 == NULL)
+ 		return (XG_KMS_ERR_BAD_ARGUMENT);
++	if (fb_index >= XG_KMS_FIXED_MODE_BASE && fb_index < XG_KMS_FIXED_MODE_BASE + XG_KMS_MAX_FIXED_MODES)
++		return (xg_kms_fixed_mode_timing(fb_index - XG_KMS_FIXED_MODE_BASE, out13));
++	if (fb_index == XG_KMS_BOOT_STATE_INDEX)
++		return (xg_kms_boot_state(out13));
+ 	if (fb_index != 0)
+ 		return (XG_KMS_ERR_NOT_FOUND);
+ 	if (!gXgMeasuredTimingValid)
+@@ -771,18 +826,23 @@
+ 	.magic = XG_KMS_KAPI_MAGIC,
+ 	.version = XG_KMS_KAPI_VERSION,
+ 	.size = sizeof(struct xg_kms_kapi),
+-	.flags = XG_KMS_KAPI_FLAG_READ_ONLY | XG_KMS_KAPI_FLAG_SCANOUT,
++	.flags = XG_KMS_KAPI_FLAG_READ_ONLY | XG_KMS_KAPI_FLAG_SCANOUT | XG_KMS_KAPI_FLAG_MODESET |
++	    XG_KMS_KAPI_FLAG_PLANE | XG_KMS_KAPI_FLAG_BACKLIGHT | XG_KMS_KAPI_FLAG_VBLANK,
+ 	.get_timing = xg_kms_get_timing,
+ 	.get_connector_info = xg_kms_get_connector_info,
+ 	.get_edid = NULL,		/* M3c */
+-	.set_mode = NULL,		/* M3c */
++	.set_mode = xg_kms_set_mode,	/* K3 */
+ 	.flip = NULL,			/* M3c */
+ 	.vblank = NULL,			/* M3c */
+ 	.reserved = {
+ 		(unsigned long long)xg_kms_alloc_scanout,
+ 		(unsigned long long)xg_kms_free_scanout,
+ 		(unsigned long long)xg_kms_get_scanout_info,
+-		0, 0, 0, 0, 0,
++		(unsigned long long)xg_kms_set_plane,		/* A1 */
++		(unsigned long long)xg_kms_backlight,		/* B1 */
++		(unsigned long long)xg_kms_wait_vblank,		/* E3 */
++		(unsigned long long)xg_kms_cursor_image,	/* C1: no flag bit -- an older adapter must keep accepting this table */
++		(unsigned long long)xg_kms_cursor_move,		/* C1 */
+ 	},
+ 	.ctx = NULL,
+ };
+@@ -1191,9 +1251,14 @@
+  * K1 (staged eDP takeover, docs/03-PLAN §30): i915 builds the internal panel's encoder/connector and reads the
+  * firmware-lit pipe back, but commits nothing -- the way NVKMS first adopts the boot head before NVRMFB commits a
+  * mode of its own.  compat.linuxkpi.i915_xegfx_kms (set by the core from NVRAM xegfx-disp-kms) picks the stage:
+- * 0 = display left alone (today), 1 = build outputs + read out, no sanitize, no initial commit, no fbdev.
++ * 0 = display left alone (today), 1 = build outputs + read out, no sanitize, no initial commit, no fbdev,
++ * 2 = K2a: K1 plus xg_display_kms_check().
+  */
+ #include "intel_dp.h"
++#include "intel_atomic.h"
++#include "intel_cdclk.h"
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_uapi.h>
+ #include <drm/display/drm_dp_helper.h>
+ 
+ static int gXgKmsLevel = -1;
+@@ -1257,6 +1322,1155 @@
+ 		snprintf(line, sizeof(line), "kms: crtc %s active %d %dx%d clock %d kHz bpp %d port_clock %d lanes %d dsc %d outputs 0x%x trans %d",
+ 		    crtc->base.name, s->hw.active ? 1 : 0, a->crtc_hdisplay, a->crtc_vdisplay, a->crtc_clock, s->pipe_bpp,
+ 		    s->port_clock, s->lane_count, s->dsc.compression_enable ? 1 : 0, s->output_types, s->cpu_transcoder);
++		xg_disp_line(display, line);
++	}
++}
++
++/*
++ * K2a: what would i915 program?  One atomic check per case -- drm_atomic_check_only(), never a commit, so the commit
++ * tail and every register write stay out of reach: first the read-out state the way intel_initial_commit() builds it
++ * (affected planes, the encoders' initial_fastset_check), then each panel fixed mode on the same pipe.  The verdict
++ * (fastset or full modeset) and the link, DSC and CDCLK i915 chose go to debug.xegfx_disp; with drm.debug KMS|ATOMIC
++ * on for the duration, i915's own "fastset requirement not met" lines and the crtc state dump go to the kernel log.
++ *
++ * K2a.2 adds what K2 will commit with: a placeholder framebuffer of the adapter's scanout geometry (2560x1600
++ * XRGB8888 linear, shmem, never pinned or mapped -- a check does not prepare planes) on the primary plane, so the plane,
++ * DDB and watermarks are checked too; one more 240 Hz case with force_dsc_en, to see the DSC configuration i915 would
++ * pick where NVKMS uses DSC (docs/31 §31.4: 2 slices of 1280, 16.06 bpp); and a dump of every input of the bpp and
++ * link-rate choice (K2a picked 18 bpp at HBR3 for 60 Hz, which neither the VBT fixup nor slow-and-wide explains).
++ */
++#include "intel_fb.h"
++#include "intel_panel.h"
++#include "intel_backlight.h"
++#include "intel_display_driver.h"
++#include "gem/i915_gem_object.h"
++#include <drm/drm_fourcc.h>
++#include <drm/drm_vblank.h>
++#include <linux/wait.h>
++
++/*
++ * K3 state.  Written once at the end of the K2 boot commit (probe thread), read by the KAPI afterwards; setMode
++ * serializes itself with gXgKmsModeLock, i915's modeset locks do the rest.
++ */
++static int			 gXgKmsCommitted;
++/*
++ * Set last, after the fixed-mode table and the pointers below are complete.  gXgKmsCommitted turns 1 the moment the
++ * boot commit returns, before xg_kms_capture_fixed_modes() runs; an adapter polling getTiming() in that gap read mode 0
++ * and then missed mode 2 (2026-10-30 11:34, no 240 Hz, no scaled desktops, and a black desktop).
++ */
++static int			 gXgKmsModesReady;
++/*
++ * J1 joiner (docs/03-PLAN §30.24): the pipe is joined with pipe B when one pipe cannot carry the plane -- a 300 Hz
++ * raster (over max_dotclk) or a desktop shrunk onto the raster so much that the plane's pixel rate over two pixels
++ * per clock exceeds max_cdclk (3840x2400 -> 2560x1600 at 240 Hz needs ~1.25 GHz of a 652.8 MHz CDCLK).  Joined, each
++ * pipe scans half.  gXgKmsJoinerDelta is pipe B's PLANE_SURF minus pipe A's as i915 programmed them for the
++ * placeholder: the accel writes PLANE_SURF_1_B = frame + delta next to PLANE_SURF_1_A (xgJoinerInfo).
++ */
++static int			 gXgKmsJoined;
++static unsigned int		 gXgKmsJoinerDelta;
++static unsigned int		 gXgKmsJoinerGen;
++static int			 gXgKmsLastCommitRet;
++static struct intel_display	*gXgKmsDisplay;
++static struct intel_crtc	*gXgKmsCrtc;
++static struct intel_connector	*gXgKmsEdp;
++static struct drm_framebuffer	*gXgKmsFb;	/* the placeholder; the committed plane state holds the reference */
++static struct drm_i915_gem_object *gXgKmsObj;	/* backs every placeholder size; this reference is never dropped */
++static const struct drm_display_mode *gXgKmsModes[XG_KMS_MAX_FIXED_MODES];
++static unsigned int		 gXgKmsModeCount;
++static int			 gXgKmsModeCurrent = -1;
++static DEFINE_MUTEX(gXgKmsModeLock);
++/* K4: the mode to boot into, from NVRAM (xg_kext.cpp, before stage 4); 0 = the panel's preferred mode */
++static unsigned int		 gXgBootReqMHz, gXgBootReqW, gXgBootReqH;
++static int			 gXgBootSaved;	/* the boot commit ran the saved mode */
++
++void xg_display_set_boot_mode(unsigned int refresh_mhz, unsigned int width, unsigned int height);
++void
++xg_display_set_boot_mode(unsigned int refresh_mhz, unsigned int width, unsigned int height)
++{
++	gXgBootReqMHz = refresh_mhz;
++	gXgBootReqW = width;
++	gXgBootReqH = height;
++}
++
++/* K4: the fixed mode with the preferred raster at the saved refresh, and a desktop the plane can take; else NULL */
++static const struct drm_display_mode *
++xg_kms_boot_pick(struct intel_connector *edp, const struct drm_display_mode *pref, unsigned int *w, unsigned int *h)
++{
++	const struct drm_display_mode *m;
++
++	*w = *h = 0;
++	if (gXgBootReqMHz == 0 || pref == NULL)
++		return (NULL);
++	if (gXgBootReqW < 640 || gXgBootReqH < 400 || gXgBootReqW > XG_KMS_PLANE_MAX_W || gXgBootReqH > XG_KMS_PLANE_MAX_H ||
++	    (gXgBootReqW & 15U) != 0 || gXgBootReqW > 2U * (unsigned int)pref->hdisplay ||
++	    gXgBootReqH > 2U * (unsigned int)pref->vdisplay)
++		return (NULL);
++	list_for_each_entry(m, &edp->panel.fixed_modes, head) {
++		const unsigned int mhz = (unsigned int)drm_mode_vrefresh(m) * 1000U;
++
++		if (m->hdisplay != pref->hdisplay || m->vdisplay != pref->vdisplay)
++			continue;
++		if (mhz + 1000U > gXgBootReqMHz && mhz < gXgBootReqMHz + 1000U) {
++			*w = gXgBootReqW;
++			*h = gXgBootReqH;
++			return (m);
++		}
++	}
++	return (NULL);
++}
++
++static unsigned int
++xg_kms_boot_state(unsigned int *out13)
++{
++	if (xg_display_kms_level() < 3)
++		return (XG_KMS_ERR_UNSUPPORTED);
++	if (!READ_ONCE(gXgKmsModesReady))
++		return (XG_KMS_ERR_NOT_READY);
++	rmb();
++	if (gXgKmsModeCurrent < 0 || gXgKmsFb == NULL)
++		return (XG_KMS_ERR_NOT_FOUND);
++	memset(out13, 0, XG_KMS_TIMING_BYTES);
++	out13[0] = XG_KMS_BOOT_STATE_TAG;
++	out13[1] = (unsigned int)gXgKmsModeCurrent;
++	out13[2] = gXgKmsFb->width;
++	out13[3] = gXgKmsFb->height;
++	out13[4] = gXgKmsFb->pitches[0];
++	out13[5] = (unsigned int)gXgKmsJoined;
++	out13[6] = (unsigned int)gXgBootSaved;
++	return (XG_KMS_OK);
++}
++
++static void xg_kms_check_one(struct intel_display *display, struct intel_crtc *crtc, struct intel_connector *conn,
++    struct drm_framebuffer *fb, const struct drm_display_mode *mode, bool force_dsc, int max_bpc, bool commit,
++    const char *tag);
++
++static void
++xg_kms_capture_fixed_modes(struct intel_display *display, struct intel_crtc *crtc, struct intel_connector *edp,
++    struct drm_framebuffer *fb, const struct drm_display_mode *pref)
++{
++	const struct drm_display_mode *m;
++	char line[160];
++
++	gXgKmsDisplay = display;
++	gXgKmsCrtc = crtc;
++	gXgKmsEdp = edp;
++	gXgKmsFb = fb;
++	gXgKmsModeCount = 0;
++	list_for_each_entry(m, &edp->panel.fixed_modes, head) {
++		if (gXgKmsModeCount >= XG_KMS_MAX_FIXED_MODES)
++			break;
++		if (m == pref)
++			gXgKmsModeCurrent = (int)gXgKmsModeCount;
++		snprintf(line, sizeof(line), "kms: K3 fixed mode %u: %dx%d@%d clock %d kHz%s", gXgKmsModeCount,
++		    m->hdisplay, m->vdisplay, drm_mode_vrefresh(m), m->clock, m == pref ? " (committed at boot)" : "");
+ 		xg_disp_line(display, line);
++		gXgKmsModes[gXgKmsModeCount++] = m;
++	}
++	snprintf(line, sizeof(line), "kms: B1 backlight present %d enabled %d level %u (min %u max %u) = %u%%",
++	    edp->panel.backlight.present ? 1 : 0, edp->panel.backlight.enabled ? 1 : 0, edp->panel.backlight.level,
++	    edp->panel.backlight.min, edp->panel.backlight.max, xg_kms_backlight_pct(&edp->panel));
++	xg_disp_line(display, line);
++}
++
++/* fixed mode n as the 13 NVK5 words getTiming() returns for the current raster */
++static unsigned int
++xg_kms_fixed_mode_timing(unsigned int n, unsigned int *out13)
++{
++	const struct drm_display_mode *m;
++
++	/* NOT_READY means "the boot commit is still coming": the adapter waits for it; below K2 it never comes */
++	if (xg_display_kms_level() < 3)
++		return (XG_KMS_ERR_UNSUPPORTED);
++	if (!READ_ONCE(gXgKmsModesReady))
++		return (XG_KMS_ERR_NOT_READY);
++	rmb();
++	if (n >= gXgKmsModeCount)
++		return (XG_KMS_ERR_NOT_FOUND);
++	m = gXgKmsModes[n];
++	memset(out13, 0, XG_KMS_TIMING_BYTES);
++	out13[0] = XG_KMS_TIMING_TAG;
++	out13[1] = (unsigned int)m->clock * 1000U;
++	out13[2] = m->hdisplay;
++	out13[3] = m->hsync_start;
++	out13[4] = m->hsync_end;
++	out13[5] = m->htotal;
++	out13[6] = m->vdisplay;
++	out13[7] = m->vsync_start;
++	out13[8] = m->vsync_end;
++	out13[9] = m->vtotal;
++	out13[10] = (unsigned int)(((unsigned long long)m->clock * 1000000ULL) / ((unsigned long long)m->htotal * m->vtotal));
++	out13[11] = (m->flags & DRM_MODE_FLAG_PHSYNC) ? 1 : 0;
++	out13[12] = (m->flags & DRM_MODE_FLAG_PVSYNC) ? 1 : 0;
++	return (xg_kms_timing_ok(out13) ? XG_KMS_OK : XG_KMS_ERR_NOT_FOUND);
++}
++
++/* J1: can one pipe carry fixed mode m with a w x h desktop on its plane?  The same arithmetic i915 checks */
++static int
++xg_kms_needs_joiner(const struct drm_display_mode *m, unsigned int w, unsigned int h)
++{
++	unsigned long long rate = (unsigned long long)m->clock;
++
++	if (m->clock > gXgKmsDisplay->cdclk.max_dotclk_freq)
++		return (1);
++	if (w > (unsigned int)m->hdisplay)
++		rate = rate * w / m->hdisplay;		/* intel_adjusted_rate(): only downscaling raises it */
++	if (h > (unsigned int)m->vdisplay)
++		rate = rate * h / m->vdisplay;
++	return (rate / 2 > (unsigned long long)gXgKmsDisplay->cdclk.max_cdclk_freq);
++}
++
++/* J1: after a commit, whether pipe A is joined and where i915 pointed pipe B's plane relative to pipe A's */
++static void
++xg_kms_update_joiner(void)
++{
++	const struct intel_crtc_state *cs = to_intel_crtc_state(gXgKmsCrtc->base.state);
++	unsigned int a = intel_de_read(gXgKmsDisplay, _MMIO(0x7019c)) & ~0xfffU;
++	unsigned int b = intel_de_read(gXgKmsDisplay, _MMIO(0x7119c)) & ~0xfffU;
++	char line[160];
++
++	gXgKmsJoined = cs->joiner_pipes != 0;
++	gXgKmsJoinerDelta = gXgKmsJoined ? b - a : 0;
++	gXgKmsJoinerGen++;
++	snprintf(line, sizeof(line), "kms: J1 joiner %s (pipes 0x%x) PLANE_SURF A 0x%x B 0x%x delta 0x%x gen %u",
++	    gXgKmsJoined ? "ON" : "off", cs->joiner_pipes, a, b, gXgKmsJoinerDelta, gXgKmsJoinerGen);
++	xg_disp_line(gXgKmsDisplay, line);
++	xg_kms_cursor_reapply();	/* C1: every commit puts i915's own cursor state back on the registers */
++}
++
++/* J1: what the accel needs to keep a joined pipe B on the frame it flips to (xg_kext.cpp "xgJoinerInfo") */
++int
++xg_display_kms_joiner_info(unsigned int *active, unsigned int *delta, unsigned int *gen)
++{
++	if (active != NULL)
++		*active = (unsigned int)gXgKmsJoined;
++	if (delta != NULL)
++		*delta = gXgKmsJoinerDelta;
++	if (gen != NULL)
++		*gen = gXgKmsJoinerGen;
++	return (gXgKmsCommitted ? 0 : -EAGAIN);
++}
++
++/*
++ * K3: commit fixed mode n from the adapter's setDisplayMode.  Same rules as the K2 boot commit (DRRS off, 8 bpc, PSR
++ * off, the placeholder stays on the primary plane), plus DSC forced above 60 Hz: on its own i915 drops 240 Hz to
++ * 6 bpc rather than compress (§30.9).  A mode that needs the joiner is refused: the accel writes PLANE_SURF_1_A only,
++ * so pipe B's half of a joined 300 Hz frame would stay on the placeholder.  Blocking, about 1 s (a full modeset, as
++ * NVKMS does for every refresh change); the caller is between IOFramebuffer's mode-change notifications, so the accel
++ * does not flip meanwhile.
++ */
++static unsigned int
++xg_kms_set_mode(void *ctx, unsigned int fb_index, unsigned int mode_id)
++{
++	const struct drm_display_mode *m;
++	struct intel_crtc_state *cs;
++	char tag[48], line[160];
++	int hz;
++	unsigned int rc;
++
++	(void)ctx;
++	if (!gXgKmsCommitted)
++		return (XG_KMS_ERR_NOT_READY);
++	if (fb_index != 0)
++		return (XG_KMS_ERR_NOT_FOUND);
++	if (mode_id >= gXgKmsModeCount)
++		return (XG_KMS_ERR_BAD_ARGUMENT);
++	m = gXgKmsModes[mode_id];
++	hz = drm_mode_vrefresh(m);
++	(void)line;
++	mutex_lock(&gXgKmsModeLock);
++	if ((int)mode_id == gXgKmsModeCurrent) {
++		mutex_unlock(&gXgKmsModeLock);
++		return (XG_KMS_OK);
++	}
++	gXgKmsCommitted = 2;	/* set_mode in flight; the commit below sets it back to 1 */
++	/* J1: join when this raster or the desktop on the plane is too much for one pipe (300 Hz, HiDPI at 240) */
++	gXgKmsEdp->force_joined_pipes = xg_kms_needs_joiner(m, gXgKmsFb->width, gXgKmsFb->height) ? 2 : 0;
++	snprintf(tag, sizeof(tag), "K3 %dx%d@%d/8bpc%s%s", m->hdisplay, m->vdisplay, hz, hz > 60 ? "+dsc" : "",
++	    gXgKmsEdp->force_joined_pipes ? "+joiner" : "");
++	xg_kms_check_one(gXgKmsDisplay, gXgKmsCrtc, gXgKmsEdp, gXgKmsFb, m, hz > 60, 8, true, tag);
++	xg_kms_update_joiner();
++	cs = to_intel_crtc_state(gXgKmsCrtc->base.state);
++	if (gXgKmsCommitted == 1 && cs->hw.adjusted_mode.crtc_clock == m->clock) {
++		gXgKmsModeCurrent = (int)mode_id;
++		rc = XG_KMS_OK;
++	} else {
++		gXgKmsCommitted = 1;
++		rc = XG_KMS_ERR_BUSY;
++	}
++	mutex_unlock(&gXgKmsModeLock);
++	return (rc);
++}
++
++/* B1: the panel's backlight, as a percent of its own min..max */
++static unsigned int
++xg_kms_backlight_pct(const struct intel_panel *panel)
++{
++	u32 min = panel->backlight.min, max = panel->backlight.max, level = panel->backlight.level;
++
++	if (max <= min)
++		return (0);
++	if (level <= min)
++		return (0);
++	return ((unsigned int)(((u64)(level - min) * 100 + (max - min) / 2) / (max - min)));
++}
++
++static unsigned int
++xg_kms_backlight(void *ctx, int set_percent, unsigned int *percent_out)
++{
++	struct intel_connector *conn = gXgKmsEdp;
++	struct drm_device *dev;
++	struct intel_panel *panel;
++	char line[160];
++
++	(void)ctx;
++	if (!READ_ONCE(gXgKmsModesReady) || conn == NULL)
++		return (XG_KMS_ERR_NOT_READY);
++	panel = &conn->panel;
++	if (!panel->backlight.present)
++		return (XG_KMS_ERR_UNSUPPORTED);
++	dev = conn->base.dev;
++	drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
++	if (set_percent >= 0) {
++		if (set_percent > 100)
++			set_percent = 100;
++		intel_backlight_set_acpi(conn->base.state, (u32)set_percent, 100);
++	}
++	if (percent_out != NULL)
++		*percent_out = xg_kms_backlight_pct(panel);
++	if (set_percent >= 0) {
++		snprintf(line, sizeof(line), "kms: B1 backlight %d%% -> level %u (min %u max %u, enabled %d)", set_percent,
++		    panel->backlight.level, panel->backlight.min, panel->backlight.max, panel->backlight.enabled ? 1 : 0);
++		pr_info("XEGFX_DISP: %s\n", line);
++	}
++	drm_modeset_unlock(&dev->mode_config.connection_mutex);
++	return (XG_KMS_OK);
++}
++
++/*
++ * E3: the adapter's vblank thread sleeps here instead of on a free-running timer.  A vblank reference per call keeps
++ * the pipe's vblank interrupt on while the adapter keeps asking (i915 disables it at the first vblank with no
++ * reference, vblank_disable_immediate); drm_handle_vblank() wakes the queue at every vblank, and drm_crtc_vblank_off()
++ * at a modeset wakes it too and fails the next get until the pipe is back.
++ */
++static unsigned int
++xg_kms_wait_vblank(void *ctx, unsigned long long last, unsigned int timeout_us, unsigned long long *count_out,
++    unsigned long long *age_ns_out)
++{
++	struct drm_crtc *crtc;
++	struct drm_vblank_crtc *vb;
++	ktime_t t;
++	s64 age;
++	u64 c;
++
++	(void)ctx;
++	if (count_out == NULL || age_ns_out == NULL || timeout_us == 0 || timeout_us > 1000000U)
++		return (XG_KMS_ERR_BAD_ARGUMENT);
++	if (!READ_ONCE(gXgKmsModesReady) || gXgKmsCrtc == NULL)
++		return (XG_KMS_ERR_NOT_READY);
++	crtc = &gXgKmsCrtc->base;
++	if (drm_crtc_vblank_get(crtc) != 0)
++		return (XG_KMS_ERR_BUSY);
++	vb = drm_crtc_vblank_crtc(crtc);
++	(void)wait_event_timeout(vb->queue, drm_crtc_vblank_count(crtc) != last || !READ_ONCE(vb->enabled),
++	    usecs_to_jiffies(timeout_us));
++	c = drm_crtc_vblank_count_and_time(crtc, &t);
++	drm_crtc_vblank_put(crtc);
++	age = ktime_to_ns(ktime_sub(ktime_get(), t));
++	*count_out = c;
++	*age_ns_out = age > 0 ? (unsigned long long)age : 0;
++	return (c != last ? XG_KMS_OK : XG_KMS_ERR_BUSY);
++}
++
++/* one plane-only commit: fb on the primary plane, its whole size as the source, the current raster as the target */
++static int
++xg_kms_plane_commit(struct drm_framebuffer *fb)
++{
++	struct intel_display *display = gXgKmsDisplay;
++	struct intel_crtc *crtc = gXgKmsCrtc;
++	struct drm_plane *primary = crtc->base.primary;
++	const struct drm_display_mode *mode = &crtc->base.state->mode;
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_plane_state *ps;
++	int ret;
++
++	state = drm_atomic_state_alloc(display->drm);
++	if (state == NULL)
++		return (-ENOMEM);
++	drm_modeset_acquire_init(&ctx, 0);
++	state->acquire_ctx = &ctx;
++	to_intel_atomic_state(state)->internal = true;
++retry:
++	ps = drm_atomic_get_plane_state(state, primary);
++	if (IS_ERR(ps)) {
++		ret = PTR_ERR(ps);
++		goto out;
++	}
++	ret = drm_atomic_set_crtc_for_plane(ps, &crtc->base);
++	if (ret)
++		goto out;
++	drm_atomic_set_fb_for_plane(ps, fb);
++	ps->src_x = ps->src_y = 0;
++	ps->src_w = (u32)fb->width << 16;
++	ps->src_h = (u32)fb->height << 16;
++	ps->crtc_x = ps->crtc_y = 0;
++	ps->crtc_w = mode->hdisplay;
++	ps->crtc_h = mode->vdisplay;
++	ret = drm_atomic_commit(state);
++out:
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++	drm_atomic_state_put(state);
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++	return (ret);
++}
++
++/*
++ * A1: a scaled desktop.  The adapter's scanout and WindowServer's frames are width x height at `pitch`; the plane
++ * reads them at that size (the accel still writes only PLANE_SURF, and refuses a frame whose pitch is not the plane's
++ * stride) and the plane scaler stretches or shrinks them onto the raster.  No modeset: the pipe and the link stay.
++ */
++static unsigned int
++xg_kms_set_plane(void *ctx, unsigned int width, unsigned int height, unsigned int pitch)
++{
++	struct drm_mode_fb_cmd2 cmd = {};
++	struct drm_framebuffer *fb;
++	char line[160];
++	u64 t0;
++	int ret;
++
++	(void)ctx;
++	if (!gXgKmsCommitted || gXgKmsObj == NULL || gXgKmsFb == NULL)
++		return (XG_KMS_ERR_NOT_READY);
++	if (width < 320 || height < 200 || width > XG_KMS_PLANE_MAX_W || height > XG_KMS_PLANE_MAX_H ||
++	    pitch < width * 4U || (pitch & 63U) != 0 || (unsigned long long)pitch * height >
++	    (unsigned long long)XG_KMS_PLANE_MAX_W * 4U * XG_KMS_PLANE_MAX_H)
++		return (XG_KMS_ERR_BAD_ARGUMENT);
++	mutex_lock(&gXgKmsModeLock);
++	if (gXgKmsFb->width == width && gXgKmsFb->height == height && gXgKmsFb->pitches[0] == pitch &&
++	    gXgKmsFb->modifier == DRM_FORMAT_MOD_LINEAR) {
++		mutex_unlock(&gXgKmsModeLock);
++		return (XG_KMS_OK);
++	}
++	cmd.width = width;
++	cmd.height = height;
++	cmd.pixel_format = DRM_FORMAT_XRGB8888;
++	cmd.pitches[0] = pitch;
++	fb = intel_framebuffer_create(intel_bo_to_drm_bo(gXgKmsObj), &cmd);
++	if (IS_ERR(fb)) {
++		mutex_unlock(&gXgKmsModeLock);
++		snprintf(line, sizeof(line), "kms: A1 setPlane %ux%u pitch %u: framebuffer create failed (%ld)", width, height,
++		    pitch, PTR_ERR(fb));
++		xg_disp_line(gXgKmsDisplay, line);
++		return (XG_KMS_ERR_BAD_ARGUMENT);
++	}
++	t0 = ktime_get_ns();
++	{
++		/*
++		 * J1: a desktop one pipe cannot carry needs the joiner, and taking the joiner on or off is a modeset --
++		 * the same fixed mode again, with the new placeholder on the plane.  Otherwise a plane-only commit.
++		 */
++		const struct drm_display_mode *m = gXgKmsModeCurrent >= 0 ? gXgKmsModes[gXgKmsModeCurrent] : NULL;
++		int join = m != NULL && xg_kms_needs_joiner(m, width, height);
++
++		if (m != NULL && join != gXgKmsJoined) {
++			char tag[48];
++			int hz = drm_mode_vrefresh(m);
++
++			gXgKmsEdp->force_joined_pipes = join ? 2 : 0;
++			snprintf(tag, sizeof(tag), "J1 %dx%d@%d desktop %ux%u%s", m->hdisplay, m->vdisplay, hz, width, height,
++			    join ? "+joiner" : "");
++			gXgKmsLastCommitRet = -EINVAL;
++			xg_kms_check_one(gXgKmsDisplay, gXgKmsCrtc, gXgKmsEdp, fb, m, hz > 60, 8, true, tag);
++			ret = gXgKmsLastCommitRet;
++		} else
++			ret = xg_kms_plane_commit(fb);
++		if (ret == 0)
++			xg_kms_update_joiner();
++	}
++	snprintf(line, sizeof(line), "kms: A1 setPlane %ux%u pitch %u -> raster %dx%d: %d in %llu us", width, height, pitch,
++	    gXgKmsCrtc->base.state->mode.hdisplay, gXgKmsCrtc->base.state->mode.vdisplay, ret,
++	    (unsigned long long)((ktime_get_ns() - t0) / 1000));
++	xg_disp_line(gXgKmsDisplay, line);
++	drm_framebuffer_put(fb);	/* on success the committed plane state holds its own reference */
++	if (ret == 0)
++		gXgKmsFb = fb;
++	mutex_unlock(&gXgKmsModeLock);
++	return (ret == 0 ? XG_KMS_OK : XG_KMS_ERR_UNSUPPORTED);
++}
++
++/*
++ * §32.16 Tile4 scanout: the plane's layout, Tile4 (1) or linear (0).  WindowServer's frames are drawn Tile4 into their
++ * own pages (a linear render target costs 8-13x the GPU time) and the accel flips them as before, writing only
++ * PLANE_SURF; i915 must then scan the plane as Tile4.  This re-commits the placeholder at the same size and pitch with
++ * the other modifier -- plane-only, no modeset, the joiner state stays -- so i915 programs PLANE_CTL's tiling, the
++ * stride in tile units and pipe B's offset, and the joiner delta is re-read.  With DPT off (enable_dpt=0, set at boot)
++ * a Tile4 plane reads the GGTT directly, as the accel's slots need.  want < 0 only reports; *cur gets the layout.
++ * Called by the accel's flip worker (thread context, sleeps) when a frame's layout differs from the plane's.
++ */
++int xg_display_kms_plane_layout(int want, int *cur);
++int
++xg_display_kms_plane_layout(int want, int *cur)
++{
++	struct drm_mode_fb_cmd2 cmd = {};
++	struct drm_framebuffer *fb, *old;
++	char line[160];
++	u64 t0, mod;
++	int ret;
++
++	if (!gXgKmsCommitted || gXgKmsObj == NULL || gXgKmsFb == NULL)
++		return (-EAGAIN);
++	mutex_lock(&gXgKmsModeLock);
++	old = gXgKmsFb;
++	if (want < 0 || (want != 0) == (old->modifier == I915_FORMAT_MOD_4_TILED)) {
++		if (cur != NULL)
++			*cur = old->modifier == I915_FORMAT_MOD_4_TILED;
++		mutex_unlock(&gXgKmsModeLock);
++		return (0);
++	}
++	mod = want ? I915_FORMAT_MOD_4_TILED : DRM_FORMAT_MOD_LINEAR;
++	if (want && (old->pitches[0] % 128U) != 0) {	/* Tile4 rows are 128 bytes wide */
++		mutex_unlock(&gXgKmsModeLock);
++		return (-EINVAL);
++	}
++	cmd.width = old->width;
++	cmd.height = old->height;
++	cmd.pixel_format = DRM_FORMAT_XRGB8888;
++	cmd.pitches[0] = old->pitches[0];
++	cmd.flags = DRM_MODE_FB_MODIFIERS;
++	cmd.modifier[0] = mod;
++	fb = intel_framebuffer_create(intel_bo_to_drm_bo(gXgKmsObj), &cmd);
++	if (IS_ERR(fb)) {
++		mutex_unlock(&gXgKmsModeLock);
++		snprintf(line, sizeof(line), "kms: Tile4 layout %d: framebuffer create failed (%ld)", want, PTR_ERR(fb));
++		xg_disp_line(gXgKmsDisplay, line);
++		return ((int)PTR_ERR(fb));
++	}
++	t0 = ktime_get_ns();
++	ret = xg_kms_plane_commit(fb);
++	if (ret == 0)
++		xg_kms_update_joiner();
++	snprintf(line, sizeof(line), "kms: Tile4 layout %s %ux%u pitch %u: %d in %llu us", want ? "Tile4" : "linear",
++	    cmd.width, cmd.height, cmd.pitches[0], ret, (unsigned long long)((ktime_get_ns() - t0) / 1000));
++	xg_disp_line(gXgKmsDisplay, line);
++	drm_framebuffer_put(fb);	/* on success the committed plane state holds its own reference */
++	if (ret == 0)
++		gXgKmsFb = fb;
++	if (cur != NULL)
++		*cur = gXgKmsFb->modifier == I915_FORMAT_MOD_4_TILED;
++	mutex_unlock(&gXgKmsModeLock);
++	return (ret);
++}
++
++/*
++ * C1 hardware cursor (native-display docs/32-FRAME-RATE.md §32.18).  Without one WindowServer draws the pointer into
++ * every 3840x2400 composite, so it moves only as often as a whole frame completes.  The cursor plane is i915's, but
++ * i915 moves it with a full atomic commit while the pipe is joined (intel_legacy_cursor_update has no joiner fast
++ * path), far too slow per mouse event.  So i915 enables the plane once -- a 128x128 ARGB framebuffer straddling the
++ * joiner seam, which makes it allocate DDB and watermarks for the cursor on both pipes -- and from then on the cursor
++ * is ours on the registers, as PLANE_SURF is the accel's: CUR_BASE points at our own contiguous WC buffer (GGTT-mapped
++ * like a KAPI scanout buffer), CUR_POS/CUR_CTL are written per pipe, CUR_BASE last (the arming write).  Every commit
++ * re-applies them (xg_kms_update_joiner).  The plane is not scaled, so the image is scaled here to the raster, and
++ * positions come in desktop pixels (what IOFramebuffer hands the adapter, hot spot already taken off) and are scaled
++ * the same way.  KAPI reserved[6] cursorImage(ctx, argb, w, h, pitch bytes): straight-alpha ARGB, w = 0 hides it;
++ * reserved[7] cursorMove(ctx, x, y, visible).  Thread context; cursorMove only writes registers.
++ */
++#define XG_CUR_DIM	128U
++#define XG_CUR_BYTES	(XG_CUR_DIM * XG_CUR_DIM * 4U)
++static DEFINE_SPINLOCK(gXgCurLock);
++static xg_vm_xmem_t		 gXgCurMem;
++static unsigned int		*gXgCurKva;
++static unsigned long long	 gXgCurGgtt;
++static struct drm_framebuffer	*gXgCurFb;	/* i915's placeholder: the committed cursor plane state holds it */
++static int			 gXgCurOn;	/* the plane is enabled by i915 and our buffer is mapped */
++static unsigned int		 gXgCurCtl[2];	/* CUR_CTL as i915 programmed it for pipes A and B */
++static int			 gXgCurX, gXgCurY, gXgCurVis, gXgCurHave;	/* raster pixels */
++static unsigned long long	 gXgCurMoves, gXgCurImages;
++
++#define XG_CUR_CTL(p)	_MMIO(0x70080 + 0x1000 * (p))
++#define XG_CUR_BASE(p)	_MMIO(0x70084 + 0x1000 * (p))
++#define XG_CUR_POS(p)	_MMIO(0x70088 + 0x1000 * (p))
++
++/* the cursor registers from our state, both halves when joined; under gXgCurLock */
++static void
++xg_kms_cursor_write_locked(void)
++{
++	const struct drm_display_mode *mode;
++	int pipes, pw, ph, p;
++
++	if (!gXgCurOn || gXgKmsCrtc == NULL)
++		return;
++	mode = &gXgKmsCrtc->base.state->mode;
++	pipes = gXgKmsJoined ? 2 : 1;
++	pw = mode->hdisplay / pipes;
++	ph = mode->vdisplay;
++	for (p = 0; p < pipes; p++) {
++		const int x = gXgCurX - p * pw, y = gXgCurY;
++		const int on = gXgCurVis && gXgCurHave && x < pw && x + (int)XG_CUR_DIM > 0 && y < ph &&
++		    y + (int)XG_CUR_DIM > 0;
++		const unsigned int pos = (y < 0 ? (1U << 31) | ((unsigned int)-y << 16) : (unsigned int)y << 16) |
++		    (x < 0 ? (1U << 15) | (unsigned int)-x : (unsigned int)x);
++
++		intel_de_write_fw(gXgKmsDisplay, XG_CUR_CTL(p), on ? gXgCurCtl[p] : 0);
++		intel_de_write_fw(gXgKmsDisplay, XG_CUR_POS(p), pos);
++		intel_de_write_fw(gXgKmsDisplay, XG_CUR_BASE(p), (unsigned int)gXgCurGgtt);
+ 	}
+ }
++
++static void
++xg_kms_cursor_reapply(void)
++{
++	unsigned long fl;
++	int p;
++
++	spin_lock_irqsave(&gXgCurLock, fl);
++	/* right after a commit the registers hold i915's state: a pipe that joined since has its CUR_CTL now */
++	for (p = 0; gXgCurOn && p < (gXgKmsJoined ? 2 : 1); p++) {
++		const unsigned int c = intel_de_read(gXgKmsDisplay, XG_CUR_CTL(p));
++
++		if (c != 0)
++			gXgCurCtl[p] = c;
++	}
++	xg_kms_cursor_write_locked();
++	spin_unlock_irqrestore(&gXgCurLock, fl);
++}
++
++/* commit i915's cursor plane once with a placeholder straddling the seam, then take the registers over */
++static int
++xg_kms_cursor_enable(void)
++{
++	struct intel_display *display = gXgKmsDisplay;
++	struct intel_crtc *crtc = gXgKmsCrtc;
++	struct drm_i915_private *i915 = to_i915(display->drm);
++	struct drm_mode_fb_cmd2 cmd = {};
++	struct drm_i915_gem_object *obj;
++	struct drm_framebuffer *fb;
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_plane_state *ps;
++	const struct drm_display_mode *mode;
++	unsigned long long pa = 0;
++	void *kva = NULL;
++	char line[160];
++	int ret;
++
++	if (gXgCurMem == NULL) {
++		gXgCurMem = xg_vm_x_alloc(XG_CUR_BYTES, 0x00000000fffff000ULL, XG_VM_CACHE_WC, &kva, &pa);
++		if (gXgCurMem == NULL || kva == NULL || pa == 0 || pa + XG_CUR_BYTES > 0x100000000ULL ||
++		    xg_scanout_ggtt_map(XG_CUR_BYTES, pa, &gXgCurGgtt) != 0) {
++			if (gXgCurMem != NULL)
++				xg_vm_x_release(gXgCurMem);
++			gXgCurMem = NULL;
++			xg_disp_line(display, "kms: C1 cursor: no contiguous buffer below 4 GiB, or no GGTT range");
++			return (-ENOMEM);
++		}
++		gXgCurKva = kva;
++		memset(gXgCurKva, 0, XG_CUR_BYTES);
++		xg_vm_x_flush(gXgCurKva, XG_CUR_BYTES);
++	}
++	obj = i915_gem_object_create_shmem(i915, XG_CUR_BYTES);
++	if (IS_ERR(obj))
++		return ((int)PTR_ERR(obj));
++	cmd.width = cmd.height = XG_CUR_DIM;
++	cmd.pixel_format = DRM_FORMAT_ARGB8888;
++	cmd.pitches[0] = XG_CUR_DIM * 4U;
++	fb = intel_framebuffer_create(intel_bo_to_drm_bo(obj), &cmd);
++	i915_gem_object_put(obj);	/* the framebuffer holds its own reference */
++	if (IS_ERR(fb))
++		return ((int)PTR_ERR(fb));
++	mode = &crtc->base.state->mode;
++	state = drm_atomic_state_alloc(display->drm);
++	if (state == NULL) {
++		drm_framebuffer_put(fb);
++		return (-ENOMEM);
++	}
++	drm_modeset_acquire_init(&ctx, 0);
++	state->acquire_ctx = &ctx;
++	to_intel_atomic_state(state)->internal = true;
++retry:
++	ps = drm_atomic_get_plane_state(state, crtc->base.cursor);
++	if (IS_ERR(ps)) {
++		ret = PTR_ERR(ps);
++		goto out;
++	}
++	ret = drm_atomic_set_crtc_for_plane(ps, &crtc->base);
++	if (ret)
++		goto out;
++	drm_atomic_set_fb_for_plane(ps, fb);
++	ps->src_x = ps->src_y = 0;
++	ps->src_w = ps->src_h = XG_CUR_DIM << 16;
++	ps->crtc_x = mode->hdisplay / 2 - (int)XG_CUR_DIM / 2;	/* across the seam: both joined pipes get it */
++	ps->crtc_y = 0;
++	ps->crtc_w = ps->crtc_h = XG_CUR_DIM;
++	ret = drm_atomic_commit(state);
++out:
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++	drm_atomic_state_put(state);
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++	if (ret == 0) {
++		gXgCurFb = fb;
++		gXgCurCtl[0] = intel_de_read(display, XG_CUR_CTL(0));
++		gXgCurCtl[1] = gXgKmsJoined ? intel_de_read(display, XG_CUR_CTL(1)) : 0;
++	}
++	drm_framebuffer_put(fb);	/* on success the committed plane state holds its own reference */
++	snprintf(line, sizeof(line), "kms: C1 cursor plane %s: %d, CUR_CTL A 0x%x B 0x%x, our buffer at GGTT 0x%llx",
++	    ret == 0 ? "enabled" : "refused", ret, gXgCurCtl[0], gXgCurCtl[1], gXgCurGgtt);
++	xg_disp_line(display, line);
++	if (ret == 0 && (gXgCurCtl[0] == 0 || (gXgKmsJoined && gXgCurCtl[1] == 0)))
++		ret = -ENODEV;	/* i915 did not turn it on where we need it */
++	return (ret);
++}
++
++/* the desktop-to-raster scale as a 16.16 fraction (the plane scaler's: the cursor plane is not scaled) */
++static unsigned int
++xg_kms_cursor_scale_x(void)
++{
++	return ((unsigned int)(((unsigned long long)gXgKmsCrtc->base.state->mode.hdisplay << 16) / gXgKmsFb->width));
++}
++static unsigned int
++xg_kms_cursor_scale_y(void)
++{
++	return ((unsigned int)(((unsigned long long)gXgKmsCrtc->base.state->mode.vdisplay << 16) / gXgKmsFb->height));
++}
++
++static unsigned int
++xg_kms_cursor_image(void *ctx, const unsigned int *argb, unsigned int width, unsigned int height, unsigned int pitch)
++{
++	unsigned int sx, sy, ow, oh, ox, oy;
++	unsigned long fl;
++	unsigned int *buf;
++
++	(void)ctx;
++	if (!gXgKmsCommitted || gXgKmsFb == NULL || gXgKmsCrtc == NULL)
++		return (XG_KMS_ERR_NOT_READY);
++	if (width == 0 || argb == NULL) {
++		spin_lock_irqsave(&gXgCurLock, fl);
++		gXgCurHave = 0;
++		xg_kms_cursor_write_locked();
++		spin_unlock_irqrestore(&gXgCurLock, fl);
++		return (XG_KMS_OK);
++	}
++	if (height == 0 || width > 512 || height > 512 || pitch < width * 4U)
++		return (XG_KMS_ERR_BAD_ARGUMENT);
++	sx = xg_kms_cursor_scale_x();
++	sy = xg_kms_cursor_scale_y();
++	ow = (unsigned int)(((unsigned long long)width * sx + 0xffffU) >> 16);
++	oh = (unsigned int)(((unsigned long long)height * sy + 0xffffU) >> 16);
++	if (ow == 0 || oh == 0 || ow > XG_CUR_DIM || oh > XG_CUR_DIM)
++		return (XG_KMS_ERR_UNSUPPORTED);	/* WindowServer draws this one itself */
++	mutex_lock(&gXgKmsModeLock);
++	if (!gXgCurOn) {
++		int ret = xg_kms_cursor_enable();
++
++		if (ret != 0) {
++			mutex_unlock(&gXgKmsModeLock);
++			return (XG_KMS_ERR_UNSUPPORTED);
++		}
++		gXgCurOn = 1;
++	}
++	mutex_unlock(&gXgKmsModeLock);
++	/*
++	 * Bilinear, premultiplied: each raster pixel samples the desktop image at its centre.  Written straight into
++	 * the buffer the plane scans (one frame may show half of the old shape at a shape change).
++	 */
++	buf = gXgCurKva;
++	for (oy = 0; oy < XG_CUR_DIM; oy++) {
++		for (ox = 0; ox < XG_CUR_DIM; ox++) {
++			unsigned int out = 0;
++
++			if (ox < ow && oy < oh) {
++				/* source position of this pixel's centre, 16.16 */
++				const long long fx = ((((long long)ox << 16) + 0x8000) << 16) / sx - 0x8000;
++				const long long fy = ((((long long)oy << 16) + 0x8000) << 16) / sy - 0x8000;
++				const int x0 = fx < 0 ? 0 : (int)(fx >> 16), y0 = fy < 0 ? 0 : (int)(fy >> 16);
++				const int x1 = x0 + 1 < (int)width ? x0 + 1 : x0, y1 = y0 + 1 < (int)height ? y0 + 1 : y0;
++				const unsigned int wx = fx < 0 ? 0 : (unsigned int)(fx & 0xffff), wy = fy < 0 ? 0 : (unsigned int)(fy & 0xffff);
++				unsigned long long acc[4] = { 0, 0, 0, 0 };
++				int k, c;
++
++				for (k = 0; k < 4; k++) {
++					const int xx = (k & 1) ? x1 : x0, yy = (k & 2) ? y1 : y0;
++					const unsigned int p = (xx < (int)width && yy < (int)height) ?
++					    *(const unsigned int *)((const char *)argb + (size_t)yy * pitch + (size_t)xx * 4U) : 0;
++					const unsigned int a = p >> 24;
++					const unsigned long long w = (unsigned long long)((k & 1) ? wx : 0x10000U - wx) *
++					    ((k & 2) ? wy : 0x10000U - wy);
++
++					acc[3] += w * a;
++					acc[2] += w * ((((p >> 16) & 255U) * a + 127U) / 255U);
++					acc[1] += w * ((((p >> 8) & 255U) * a + 127U) / 255U);
++					acc[0] += w * (((p & 255U) * a + 127U) / 255U);
++				}
++				for (c = 0; c < 4; c++) {
++					unsigned long long v = (acc[c] + (1ULL << 31)) >> 32;
++
++					out |= (unsigned int)(v > 255 ? 255 : v) << (8 * c);
++				}
++			}
++			buf[oy * XG_CUR_DIM + ox] = out;
++		}
++	}
++	xg_vm_x_flush(buf, XG_CUR_BYTES);
++	__sync_synchronize();
++	spin_lock_irqsave(&gXgCurLock, fl);
++	gXgCurHave = 1;
++	gXgCurImages++;
++	xg_kms_cursor_write_locked();
++	spin_unlock_irqrestore(&gXgCurLock, fl);
++	return (XG_KMS_OK);
++}
++
++static unsigned int
++xg_kms_cursor_move(void *ctx, int x, int y, unsigned int visible)
++{
++	unsigned long fl;
++
++	(void)ctx;
++	if (!gXgCurOn || gXgKmsFb == NULL || gXgKmsCrtc == NULL)
++		return (XG_KMS_ERR_NOT_READY);
++	spin_lock_irqsave(&gXgCurLock, fl);
++	gXgCurX = (int)(((long long)x * (long long)xg_kms_cursor_scale_x()) >> 16);
++	gXgCurY = (int)(((long long)y * (long long)xg_kms_cursor_scale_y()) >> 16);
++	gXgCurVis = visible != 0;
++	gXgCurMoves++;
++	xg_kms_cursor_write_locked();
++	spin_unlock_irqrestore(&gXgCurLock, fl);
++	return (XG_KMS_OK);
++}
++
++static void
++xg_kms_check_one(struct intel_display *display, struct intel_crtc *crtc, struct intel_connector *conn,
++    struct drm_framebuffer *fb, const struct drm_display_mode *mode, bool force_dsc, int max_bpc, bool commit,
++    const char *tag)
++{
++	struct intel_dp *dp = enc_to_intel_dp(intel_attached_encoder(conn));
++	struct intel_plane *primary = to_intel_plane(crtc->base.primary);
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct intel_crtc_state *cs;
++	struct intel_encoder *encoder;
++	bool saved_force_dsc = dp->force_dsc_en;
++	int fastset_ok = -1;
++	char line[320];
++	int ret;
++
++	state = drm_atomic_state_alloc(display->drm);
++	if (state == NULL)
++		return;
++	drm_modeset_acquire_init(&ctx, 0);
++	state->acquire_ctx = &ctx;
++	to_intel_atomic_state(state)->internal = true;
++	dp->force_dsc_en = force_dsc;
++retry:
++	cs = intel_atomic_get_crtc_state(state, crtc);
++	if (IS_ERR(cs)) {
++		ret = PTR_ERR(cs);
++		goto out;
++	}
++	ret = drm_atomic_add_affected_planes(state, &crtc->base);
++	if (ret)
++		goto out;
++	if (mode == NULL) {
++		cs->uapi.color_mgmt_changed = true;	/* as intel_initial_commit() */
++		for_each_intel_encoder_mask(display->drm, encoder, cs->uapi.encoder_mask) {
++			if (encoder->initial_fastset_check == NULL)
++				continue;
++			fastset_ok = encoder->initial_fastset_check(encoder, cs) ? 1 : 0;
++			if (!fastset_ok && (ret = drm_atomic_add_affected_connectors(state, &crtc->base)) != 0)
++				goto out;
++		}
++	} else {
++		struct drm_connector_state *cn = drm_atomic_get_connector_state(state, &conn->base);
++
++		if (IS_ERR(cn)) {
++			ret = PTR_ERR(cn);
++			goto out;
++		}
++		ret = drm_atomic_set_crtc_for_connector(cn, &crtc->base);
++		if (ret == 0)
++			ret = drm_atomic_set_mode_for_crtc(&cs->uapi, mode);
++		if (ret)
++			goto out;
++		if (max_bpc > 0)
++			cn->max_requested_bpc = max_bpc;
++		cs->uapi.active = true;
++		/*
++		 * Always a full modeset.  J1 commits the same raster with the joiner turned on or off; DRM sees an equal
++		 * mode, leaves mode_changed clear, and i915 then keeps the old pipe config and refuses the plane (-EINVAL
++		 * in ~25 us: a 3840x2400 desktop on one 240 Hz pipe).
++		 */
++		cs->uapi.mode_changed = true;
++	}
++	if (fb != NULL) {
++		struct drm_plane_state *ps = drm_atomic_get_plane_state(state, &primary->base);
++		int w = mode != NULL ? mode->hdisplay : fb->width, h = mode != NULL ? mode->vdisplay : fb->height;
++
++		if (IS_ERR(ps)) {
++			ret = PTR_ERR(ps);
++			goto out;
++		}
++		ret = drm_atomic_set_crtc_for_plane(ps, &crtc->base);
++		if (ret)
++			goto out;
++		drm_atomic_set_fb_for_plane(ps, fb);
++		ps->src_x = ps->src_y = 0;
++		ps->src_w = (u32)fb->width << 16;
++		ps->src_h = (u32)fb->height << 16;
++		ps->crtc_x = ps->crtc_y = 0;
++		ps->crtc_w = w;
++		ps->crtc_h = h;
++	}
++	if (commit) {
++		u64 t0 = ktime_get_ns();
++
++		ret = drm_atomic_commit(state);
++		gXgKmsLastCommitRet = ret;
++		if (ret == 0)
++			gXgKmsCommitted = 1;
++		snprintf(line, sizeof(line), "kms: commit %s -> %d in %llu us", tag, ret,
++		    (unsigned long long)((ktime_get_ns() - t0) / 1000));
++		if (ret != -EDEADLK)
++			xg_disp_line(display, line);
++	} else
++		ret = drm_atomic_check_only(state);
++out:
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++	if (ret == 0) {
++		struct intel_atomic_state *is = to_intel_atomic_state(state);
++		const struct intel_cdclk_state *cd = intel_atomic_get_new_cdclk_state(is);
++		const struct drm_connector_state *ncs = drm_atomic_get_new_connector_state(state, &conn->base);
++		const struct intel_plane_state *pps = intel_atomic_get_new_plane_state(is, primary);
++		const struct skl_ddb_entry *ddb;
++
++		cs = intel_atomic_get_new_crtc_state(is, crtc);
++		ddb = &cs->wm.skl.plane_ddb[primary->id];
++		snprintf(line, sizeof(line), "kms: %s %s ok: %s initial_fastset %d clock %d kHz port_clock %d lanes %d "
++		    "bpp %d max_bpc %d dsc %d bpp_x16 %u slices %u joiner 0x%x psr %d cdclk %d%s plane %s ddb %u..%u",
++		    commit ? "committed" : "check", tag, intel_crtc_needs_modeset(cs) ? "modeset" : cs->update_pipe ? "fastset" : "unchanged", fastset_ok,
++		    cs->hw.adjusted_mode.crtc_clock, cs->port_clock, cs->lane_count, cs->pipe_bpp,
++		    ncs != NULL ? ncs->max_bpc : -1,
++		    cs->dsc.compression_enable ? 1 : 0, cs->dsc.compressed_bpp_x16, cs->dsc.slice_count, cs->joiner_pipes,
++		    cs->has_psr ? 1 : 0, cd != NULL ? cd->logical.cdclk : display->cdclk.hw.cdclk,
++		    cd != NULL ? "" : " (unchanged)",
++		    pps == NULL ? "-" : pps->uapi.visible ? "visible" : "off", ddb->start, ddb->end);
++	} else
++		snprintf(line, sizeof(line), "kms: %s %s failed: %d", commit ? "commit" : "check", tag, ret);
++	xg_disp_line(display, line);
++	dp->force_dsc_en = saved_force_dsc;
++	drm_atomic_state_put(state);
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++}
++
++/* every input of the bpp / link-rate choice, as intel_dp_compute_config_limits() and intel_dp_max_bpp() see them */
++static void
++xg_kms_diag(struct intel_display *display, struct intel_connector *conn)
++{
++	struct intel_dp *dp = enc_to_intel_dp(intel_attached_encoder(conn));
++	const struct drm_display_info *info = &conn->base.display_info;
++	char line[320];
++	int i, n = 0;
++
++	snprintf(line, sizeof(line), "kms: diag edid_bpc %d max_requested_bpc %d vbt_edp_bpp %d use_max_params %d "
++	    "edp_rev 0x%02x force_rate %d force_lanes %d force_dsc %d enable_psr %d",
++	    info->bpc, conn->base.state != NULL ? conn->base.state->max_requested_bpc : -1, conn->panel.vbt.edp.bpp,
++	    dp->use_max_params ? 1 : 0, dp->edp_dpcd[0], dp->link.force_rate, dp->link.force_lane_count,
++	    dp->force_dsc_en ? 1 : 0, display->params.enable_psr);
++	xg_disp_line(display, line);
++	n = snprintf(line, sizeof(line), "kms: diag common_rates %d:", dp->num_common_rates);
++	for (i = 0; i < dp->num_common_rates && n < (int)sizeof(line) - 12; i++)
++		n += snprintf(line + n, sizeof(line) - n, " %d", intel_dp_common_rate(dp, i));
++	n += snprintf(line + n, sizeof(line) - n, " max_rate %d max_lanes %d", intel_dp_max_link_rate(dp),
++	    intel_dp_max_lane_count(dp));
++	xg_disp_line(display, line);
++	{
++		u8 bpcs[DP_DSC_RECEIVER_CAP_SIZE];
++		int nb = drm_dp_dsc_sink_supported_input_bpcs(conn->dp.dsc_dpcd, bpcs);
++
++		snprintf(line, sizeof(line), "kms: diag dsc sink %d slices %u input_bpcs %d (max %u) edp_out_bpp_x16 %u vbt_dsc %d",
++		    drm_dp_sink_supports_dsc(conn->dp.dsc_dpcd) ? 1 : 0,
++		    drm_dp_dsc_sink_max_slice_count(conn->dp.dsc_dpcd, true), nb, nb > 0 ? bpcs[0] : 0,
++		    drm_edp_dsc_sink_output_bpp(conn->dp.dsc_dpcd), conn->panel.vbt.edp.dsc_disable ? 0 : 1);
++	}
++	xg_disp_line(display, line);
++}
++
++void
++xg_display_kms_check(struct intel_display *display)
++{
++	struct drm_i915_private *i915 = to_i915(display->drm);
++	struct drm_connector_list_iter it;
++	struct drm_connector *dc;
++	struct intel_connector *edp = NULL;
++	struct intel_crtc *crtc, *active = NULL;
++	struct drm_framebuffer *fb = NULL;
++	struct drm_mode_fb_cmd2 cmd = {};
++	struct drm_i915_gem_object *obj;
++	const struct drm_display_mode *m;
++	const struct drm_display_mode *booted = NULL;
++	unsigned long debug = __drm_debug;
++	char tag[48];
++
++	for_each_intel_crtc(display->drm, crtc)
++		if (active == NULL && to_intel_crtc_state(crtc->base.state)->hw.active)
++			active = crtc;
++	drm_connector_list_iter_begin(display->drm, &it);
++	drm_for_each_connector_iter(dc, &it)
++		if (edp == NULL && dc->connector_type == DRM_MODE_CONNECTOR_eDP)
++			edp = to_intel_connector(dc);
++	drm_connector_list_iter_end(&it);
++	if (active == NULL || edp == NULL) {
++		xg_disp_line(display, active == NULL ? "kms: check skipped: no active pipe" : "kms: check skipped: no eDP");
++		return;
++	}
++	xg_kms_diag(display, edp);
++
++	/* the adapter's scanout geometry; K2 commits with this, the accel keeps writing PLANE_SURF over it */
++	cmd.width = 2560;
++	cmd.height = 1600;
++	cmd.pixel_format = DRM_FORMAT_XRGB8888;
++	cmd.pitches[0] = 2560 * 4;
++	/* sized for the largest scaled desktop (A1), so every placeholder size is a framebuffer over the same pages */
++	obj = i915_gem_object_create_shmem(i915, PAGE_ALIGN(XG_KMS_PLANE_MAX_W * 4U * XG_KMS_PLANE_MAX_H));
++	if (IS_ERR(obj))
++		xg_disp_line(display, "kms: placeholder fb: shmem object failed; checking with the plane off");
++	else {
++		fb = intel_framebuffer_create(intel_bo_to_drm_bo(obj), &cmd);
++		if (xg_display_kms_level() >= 3 && !IS_ERR(fb))
++			gXgKmsObj = obj;	/* keep our reference for setPlane */
++		else
++			i915_gem_object_put(obj);
++		if (IS_ERR(fb)) {
++			xg_disp_line(display, "kms: placeholder fb: framebuffer create failed; checking with the plane off");
++			fb = NULL;
++		}
++	}
++
++	/* drm.debug only for the K2a checks: at kms=3 its output made the boot commit take 12.7 s instead of 1 s */
++	if (xg_display_kms_level() == 2)
++		__drm_debug |= BIT(DRM_UT_KMS) | BIT(DRM_UT_ATOMIC);
++	/* K2 boots skip the checks: K2a.3 answered them, and with drm.debug on they cost ~30 s of stage 4's budget */
++	if (xg_display_kms_level() == 2)
++		xg_kms_check_one(display, active, edp, fb, NULL, false, 0, false, "readout");
++	/*
++	 * K2a.2 showed why every mode came out as HBR3 x4 at 18 bpp: the VBT declares seamless DRRS, so
++	 * intel_dp_mode_clock() sizes the link for the panel's highest fixed mode (300 Hz, 1.387 GHz) and a refresh change
++	 * is only an M/N update -- and 300 Hz uncompressed only fits HBR3 x4 at 6 bpc.  K2a.3 checks the plan for K2/K3
++	 * with DRRS off (each mode sized for itself, a full modeset per refresh change, as NVKMS does): every fixed mode
++	 * as i915 would pick it, at 8 bpc (the firmware's and NVKMS's input depth), and the high refresh rates with DSC.
++	 */
++	xg_disp_line(display, edp->panel.vbt.drrs_type == DRRS_TYPE_SEAMLESS ?
++	    "kms: VBT DRRS seamless -> off for the K2a.3 checks" : "kms: VBT DRRS not seamless");
++	edp->panel.vbt.drrs_type = DRRS_TYPE_NONE;
++	list_for_each_entry(m, &edp->panel.fixed_modes, head) {
++		if (xg_display_kms_level() != 2)
++			break;
++		int hz = drm_mode_vrefresh(m);
++
++		snprintf(tag, sizeof(tag), "%dx%d@%d", m->hdisplay, m->vdisplay, hz);
++		xg_kms_check_one(display, active, edp, fb, m, false, 0, false, tag);
++		snprintf(tag, sizeof(tag), "%dx%d@%d/8bpc", m->hdisplay, m->vdisplay, hz);
++		xg_kms_check_one(display, active, edp, fb, m, false, 8, false, tag);
++		if (hz > 60) {
++			snprintf(tag, sizeof(tag), "%dx%d@%d/8bpc+dsc", m->hdisplay, m->vdisplay, hz);
++			xg_kms_check_one(display, active, edp, fb, m, true, 8, false, tag);
++		}
++	}
++	/*
++	 * K2 (kms=3): the first commit of i915's own, where intel_initial_commit() would make it -- before the adapter
++	 * publishes its nub.  A full modeset onto the panel's preferred mode (60 Hz) with what K2a.3 checked: DRRS off,
++	 * 8 bpc (2.16 GHz x4, 24 bpp, no DSC), PSR off, the placeholder framebuffer on the primary plane (prepare_fb pins
++	 * it into the GGTT; its pages are zero, so the panel shows black until the first flip).  The accel then writes
++	 * PLANE_SURF_1_A over it exactly as it wrote over the firmware's plane: same format, size and stride, and the
++	 * watermarks/DDB are now i915's.  NVKMS takes the panel the same way (docs/31 §31.4: black takeover, then a full
++	 * modeset at 60 Hz).  Nothing commits without a placeholder fb: the plane would come back off.
++	 */
++	if (xg_display_kms_level() >= 3) {
++		m = intel_panel_preferred_fixed_mode(edp);
++		if (fb == NULL || m == NULL)
++			xg_disp_line(display, fb == NULL ? "kms: commit skipped: no placeholder fb" :
++			    "kms: commit skipped: no fixed mode");
++		else {
++			unsigned int bw, bh;
++			const struct drm_display_mode *want = xg_kms_boot_pick(edp, m, &bw, &bh);
++
++			/*
++			 * K4: straight into the mode the adapter last set -- the refresh WindowServer will ask for and the
++			 * desktop on the plane, joined when one pipe cannot carry it -- so the desktop comes up without the
++			 * 60 Hz commit, a refresh modeset and a joiner modeset after it.  The same rules as K3/J1 (8 bpc, DSC
++			 * above 60 Hz, PSR off).  A refused commit leaves the pipe as it was; the 60 Hz commit follows.
++			 */
++			if (want != NULL && (want != m || bw != fb->width || bh != fb->height)) {
++				struct drm_mode_fb_cmd2 bcmd = {};
++				struct drm_framebuffer *bfb = fb;
++				int hz = drm_mode_vrefresh(want);
++
++				if (bw != fb->width || bh != fb->height) {
++					bcmd.width = bw;
++					bcmd.height = bh;
++					bcmd.pixel_format = DRM_FORMAT_XRGB8888;
++					bcmd.pitches[0] = bw * 4U;
++					bfb = gXgKmsObj != NULL ? intel_framebuffer_create(intel_bo_to_drm_bo(gXgKmsObj), &bcmd) :
++					    ERR_PTR(-ENOENT);
++				}
++				if (IS_ERR(bfb))
++					xg_disp_line(display, "kms: K4 boot mode: no placeholder at the saved desktop; 60 Hz");
++				else {
++					gXgKmsDisplay = display;	/* xg_kms_needs_joiner() reads its limits */
++					edp->force_joined_pipes = xg_kms_needs_joiner(want, bw, bh) ? 2 : 0;
++					snprintf(tag, sizeof(tag), "K4 %dx%d@%d desktop %ux%u%s", want->hdisplay, want->vdisplay, hz,
++					    bw, bh, edp->force_joined_pipes ? "+joiner" : "");
++					gXgKmsLastCommitRet = -EINVAL;
++					xg_kms_check_one(display, active, edp, bfb, want, hz > 60, 8, true, tag);
++					if (gXgKmsLastCommitRet == 0) {
++						if (bfb != fb) {
++							drm_framebuffer_put(fb);
++							fb = bfb;
++						}
++						booted = want;
++						gXgBootSaved = 1;
++					} else {
++						if (bfb != fb)
++							drm_framebuffer_put(bfb);
++						edp->force_joined_pipes = 0;
++						xg_disp_line(display, "kms: K4 boot mode refused; the panel's preferred mode instead");
++					}
++				}
++			}
++			if (booted == NULL) {
++				snprintf(tag, sizeof(tag), "%dx%d@%d/8bpc", m->hdisplay, m->vdisplay, drm_mode_vrefresh(m));
++				xg_kms_check_one(display, active, edp, fb, m, false, 8, true, tag);
++				booted = m;
++			}
++		}
++	}
++	__drm_debug = debug;
++	if (xg_display_kms_level() >= 3 && gXgKmsCommitted) {
++		xg_kms_capture_fixed_modes(display, active, edp, fb, booted);
++		/*
++		 * K3: setMode runs on the adapter's thread.  i915 lets only the probe thread touch the display until
++		 * intel_display_driver_register() opens it to all, and K1 skips register; open it here instead.
++		 */
++		intel_display_driver_enable_user_access(display);
++		xg_kms_update_joiner();
++		wmb();
++		WRITE_ONCE(gXgKmsModesReady, 1);
++	}
++	if (fb != NULL)
++		drm_framebuffer_put(fb);	/* a committed plane state holds its own reference */
++	if (xg_display_kms_level() >= 3)
++		xg_display_kms_dump(display);	/* the crtc as i915 now knows it, after the commit */
++}
+--- a/gpu/xkpi/src/i915/xg_display_hook.h
++++ b/gpu/xkpi/src/i915/xg_display_hook.h
+@@ -40,9 +40,18 @@
+ unsigned int xg_display_edid_get(const void **data);
+ unsigned int xg_display_dpcd_get(const void **data);
+ 
+-/* K1 staged eDP takeover: 0 = display left alone, 1 = build outputs + read out, commit nothing (xg_display_hook.c) */
++/*
++ * Staged eDP takeover (xg_display_hook.c): 0 = display left alone, 1 = K1 build outputs + read out, commit nothing,
++ * 2 = K2a as K1 plus an atomic check (never a commit) of the read-out state and of each panel fixed mode, with a
++ * placeholder framebuffer on the primary plane (K2a.2); the fixed modes are checked with DRRS off, at the default
++ * and at 8 bpc, and above 60 Hz with DSC forced (K2a.3).  Leaves the connector's VBT DRRS type at none.
++ * 3 = K2: the checks, then one full modeset onto the preferred 60 Hz mode at 8 bpc with the placeholder framebuffer.
++ */
+ int xg_display_kms_level(void);
+ void xg_display_kms_dump(struct intel_display *display);
++void xg_display_kms_check(struct intel_display *display);
++/* J1: whether pipe A is joined with pipe B, pipe B's PLANE_SURF minus pipe A's, and a generation counter */
++int xg_display_kms_joiner_info(unsigned int *active, unsigned int *delta, unsigned int *gen);
+ 
+ /*
+  * M3b: read-only KMS KAPI v1.
+--- a/gpu/xkpi/src/i915/intel_display_driver.c
++++ b/gpu/xkpi/src/i915/intel_display_driver.c
+@@ -501,7 +501,7 @@
+ 	 * K1 adopts the firmware's pipe read-only: the BIOS framebuffer stays where it is (no GGTT takeover; the
+ 	 * adapter's own scanout is what the panel shows) and the watermarks the firmware programmed stay in place.
+ 	 */
+-	if (xg_display_kms_level() == 1) {
++	if (xg_display_kms_level() >= 1) {
+ 		xg_display_kms_dump(display);
+ 		return 0;
+ 	}
+@@ -535,9 +535,15 @@
+ 	if (!HAS_DISPLAY(display))
+ 		return 0;
+ 
+-	/* K1 commits nothing: no initial commit, no hotplug, no IPC change */
+-	if (xg_display_kms_level() == 1)
++	/*
++	 * K1 commits nothing: no initial commit, no hotplug, no IPC change.  K2a (kms=2) checks, where
++	 * intel_initial_commit() would commit, what i915 would program -- check only, still nothing reaches the hardware.
++	 */
++	if (xg_display_kms_level() >= 1) {
++		if (xg_display_kms_level() >= 2)
++			xg_display_kms_check(display);
+ 		return 0;
++	}
+ 
+ 	/*
+ 	 * This will bind stuff into ggtt, so it needs to be done after
+@@ -575,8 +581,8 @@
+ 	if (!HAS_DISPLAY(display))
+ 		return;
+ 
+-	/* K1: no OpRegion/ACPI video, no fbdev console, no connector polling: the adapter keeps the desktop */
+-	if (xg_display_kms_level() == 1)
++	/* K1/K2a: no OpRegion/ACPI video, no fbdev console, no connector polling: the adapter keeps the desktop */
++	if (xg_display_kms_level() >= 1)
+ 		return;
+ 
+ 	/* Must be done after probing outputs */
+--- a/gpu/xkpi/src/i915/intel_modeset_setup.c
++++ b/gpu/xkpi/src/i915/intel_modeset_setup.c
+@@ -980,7 +980,7 @@
+ 	 * watermarks -- and skip every sanitize step: nothing here may disable a pipe, an encoder, a DPLL or a
+ 	 * power well, or touch planes, FBC or underrun reporting.
+ 	 */
+-	if (xg_display_kms_level() == 1) {
++	if (xg_display_kms_level() >= 1) {
+ 		get_encoder_power_domains(i915);
+ 		intel_modeset_update_connector_atomic_state(i915);
+ 		intel_wm_get_hw_state(i915);
+--- a/gpu/xkpi/src/i915/xg_i915_exec.c
++++ b/gpu/xkpi/src/i915/xg_i915_exec.c
+@@ -20,6 +20,12 @@
+ #include "i915_gem_gtt.h"
+ 
+ #include "xg_i915.h"
++#include "gt/intel_rps.h"
++#include "gt/intel_timeline.h"
++#include "i915_active.h"
++#include <linux/dma-fence.h>
++#include <linux/slab.h>
++#include "gt/uc/intel_guc_slpc.h"
+ 
+ static struct drm_i915_private *
+ xg_i915_find(struct pci_dev **pdevp)
+@@ -226,4 +232,148 @@
+ 			return (0);
+ 	}
+ 	return (1);
++}
++
++/*
++ * GPU clock (native-display docs/32-FRAME-RATE.md §32.13): Dock and Genie animations run 20-50 fps with the flip worker
++ * waiting 8-67 ms for each composite, while the same desktop does 100+ fps once the animation is over.  Linux boosts the
++ * clock when a client waits for its work; WindowServer no longer waits (E1) and the flip worker only polls, so these
++ * report the clock and let it be pinned up from the minimum.  Thread context.
++ */
++int
++xg_i915_gt_text(char *out, int max)
++{
++	struct pci_dev *pdev = NULL;
++	struct drm_i915_private *i915 = xg_i915_find(&pdev);
++	struct intel_rps *rps;
++
++	if (!i915)
++		return (-ENODEV);
++	rps = &to_gt(i915)->rps;
++	/* no throttle reasons: intel_rps_read_throttle_reason is one of this port's panicking stubs (xg_stubs.c) */
++	return (snprintf(out, max, "slpc %d act %u req %u min %u max %u rp0 %u rp1 %u rpn %u boost %u MHz",
++	    intel_uc_uses_guc_slpc(&to_gt(i915)->uc) ? 1 : 0, intel_rps_read_actual_frequency(rps),
++	    intel_rps_get_requested_frequency(rps), intel_rps_get_min_frequency(rps), intel_rps_get_max_frequency(rps),
++	    intel_rps_get_rp0_frequency(rps), intel_rps_get_rp1_frequency(rps), intel_rps_get_rpn_frequency(rps),
++	    intel_rps_get_boost_frequency(rps)));
++}
++
++/* actual GPU clock in MHz (0 while the GT sleeps: nothing is woken to read it) */
++int
++xg_i915_gt_act_mhz(void)
++{
++	struct pci_dev *pdev = NULL;
++	struct drm_i915_private *i915 = xg_i915_find(&pdev);
++
++	return (i915 ? (int)intel_rps_read_actual_frequency(&to_gt(i915)->rps) : -ENODEV);
++}
++
++int
++xg_i915_gt_min_mhz(int set_mhz)
++{
++	struct pci_dev *pdev = NULL;
++	struct drm_i915_private *i915 = xg_i915_find(&pdev);
++	struct intel_rps *rps;
++	int err;
++
++	if (!i915)
++		return (-ENODEV);
++	rps = &to_gt(i915)->rps;
++	if (set_mhz > 0) {
++		err = intel_rps_set_min_frequency(rps, (u32)set_mhz);
++		pr_info("XEGFX: GT min frequency -> %d MHz: %d (now min %u max %u)\n", set_mhz, err,
++		    intel_rps_get_min_frequency(rps), intel_rps_get_max_frequency(rps));
++		if (err)
++			return (err);
++	}
++	return ((int)intel_rps_get_min_frequency(rps));
++}
++
++/*
++ * Per-frame flip ordering (native-display docs/32-FRAME-RATE.md §32.14).  "Every engine idle" (xg_i915_idle) waits for
++ * everybody's work, including work queued after the frame, and a GPU that never goes idle (a video, a game) only ends at
++ * the accelerator's timeout, which then shows the frame unfinished.  Instead the accelerator takes a snapshot when the
++ * compositor's transaction arrives -- the last request of every active timeline, i.e. everything submitted so far, the
++ * composite included (the XeMTL plugin reports "scheduled" only after its execbuffer) -- and the flip worker waits for
++ * exactly those fences.  Waiting through dma_fence_wait_timeout also gives the GPU i915's waitboost.
++ */
++#define XG_FLIP_SNAP_MAX 64
++struct xg_flip_snap {
++	unsigned int		 n;
++	int			 overflow;
++	struct dma_fence	*f[XG_FLIP_SNAP_MAX];
++};
++
++/* thread context, does not sleep: a spinlock and RCU fence references.  NULL with no i915 or no memory */
++void *
++xg_i915_flip_snapshot(void)
++{
++	struct pci_dev *pdev = NULL;
++	struct drm_i915_private *i915 = xg_i915_find(&pdev);
++	struct intel_gt_timelines *timelines;
++	struct intel_timeline *tl;
++	struct xg_flip_snap *snap;
++	struct dma_fence *extra = NULL;
++
++	if (!i915)
++		return (NULL);
++	snap = kzalloc(sizeof(*snap), GFP_NOWAIT);
++	if (snap == NULL)
++		return (NULL);
++	timelines = &to_gt(i915)->timelines;
++	spin_lock(&timelines->lock);
++	list_for_each_entry(tl, &timelines->active_list, link) {
++		struct dma_fence *f = i915_active_fence_get(&tl->last_request);
++
++		if (f == NULL)
++			continue;
++		if (snap->n == XG_FLIP_SNAP_MAX) {
++			snap->overflow = 1;
++			extra = f;	/* a put can free the request: not under the timelines lock */
++			break;
++		}
++		snap->f[snap->n++] = f;
++	}
++	spin_unlock(&timelines->lock);
++	if (extra != NULL)
++		dma_fence_put(extra);
++	return (snap);
+ }
++
++/* 1 every fence of the snapshot signalled, 0 timeout, -1 the snapshot overflowed (wait for idle instead).  Sleeps */
++int
++xg_i915_flip_snap_wait(void *s, unsigned int timeout_ms, unsigned int *fences)
++{
++	struct xg_flip_snap *snap = s;
++	long left = msecs_to_jiffies(timeout_ms ? timeout_ms : 1);
++	unsigned int i;
++
++	if (snap == NULL)
++		return (-1);
++	if (fences != NULL)
++		*fences = snap->n;
++	for (i = 0; i < snap->n; i++) {
++		long r;
++
++		if (dma_fence_is_signaled(snap->f[i]))
++			continue;
++		r = dma_fence_wait_timeout(snap->f[i], false, left);
++		if (r <= 0)
++			return (0);
++		left = r;
++	}
++	return (snap->overflow ? -1 : 1);
++}
++
++void
++xg_i915_flip_snap_free(void *s)
++{
++	struct xg_flip_snap *snap = s;
++	unsigned int i;
++
++	if (snap == NULL)
++		return;
++	for (i = 0; i < snap->n; i++)
++		dma_fence_put(snap->f[i]);
++	kfree(snap);
++}
+--- a/gpu/xkpi/exclude.txt
++++ b/gpu/xkpi/exclude.txt
+@@ -17,3 +17,4 @@
+ intel_engine_heartbeat.c      # MIT; replaced by src/i915/ with Linux 4c71fd099513 (heartbeat park double put, I-109)
+ intel_gsc.c                   # MIT; replaced by src/i915/ with Linux 8cadce97bf26 (GSC top half with IRQs off)
+ intel_modeset_setup.c         # MIT; replaced by src/i915/intel_modeset_setup.c (K1: read out the firmware pipe, skip every sanitize)
++i915_gem_execbuffer.c         # MIT; replaced by src/i915/i915_gem_execbuffer.c (per-stage timing, debug.xegfx_eb, native-display §32.10)
+--- /dev/null
++++ b/gpu/xkpi/src/i915/i915_gem_execbuffer.c
+@@ -0,0 +1,3916 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Copyright © 2008,2010 Intel Corporation
++ */
++/* XeGfx overlay: drm-kmod gem/i915_gem_execbuffer.c with per-stage timing (debug.xegfx_eb); otherwise unchanged. */
++
++#include <linux/dma-resv.h>
++#include <linux/highmem.h>
++#include <linux/sync_file.h>
++#include <linux/uaccess.h>
++
++#include <drm/drm_auth.h>
++#include <drm/drm_syncobj.h>
++
++#include "gem/i915_gem_ioctls.h"
++#include "gt/intel_context.h"
++#include "gt/intel_gpu_commands.h"
++#include "gt/intel_gt.h"
++#include "gt/intel_gt_buffer_pool.h"
++#include "gt/intel_gt_pm.h"
++#include "gt/intel_ring.h"
++
++#include "pxp/intel_pxp.h"
++
++#include "i915_cmd_parser.h"
++#include "i915_drv.h"
++#include "i915_file_private.h"
++#include "gem/i915_gem_clflush.h"
++#include "gem/i915_gem_context.h"
++#include "i915_gem_evict.h"
++#include "gem/i915_gem_ioctls.h"
++#include "i915_reg.h"
++#include "i915_trace.h"
++#include "i915_user_extensions.h"
++
++/*
++ * XeGfx (native-display docs/32-FRAME-RATE.md §32.10): per-stage execbuffer timing.  WindowServer's composites spend
++ * ~7 ms a frame in this ioctl (Linux: ~0.1 ms).  Each stage adds its time to a sum and a max; debug.xegfx_eb prints them
++ * (the maxes restart at every read).  xg_eb_outer is the whole remote ioctl as the shim sees it, drm dispatch included.
++ */
++enum { XG_EB_IOCTL, XG_EB_DO, XG_EB_EXT, XG_EB_SETUP, XG_EB_LOOKUP, XG_EB_PIN_ENGINE, XG_EB_VALIDATE, XG_EB_RELOC,
++	XG_EB_REQ_CREATE, XG_EB_SUBMIT, XG_EB_MOVE, XG_EB_CLFLUSH, XG_EB_REQ_ADD, XG_EB_RELEASE, XG_EB_OUTER,
++	XG_EB_LUT, XG_EB_LUT_MISS, XG_EB_UPTR, XG_EB_UPTR_SLOW, XG_EB_LOCK, XG_EB_PIN, XG_EB_RESERVE, XG_EB_N };
++static const char *const xg_eb_names[XG_EB_N] = { "ioctl", "do", "ext+fences", "setup", "lookup", "pin_engine",
++	"validate", "reloc+parse", "req_create", "submit", "move_to_gpu", "clflush", "req_add", "release", "outer",
++	"lut_lookup", "lut_miss", "userptr", "userptr>20us", "v:lock", "v:pin", "v:reserve" };
++static atomic64_t xg_eb_sum[XG_EB_N], xg_eb_cnt[XG_EB_N], xg_eb_max[XG_EB_N];
++static atomic64_t xg_eb_bufs, xg_eb_clflush_objs, xg_eb_clflush_bytes;
++static unsigned int xg_eb_bufs_max;
++
++static inline u64 xg_eb_t(void) { return ktime_get_ns(); }
++static void xg_eb_add(int s, u64 d)
++{
++	atomic64_add(d, &xg_eb_sum[s]);
++	atomic64_inc(&xg_eb_cnt[s]);
++	if ((s64)d > atomic64_read(&xg_eb_max[s]))
++		atomic64_set(&xg_eb_max[s], d);	/* racy by one sample at worst */
++}
++static void xg_eb_note(int s, u64 t0)
++{
++	xg_eb_add(s, ktime_get_ns() - t0);
++}
++void xg_eb_outer(unsigned long long ns);
++void
++xg_eb_outer(unsigned long long ns)
++{
++	xg_eb_add(XG_EB_OUTER, ns);
++}
++int xg_eb_stats_text(char *out, int max);
++int
++xg_eb_stats_text(char *out, int max)
++{
++	int n = 0, i;
++
++	n += snprintf(out + n, max - n, "calls %lld bufs %lld (max %u) clflush objs %lld bytes %lld\n",
++	    (long long)atomic64_read(&xg_eb_cnt[XG_EB_IOCTL]), (long long)atomic64_read(&xg_eb_bufs), xg_eb_bufs_max,
++	    (long long)atomic64_read(&xg_eb_clflush_objs), (long long)atomic64_read(&xg_eb_clflush_bytes));
++	for (i = 0; i < XG_EB_N && n < max - 80; i++) {
++		n += snprintf(out + n, max - n, "%-12s n %10lld sum_us %12lld max_us %8lld\n", xg_eb_names[i],
++		    (long long)atomic64_read(&xg_eb_cnt[i]), (long long)(atomic64_read(&xg_eb_sum[i]) / 1000),
++		    (long long)(atomic64_read(&xg_eb_max[i]) / 1000));
++		atomic64_set(&xg_eb_max[i], 0);
++	}
++	return (n);
++}
++
++/*
++ * <wtl> §32.16: where a request's time goes after the execbuffer, per caller class (WindowServer vs everyone else):
++ *   dep  queued (eb_request_add) -> ready: its awaits resolved and i915 handed it to the backend (submit_request)
++ *   run  ready -> done (its fence signaled): GuC queueing plus execution, including this context's earlier requests
++ * For each WindowServer request the completions of OTHER callers' requests while it was running are counted: many
++ * means the GPU ran other contexts ahead of it (priority not honoured), none means the time was WindowServer's own.
++ * Fixed pool, no allocation: the record of request rq is slot hash(rq); a busy slot leaves that request untracked.
++ * debug.xegfx_rq prints it (maxes and the slow list restart at every read).
++ */
++extern int xg_fd_xnu_is_compositor(void);
++#define XG_RQ_SLOTS 1024
++struct xg_rq_rec {
++	struct dma_fence_cb cb;
++	struct i915_request *volatile owner;
++	u64 t_add, t_ready;
++	s64 others_at_ready, ws_at_ready;
++	int ws, prio;
++};
++static struct xg_rq_rec xg_rq_pool[XG_RQ_SLOTS];
++enum { XG_RQ_DEP, XG_RQ_RUN, XG_RQ_TOTAL, XG_RQ_STAGES };
++static atomic64_t xg_rq_n[2], xg_rq_sum[2][XG_RQ_STAGES], xg_rq_max[2][XG_RQ_STAGES], xg_rq_over50[2], xg_rq_over100[2];
++static atomic64_t xg_rq_done[2], xg_rq_untracked, xg_rq_noready;
++struct xg_rq_slow { u64 t_ms, dep_us, run_us; s64 others, own; int prio; };
++#define XG_RQ_SLOW 16
++static struct xg_rq_slow xg_rq_slow[XG_RQ_SLOW];
++static atomic_t xg_rq_slow_n;
++static void (*volatile xg_rq_saved_submit)(struct i915_request *rq);
++static DEFINE_SPINLOCK(xg_rq_hook_lock);
++
++static inline unsigned int xg_rq_slot(const struct i915_request *rq)
++{
++	return ((unsigned int)((uintptr_t)rq >> 6) ^ (unsigned int)((uintptr_t)rq >> 16)) & (XG_RQ_SLOTS - 1);
++}
++
++static void xg_rq_max_note(atomic64_t *m, u64 v)
++{
++	if ((s64)v > atomic64_read(m))
++		atomic64_set(m, v);	/* racy by one sample at worst */
++}
++
++/* the render engine's submit_request, wrapped: records when the request became ready */
++static void xg_rq_submit(struct i915_request *rq)
++{
++	struct xg_rq_rec *r = &xg_rq_pool[xg_rq_slot(rq)];
++
++	if (r->owner == rq && !r->t_ready) {
++		r->others_at_ready = atomic64_read(&xg_rq_done[0]);
++		r->ws_at_ready = atomic64_read(&xg_rq_done[1]);
++		r->t_ready = ktime_get_ns();
++	}
++	xg_rq_saved_submit(rq);
++}
++
++static void xg_rq_signaled(struct dma_fence *f, struct dma_fence_cb *cb)
++{
++	struct xg_rq_rec *r = container_of(cb, struct xg_rq_rec, cb);
++	const u64 now = ktime_get_ns();
++	const int c = r->ws ? 1 : 0;
++
++	(void)f;
++	atomic64_inc(&xg_rq_done[c]);
++	if (!r->t_ready) {
++		atomic64_inc(&xg_rq_noready);
++		r->t_ready = r->t_add;
++	}
++	{
++		const u64 dep = r->t_ready - r->t_add, run = now - r->t_ready, tot = now - r->t_add;
++
++		atomic64_inc(&xg_rq_n[c]);
++		atomic64_add(dep, &xg_rq_sum[c][XG_RQ_DEP]); xg_rq_max_note(&xg_rq_max[c][XG_RQ_DEP], dep);
++		atomic64_add(run, &xg_rq_sum[c][XG_RQ_RUN]); xg_rq_max_note(&xg_rq_max[c][XG_RQ_RUN], run);
++		atomic64_add(tot, &xg_rq_sum[c][XG_RQ_TOTAL]); xg_rq_max_note(&xg_rq_max[c][XG_RQ_TOTAL], tot);
++		if (tot > 50 * NSEC_PER_MSEC)
++			atomic64_inc(&xg_rq_over50[c]);
++		if (tot > 100 * NSEC_PER_MSEC)
++			atomic64_inc(&xg_rq_over100[c]);
++		if (c && tot > 50 * NSEC_PER_MSEC) {
++			struct xg_rq_slow *e = &xg_rq_slow[(unsigned int)atomic_inc_return(&xg_rq_slow_n) % XG_RQ_SLOW];
++
++			e->t_ms = now / NSEC_PER_MSEC; e->dep_us = dep / 1000; e->run_us = run / 1000;
++			e->others = atomic64_read(&xg_rq_done[0]) - r->others_at_ready;
++			e->own = atomic64_read(&xg_rq_done[1]) - r->ws_at_ready - 1;
++			e->prio = r->prio;
++		}
++	}
++	WRITE_ONCE(r->owner, NULL);
++}
++
++/* called before __i915_request_commit: starts the record and wraps the render engine's submit_request once */
++static void xg_rq_track(struct i915_request *rq, int prio)
++{
++	struct intel_engine_cs *e = rq->engine;
++	struct xg_rq_rec *r = &xg_rq_pool[xg_rq_slot(rq)];
++	unsigned long fl;
++
++	if (e->class == RENDER_CLASS && !intel_engine_is_virtual(e) && e->submit_request != xg_rq_submit) {
++		spin_lock_irqsave(&xg_rq_hook_lock, fl);
++		if (e->submit_request != xg_rq_submit) {
++			xg_rq_saved_submit = e->submit_request;
++			wmb();
++			WRITE_ONCE(e->submit_request, xg_rq_submit);
++		}
++		spin_unlock_irqrestore(&xg_rq_hook_lock, fl);
++	}
++	if (cmpxchg(&r->owner, NULL, rq) != NULL) {
++		atomic64_inc(&xg_rq_untracked);
++		return;
++	}
++	r->t_ready = 0;
++	r->ws = xg_fd_xnu_is_compositor();
++	r->prio = prio;
++	r->t_add = ktime_get_ns();
++	if (dma_fence_add_callback(&rq->fence, &r->cb, xg_rq_signaled))
++		WRITE_ONCE(r->owner, NULL);	/* already signaled */
++}
++
++int xg_rq_stats_text(char *out, int max);
++int
++xg_rq_stats_text(char *out, int max)
++{
++	static const char *const cls[2] = { "other", "WindowServer" };
++	int n = 0;
++
++	n += snprintf(out + n, max - n, "untracked %lld no-ready %lld (dep = queued->ready, run = ready->done, us)\n",
++	    (long long)atomic64_read(&xg_rq_untracked), (long long)atomic64_read(&xg_rq_noready));
++	for (int c = 1; c >= 0 && n < max; c--) {
++		const s64 k = atomic64_read(&xg_rq_n[c]) ? atomic64_read(&xg_rq_n[c]) : 1;
++
++		n += snprintf(out + n, max - n, "%-12s n %lld dep avg %lld max %lld | run avg %lld max %lld | total avg %lld max %lld | >50ms %lld >100ms %lld\n",
++		    cls[c], (long long)atomic64_read(&xg_rq_n[c]),
++		    (long long)(atomic64_read(&xg_rq_sum[c][XG_RQ_DEP]) / k / 1000), (long long)(atomic64_read(&xg_rq_max[c][XG_RQ_DEP]) / 1000),
++		    (long long)(atomic64_read(&xg_rq_sum[c][XG_RQ_RUN]) / k / 1000), (long long)(atomic64_read(&xg_rq_max[c][XG_RQ_RUN]) / 1000),
++		    (long long)(atomic64_read(&xg_rq_sum[c][XG_RQ_TOTAL]) / k / 1000), (long long)(atomic64_read(&xg_rq_max[c][XG_RQ_TOTAL]) / 1000),
++		    (long long)atomic64_read(&xg_rq_over50[c]), (long long)atomic64_read(&xg_rq_over100[c]));
++		for (int s = 0; s < XG_RQ_STAGES; s++)
++			atomic64_set(&xg_rq_max[c][s], 0);
++	}
++	n += snprintf(out + n, max - n, "WindowServer requests over 50 ms since the last read (t_ms dep_us run_us others_done own_done prio):\n");
++	{
++		const unsigned int last = (unsigned int)atomic_xchg(&xg_rq_slow_n, 0);
++
++		for (unsigned int i = 0; i < last && i < XG_RQ_SLOW && n < max; i++) {
++			const struct xg_rq_slow *e = &xg_rq_slow[(last - i) % XG_RQ_SLOW];
++
++			n += snprintf(out + n, max - n, "  %llu %llu %llu %lld %lld %d\n", (unsigned long long)e->t_ms,
++			    (unsigned long long)e->dep_us, (unsigned long long)e->run_us, (long long)e->others, (long long)e->own, e->prio);
++		}
++	}
++	return (n < max ? n : max - 1);
++}
++
++#ifdef __FreeBSD__
++/* CEM: Make sure we got the Linux version */
++CTASSERT(PAGE_MASK != (PAGE_SIZE - 1));
++#endif
++
++struct eb_vma {
++	struct i915_vma *vma;
++	unsigned int flags;
++
++	/** This vma's place in the execbuf reservation list */
++	struct drm_i915_gem_exec_object2 *exec;
++	struct list_head bind_link;
++	struct list_head reloc_link;
++
++	struct hlist_node node;
++	u32 handle;
++};
++
++enum {
++	FORCE_CPU_RELOC = 1,
++	FORCE_GTT_RELOC,
++	FORCE_GPU_RELOC,
++#define DBG_FORCE_RELOC 0 /* choose one of the above! */
++};
++
++/* __EXEC_OBJECT_ flags > BIT(29) defined in i915_vma.h */
++#define __EXEC_OBJECT_HAS_PIN		BIT(29)
++#define __EXEC_OBJECT_HAS_FENCE		BIT(28)
++#define __EXEC_OBJECT_USERPTR_INIT	BIT(27)
++#define __EXEC_OBJECT_NEEDS_MAP		BIT(26)
++#define __EXEC_OBJECT_NEEDS_BIAS	BIT(25)
++#define __EXEC_OBJECT_INTERNAL_FLAGS	(~0u << 25) /* all of the above + */
++#define __EXEC_OBJECT_RESERVED (__EXEC_OBJECT_HAS_PIN | __EXEC_OBJECT_HAS_FENCE)
++
++#define __EXEC_HAS_RELOC	BIT(31)
++#define __EXEC_ENGINE_PINNED	BIT(30)
++#define __EXEC_USERPTR_USED	BIT(29)
++#define __EXEC_INTERNAL_FLAGS	(~0u << 29)
++#define UPDATE			PIN_OFFSET_FIXED
++
++#define BATCH_OFFSET_BIAS (256*1024)
++
++#define __I915_EXEC_ILLEGAL_FLAGS \
++	(__I915_EXEC_UNKNOWN_FLAGS | \
++	 I915_EXEC_CONSTANTS_MASK  | \
++	 I915_EXEC_RESOURCE_STREAMER)
++
++/* Catch emission of unexpected errors for CI! */
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
++#undef EINVAL
++#define EINVAL ({ \
++	DRM_DEBUG_DRIVER("EINVAL at %s:%d\n", __func__, __LINE__); \
++	22; \
++})
++#endif
++
++/**
++ * DOC: User command execution
++ *
++ * Userspace submits commands to be executed on the GPU as an instruction
++ * stream within a GEM object we call a batchbuffer. This instructions may
++ * refer to other GEM objects containing auxiliary state such as kernels,
++ * samplers, render targets and even secondary batchbuffers. Userspace does
++ * not know where in the GPU memory these objects reside and so before the
++ * batchbuffer is passed to the GPU for execution, those addresses in the
++ * batchbuffer and auxiliary objects are updated. This is known as relocation,
++ * or patching. To try and avoid having to relocate each object on the next
++ * execution, userspace is told the location of those objects in this pass,
++ * but this remains just a hint as the kernel may choose a new location for
++ * any object in the future.
++ *
++ * At the level of talking to the hardware, submitting a batchbuffer for the
++ * GPU to execute is to add content to a buffer from which the HW
++ * command streamer is reading.
++ *
++ * 1. Add a command to load the HW context. For Logical Ring Contexts, i.e.
++ *    Execlists, this command is not placed on the same buffer as the
++ *    remaining items.
++ *
++ * 2. Add a command to invalidate caches to the buffer.
++ *
++ * 3. Add a batchbuffer start command to the buffer; the start command is
++ *    essentially a token together with the GPU address of the batchbuffer
++ *    to be executed.
++ *
++ * 4. Add a pipeline flush to the buffer.
++ *
++ * 5. Add a memory write command to the buffer to record when the GPU
++ *    is done executing the batchbuffer. The memory write writes the
++ *    global sequence number of the request, ``i915_request::global_seqno``;
++ *    the i915 driver uses the current value in the register to determine
++ *    if the GPU has completed the batchbuffer.
++ *
++ * 6. Add a user interrupt command to the buffer. This command instructs
++ *    the GPU to issue an interrupt when the command, pipeline flush and
++ *    memory write are completed.
++ *
++ * 7. Inform the hardware of the additional commands added to the buffer
++ *    (by updating the tail pointer).
++ *
++ * Processing an execbuf ioctl is conceptually split up into a few phases.
++ *
++ * 1. Validation - Ensure all the pointers, handles and flags are valid.
++ * 2. Reservation - Assign GPU address space for every object
++ * 3. Relocation - Update any addresses to point to the final locations
++ * 4. Serialisation - Order the request with respect to its dependencies
++ * 5. Construction - Construct a request to execute the batchbuffer
++ * 6. Submission (at some point in the future execution)
++ *
++ * Reserving resources for the execbuf is the most complicated phase. We
++ * neither want to have to migrate the object in the address space, nor do
++ * we want to have to update any relocations pointing to this object. Ideally,
++ * we want to leave the object where it is and for all the existing relocations
++ * to match. If the object is given a new address, or if userspace thinks the
++ * object is elsewhere, we have to parse all the relocation entries and update
++ * the addresses. Userspace can set the I915_EXEC_NORELOC flag to hint that
++ * all the target addresses in all of its objects match the value in the
++ * relocation entries and that they all match the presumed offsets given by the
++ * list of execbuffer objects. Using this knowledge, we know that if we haven't
++ * moved any buffers, all the relocation entries are valid and we can skip
++ * the update. (If userspace is wrong, the likely outcome is an impromptu GPU
++ * hang.) The requirement for using I915_EXEC_NO_RELOC are:
++ *
++ *      The addresses written in the objects must match the corresponding
++ *      reloc.presumed_offset which in turn must match the corresponding
++ *      execobject.offset.
++ *
++ *      Any render targets written to in the batch must be flagged with
++ *      EXEC_OBJECT_WRITE.
++ *
++ *      To avoid stalling, execobject.offset should match the current
++ *      address of that object within the active context.
++ *
++ * The reservation is done is multiple phases. First we try and keep any
++ * object already bound in its current location - so as long as meets the
++ * constraints imposed by the new execbuffer. Any object left unbound after the
++ * first pass is then fitted into any available idle space. If an object does
++ * not fit, all objects are removed from the reservation and the process rerun
++ * after sorting the objects into a priority order (more difficult to fit
++ * objects are tried first). Failing that, the entire VM is cleared and we try
++ * to fit the execbuf once last time before concluding that it simply will not
++ * fit.
++ *
++ * A small complication to all of this is that we allow userspace not only to
++ * specify an alignment and a size for the object in the address space, but
++ * we also allow userspace to specify the exact offset. This objects are
++ * simpler to place (the location is known a priori) all we have to do is make
++ * sure the space is available.
++ *
++ * Once all the objects are in place, patching up the buried pointers to point
++ * to the final locations is a fairly simple job of walking over the relocation
++ * entry arrays, looking up the right address and rewriting the value into
++ * the object. Simple! ... The relocation entries are stored in user memory
++ * and so to access them we have to copy them into a local buffer. That copy
++ * has to avoid taking any pagefaults as they may lead back to a GEM object
++ * requiring the struct_mutex (i.e. recursive deadlock). So once again we split
++ * the relocation into multiple passes. First we try to do everything within an
++ * atomic context (avoid the pagefaults) which requires that we never wait. If
++ * we detect that we may wait, or if we need to fault, then we have to fallback
++ * to a slower path. The slowpath has to drop the mutex. (Can you hear alarm
++ * bells yet?) Dropping the mutex means that we lose all the state we have
++ * built up so far for the execbuf and we must reset any global data. However,
++ * we do leave the objects pinned in their final locations - which is a
++ * potential issue for concurrent execbufs. Once we have left the mutex, we can
++ * allocate and copy all the relocation entries into a large array at our
++ * leisure, reacquire the mutex, reclaim all the objects and other state and
++ * then proceed to update any incorrect addresses with the objects.
++ *
++ * As we process the relocation entries, we maintain a record of whether the
++ * object is being written to. Using NORELOC, we expect userspace to provide
++ * this information instead. We also check whether we can skip the relocation
++ * by comparing the expected value inside the relocation entry with the target's
++ * final address. If they differ, we have to map the current object and rewrite
++ * the 4 or 8 byte pointer within.
++ *
++ * Serialising an execbuf is quite simple according to the rules of the GEM
++ * ABI. Execution within each context is ordered by the order of submission.
++ * Writes to any GEM object are in order of submission and are exclusive. Reads
++ * from a GEM object are unordered with respect to other reads, but ordered by
++ * writes. A write submitted after a read cannot occur before the read, and
++ * similarly any read submitted after a write cannot occur before the write.
++ * Writes are ordered between engines such that only one write occurs at any
++ * time (completing any reads beforehand) - using semaphores where available
++ * and CPU serialisation otherwise. Other GEM access obey the same rules, any
++ * write (either via mmaps using set-domain, or via pwrite) must flush all GPU
++ * reads before starting, and any read (either using set-domain or pread) must
++ * flush all GPU writes before starting. (Note we only employ a barrier before,
++ * we currently rely on userspace not concurrently starting a new execution
++ * whilst reading or writing to an object. This may be an advantage or not
++ * depending on how much you trust userspace not to shoot themselves in the
++ * foot.) Serialisation may just result in the request being inserted into
++ * a DAG awaiting its turn, but most simple is to wait on the CPU until
++ * all dependencies are resolved.
++ *
++ * After all of that, is just a matter of closing the request and handing it to
++ * the hardware (well, leaving it in a queue to be executed). However, we also
++ * offer the ability for batchbuffers to be run with elevated privileges so
++ * that they access otherwise hidden registers. (Used to adjust L3 cache etc.)
++ * Before any batch is given extra privileges we first must check that it
++ * contains no nefarious instructions, we check that each instruction is from
++ * our whitelist and all registers are also from an allowed list. We first
++ * copy the user's batchbuffer to a shadow (so that the user doesn't have
++ * access to it, either by the CPU or GPU as we scan it) and then parse each
++ * instruction. If everything is ok, we set a flag telling the hardware to run
++ * the batchbuffer in trusted mode, otherwise the ioctl is rejected.
++ */
++
++struct eb_fence {
++	struct drm_syncobj *syncobj; /* Use with ptr_mask_bits() */
++	struct dma_fence *dma_fence;
++	u64 value;
++	struct dma_fence_chain *chain_fence;
++};
++
++struct i915_execbuffer {
++	struct drm_i915_private *i915; /** i915 backpointer */
++	struct drm_file *file; /** per-file lookup tables and limits */
++	struct drm_i915_gem_execbuffer2 *args; /** ioctl parameters */
++	struct drm_i915_gem_exec_object2 *exec; /** ioctl execobj[] */
++	struct eb_vma *vma;
++
++	struct intel_gt *gt; /* gt for the execbuf */
++	struct intel_context *context; /* logical state for the request */
++	struct i915_gem_context *gem_context; /** caller's context */
++	intel_wakeref_t wakeref;
++	intel_wakeref_t wakeref_gt0;
++
++	/** our requests to build */
++	struct i915_request *requests[MAX_ENGINE_INSTANCE + 1];
++	/** identity of the batch obj/vma */
++	struct eb_vma *batches[MAX_ENGINE_INSTANCE + 1];
++	struct i915_vma *trampoline; /** trampoline used for chaining */
++
++	/** used for excl fence in dma_resv objects when > 1 BB submitted */
++	struct dma_fence *composite_fence;
++
++	/** actual size of execobj[] as we may extend it for the cmdparser */
++	unsigned int buffer_count;
++
++	/* number of batches in execbuf IOCTL */
++	unsigned int num_batches;
++
++	/** list of vma not yet bound during reservation phase */
++	struct list_head unbound;
++
++	/** list of vma that have execobj.relocation_count */
++	struct list_head relocs;
++
++	struct i915_gem_ww_ctx ww;
++
++	/**
++	 * Track the most recently used object for relocations, as we
++	 * frequently have to perform multiple relocations within the same
++	 * obj/page
++	 */
++	struct reloc_cache {
++		struct drm_mm_node node; /** temporary GTT binding */
++		unsigned long vaddr; /** Current kmap address */
++		unsigned long page; /** Currently mapped page index */
++		unsigned int graphics_ver; /** Cached value of GRAPHICS_VER */
++		bool use_64bit_reloc : 1;
++		bool has_llc : 1;
++		bool has_fence : 1;
++		bool needs_unfenced : 1;
++	} reloc_cache;
++
++	u64 invalid_flags; /** Set of execobj.flags that are invalid */
++
++	/** Length of batch within object */
++	u64 batch_len[MAX_ENGINE_INSTANCE + 1];
++	u32 batch_start_offset; /** Location within object of batch */
++	u32 batch_flags; /** Flags composed for emit_bb_start() */
++	struct intel_gt_buffer_pool_node *batch_pool; /** pool node for batch buffer */
++
++	/**
++	 * Indicate either the size of the hastable used to resolve
++	 * relocation handles, or if negative that we are using a direct
++	 * index into the execobj[].
++	 */
++	int lut_size;
++	struct hlist_head *buckets; /** ht for relocation handles */
++
++	struct eb_fence *fences;
++	unsigned long num_fences;
++#if IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR)
++	struct i915_capture_list *capture_lists[MAX_ENGINE_INSTANCE + 1];
++#endif
++};
++
++static int eb_parse(struct i915_execbuffer *eb);
++static int eb_pin_engine(struct i915_execbuffer *eb, bool throttle);
++static void eb_unpin_engine(struct i915_execbuffer *eb);
++static void eb_capture_release(struct i915_execbuffer *eb);
++
++static bool eb_use_cmdparser(const struct i915_execbuffer *eb)
++{
++	return intel_engine_requires_cmd_parser(eb->context->engine) ||
++		(intel_engine_using_cmd_parser(eb->context->engine) &&
++		 eb->args->batch_len);
++}
++
++static int eb_create(struct i915_execbuffer *eb)
++{
++	if (!(eb->args->flags & I915_EXEC_HANDLE_LUT)) {
++		unsigned int size = 1 + ilog2(eb->buffer_count);
++
++		/*
++		 * Without a 1:1 association between relocation handles and
++		 * the execobject[] index, we instead create a hashtable.
++		 * We size it dynamically based on available memory, starting
++		 * first with 1:1 associative hash and scaling back until
++		 * the allocation succeeds.
++		 *
++		 * Later on we use a positive lut_size to indicate we are
++		 * using this hashtable, and a negative value to indicate a
++		 * direct lookup.
++		 */
++		do {
++			gfp_t flags;
++
++			/* While we can still reduce the allocation size, don't
++			 * raise a warning and allow the allocation to fail.
++			 * On the last pass though, we want to try as hard
++			 * as possible to perform the allocation and warn
++			 * if it fails.
++			 */
++			flags = GFP_KERNEL;
++			if (size > 1)
++				flags |= __GFP_NORETRY | __GFP_NOWARN;
++
++			eb->buckets = kzalloc(sizeof(struct hlist_head) << size,
++					      flags);
++			if (eb->buckets)
++				break;
++		} while (--size);
++
++		if (unlikely(!size))
++			return -ENOMEM;
++
++		eb->lut_size = size;
++	} else {
++		eb->lut_size = -eb->buffer_count;
++	}
++
++	return 0;
++}
++
++static bool
++eb_vma_misplaced(const struct drm_i915_gem_exec_object2 *entry,
++		 const struct i915_vma *vma,
++		 unsigned int flags)
++{
++	const u64 start = i915_vma_offset(vma);
++	const u64 size = i915_vma_size(vma);
++
++	if (size < entry->pad_to_size)
++		return true;
++
++	if (entry->alignment && !IS_ALIGNED(start, entry->alignment))
++		return true;
++
++	if (flags & EXEC_OBJECT_PINNED &&
++	    start != entry->offset)
++		return true;
++
++	if (flags & __EXEC_OBJECT_NEEDS_BIAS &&
++	    start < BATCH_OFFSET_BIAS)
++		return true;
++
++	if (!(flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS) &&
++	    (start + size + 4095) >> 32)
++		return true;
++
++	if (flags & __EXEC_OBJECT_NEEDS_MAP &&
++	    !i915_vma_is_map_and_fenceable(vma))
++		return true;
++
++	return false;
++}
++
++static u64 eb_pin_flags(const struct drm_i915_gem_exec_object2 *entry,
++			unsigned int exec_flags)
++{
++	u64 pin_flags = 0;
++
++	if (exec_flags & EXEC_OBJECT_NEEDS_GTT)
++		pin_flags |= PIN_GLOBAL;
++
++	/*
++	 * Wa32bitGeneralStateOffset & Wa32bitInstructionBaseOffset,
++	 * limit address to the first 4GBs for unflagged objects.
++	 */
++	if (!(exec_flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS))
++		pin_flags |= PIN_ZONE_4G;
++
++	if (exec_flags & __EXEC_OBJECT_NEEDS_MAP)
++		pin_flags |= PIN_MAPPABLE;
++
++	if (exec_flags & EXEC_OBJECT_PINNED)
++		pin_flags |= entry->offset | PIN_OFFSET_FIXED;
++	else if (exec_flags & __EXEC_OBJECT_NEEDS_BIAS)
++		pin_flags |= BATCH_OFFSET_BIAS | PIN_OFFSET_BIAS;
++
++	return pin_flags;
++}
++
++static int
++eb_pin_vma(struct i915_execbuffer *eb,
++	   const struct drm_i915_gem_exec_object2 *entry,
++	   struct eb_vma *ev)
++{
++	struct i915_vma *vma = ev->vma;
++	u64 pin_flags;
++	int err;
++
++	if (vma->node.size)
++		pin_flags =  __i915_vma_offset(vma);
++	else
++		pin_flags = entry->offset & PIN_OFFSET_MASK;
++
++	pin_flags |= PIN_USER | PIN_NOEVICT | PIN_OFFSET_FIXED | PIN_VALIDATE;
++	if (unlikely(ev->flags & EXEC_OBJECT_NEEDS_GTT))
++		pin_flags |= PIN_GLOBAL;
++
++	/* Attempt to reuse the current location if available */
++	err = i915_vma_pin_ww(vma, &eb->ww, 0, 0, pin_flags);
++	if (err == -EDEADLK)
++		return err;
++
++	if (unlikely(err)) {
++		if (entry->flags & EXEC_OBJECT_PINNED)
++			return err;
++
++		/* Failing that pick any _free_ space if suitable */
++		err = i915_vma_pin_ww(vma, &eb->ww,
++					     entry->pad_to_size,
++					     entry->alignment,
++					     eb_pin_flags(entry, ev->flags) |
++					     PIN_USER | PIN_NOEVICT | PIN_VALIDATE);
++		if (unlikely(err))
++			return err;
++	}
++
++	if (unlikely(ev->flags & EXEC_OBJECT_NEEDS_FENCE)) {
++		err = i915_vma_pin_fence(vma);
++		if (unlikely(err))
++			return err;
++
++		if (vma->fence)
++			ev->flags |= __EXEC_OBJECT_HAS_FENCE;
++	}
++
++	ev->flags |= __EXEC_OBJECT_HAS_PIN;
++	if (eb_vma_misplaced(entry, vma, ev->flags))
++		return -EBADSLT;
++
++	return 0;
++}
++
++static void
++eb_unreserve_vma(struct eb_vma *ev)
++{
++	if (unlikely(ev->flags & __EXEC_OBJECT_HAS_FENCE))
++		__i915_vma_unpin_fence(ev->vma);
++
++	ev->flags &= ~__EXEC_OBJECT_RESERVED;
++}
++
++static int
++eb_validate_vma(struct i915_execbuffer *eb,
++		struct drm_i915_gem_exec_object2 *entry,
++		struct i915_vma *vma)
++{
++	/* Relocations are disallowed for all platforms after TGL-LP.  This
++	 * also covers all platforms with local memory.
++	 */
++	if (entry->relocation_count &&
++	    GRAPHICS_VER(eb->i915) >= 12 && !IS_TIGERLAKE(eb->i915))
++		return -EINVAL;
++
++	if (unlikely(entry->flags & eb->invalid_flags))
++		return -EINVAL;
++
++	if (unlikely(entry->alignment &&
++		     !is_power_of_2_u64(entry->alignment)))
++		return -EINVAL;
++
++	/*
++	 * Offset can be used as input (EXEC_OBJECT_PINNED), reject
++	 * any non-page-aligned or non-canonical addresses.
++	 */
++	if (unlikely(entry->flags & EXEC_OBJECT_PINNED &&
++		     entry->offset != gen8_canonical_addr(entry->offset & I915_GTT_PAGE_MASK)))
++		return -EINVAL;
++
++	/* pad_to_size was once a reserved field, so sanitize it */
++	if (entry->flags & EXEC_OBJECT_PAD_TO_SIZE) {
++		if (unlikely(offset_in_page(entry->pad_to_size)))
++			return -EINVAL;
++	} else {
++		entry->pad_to_size = 0;
++	}
++	/*
++	 * From drm_mm perspective address space is continuous,
++	 * so from this point we're always using non-canonical
++	 * form internally.
++	 */
++	entry->offset = gen8_noncanonical_addr(entry->offset);
++
++	if (!eb->reloc_cache.has_fence) {
++		entry->flags &= ~EXEC_OBJECT_NEEDS_FENCE;
++	} else {
++		if ((entry->flags & EXEC_OBJECT_NEEDS_FENCE ||
++		     eb->reloc_cache.needs_unfenced) &&
++		    i915_gem_object_is_tiled(vma->obj))
++			entry->flags |= EXEC_OBJECT_NEEDS_GTT | __EXEC_OBJECT_NEEDS_MAP;
++	}
++
++	return 0;
++}
++
++static bool
++is_batch_buffer(struct i915_execbuffer *eb, unsigned int buffer_idx)
++{
++	return eb->args->flags & I915_EXEC_BATCH_FIRST ?
++		buffer_idx < eb->num_batches :
++		buffer_idx >= eb->args->buffer_count - eb->num_batches;
++}
++
++static int
++eb_add_vma(struct i915_execbuffer *eb,
++	   unsigned int *current_batch,
++	   unsigned int i,
++	   struct i915_vma *vma)
++{
++	struct drm_i915_private *i915 = eb->i915;
++	struct drm_i915_gem_exec_object2 *entry = &eb->exec[i];
++	struct eb_vma *ev = &eb->vma[i];
++
++	ev->vma = vma;
++	ev->exec = entry;
++	ev->flags = entry->flags;
++
++	if (eb->lut_size > 0) {
++		ev->handle = entry->handle;
++		hlist_add_head(&ev->node,
++			       &eb->buckets[hash_32(entry->handle,
++						    eb->lut_size)]);
++	}
++
++	if (entry->relocation_count)
++		list_add_tail(&ev->reloc_link, &eb->relocs);
++
++	/*
++	 * SNA is doing fancy tricks with compressing batch buffers, which leads
++	 * to negative relocation deltas. Usually that works out ok since the
++	 * relocate address is still positive, except when the batch is placed
++	 * very low in the GTT. Ensure this doesn't happen.
++	 *
++	 * Note that actual hangs have only been observed on gen7, but for
++	 * paranoia do it everywhere.
++	 */
++	if (is_batch_buffer(eb, i)) {
++		if (entry->relocation_count &&
++		    !(ev->flags & EXEC_OBJECT_PINNED))
++			ev->flags |= __EXEC_OBJECT_NEEDS_BIAS;
++		if (eb->reloc_cache.has_fence)
++			ev->flags |= EXEC_OBJECT_NEEDS_FENCE;
++
++		eb->batches[*current_batch] = ev;
++
++		if (unlikely(ev->flags & EXEC_OBJECT_WRITE)) {
++			drm_dbg(&i915->drm,
++				"Attempting to use self-modifying batch buffer\n");
++			return -EINVAL;
++		}
++
++		if (range_overflows_t(u64,
++				      eb->batch_start_offset,
++				      eb->args->batch_len,
++				      ev->vma->size)) {
++			drm_dbg(&i915->drm, "Attempting to use out-of-bounds batch\n");
++			return -EINVAL;
++		}
++
++		if (eb->args->batch_len == 0)
++			eb->batch_len[*current_batch] = ev->vma->size -
++				eb->batch_start_offset;
++		else
++			eb->batch_len[*current_batch] = eb->args->batch_len;
++		if (unlikely(eb->batch_len[*current_batch] == 0)) { /* impossible! */
++			drm_dbg(&i915->drm, "Invalid batch length\n");
++			return -EINVAL;
++		}
++
++		++*current_batch;
++	}
++
++	return 0;
++}
++
++static int use_cpu_reloc(const struct reloc_cache *cache,
++			 const struct drm_i915_gem_object *obj)
++{
++	if (!i915_gem_object_has_struct_page(obj))
++		return false;
++
++	if (DBG_FORCE_RELOC == FORCE_CPU_RELOC)
++		return true;
++
++	if (DBG_FORCE_RELOC == FORCE_GTT_RELOC)
++		return false;
++
++	/*
++	 * For objects created by userspace through GEM_CREATE with pat_index
++	 * set by set_pat extension, i915_gem_object_has_cache_level() always
++	 * return true, otherwise the call would fall back to checking whether
++	 * the object is un-cached.
++	 */
++	return (cache->has_llc ||
++		obj->cache_dirty ||
++		!i915_gem_object_has_cache_level(obj, I915_CACHE_NONE));
++}
++
++static int eb_reserve_vma(struct i915_execbuffer *eb,
++			  struct eb_vma *ev,
++			  u64 pin_flags)
++{
++	struct drm_i915_gem_exec_object2 *entry = ev->exec;
++	struct i915_vma *vma = ev->vma;
++	int err;
++
++	if (drm_mm_node_allocated(&vma->node) &&
++	    eb_vma_misplaced(entry, vma, ev->flags)) {
++		err = i915_vma_unbind(vma);
++		if (err)
++			return err;
++	}
++
++	err = i915_vma_pin_ww(vma, &eb->ww,
++			   entry->pad_to_size, entry->alignment,
++			   eb_pin_flags(entry, ev->flags) | pin_flags);
++	if (err)
++		return err;
++
++	if (entry->offset != i915_vma_offset(vma)) {
++		entry->offset = i915_vma_offset(vma) | UPDATE;
++		eb->args->flags |= __EXEC_HAS_RELOC;
++	}
++
++	if (unlikely(ev->flags & EXEC_OBJECT_NEEDS_FENCE)) {
++		err = i915_vma_pin_fence(vma);
++		if (unlikely(err))
++			return err;
++
++		if (vma->fence)
++			ev->flags |= __EXEC_OBJECT_HAS_FENCE;
++	}
++
++	ev->flags |= __EXEC_OBJECT_HAS_PIN;
++	GEM_BUG_ON(eb_vma_misplaced(entry, vma, ev->flags));
++
++	return 0;
++}
++
++static bool eb_unbind(struct i915_execbuffer *eb, bool force)
++{
++	const unsigned int count = eb->buffer_count;
++	unsigned int i;
++	struct list_head last;
++	bool unpinned = false;
++
++	/* Resort *all* the objects into priority order */
++	INIT_LIST_HEAD(&eb->unbound);
++	INIT_LIST_HEAD(&last);
++
++	for (i = 0; i < count; i++) {
++		struct eb_vma *ev = &eb->vma[i];
++		unsigned int flags = ev->flags;
++
++		if (!force && flags & EXEC_OBJECT_PINNED &&
++		    flags & __EXEC_OBJECT_HAS_PIN)
++			continue;
++
++		unpinned = true;
++		eb_unreserve_vma(ev);
++
++		if (flags & EXEC_OBJECT_PINNED)
++			/* Pinned must have their slot */
++			list_add(&ev->bind_link, &eb->unbound);
++		else if (flags & __EXEC_OBJECT_NEEDS_MAP)
++			/* Map require the lowest 256MiB (aperture) */
++			list_add_tail(&ev->bind_link, &eb->unbound);
++		else if (!(flags & EXEC_OBJECT_SUPPORTS_48B_ADDRESS))
++			/* Prioritise 4GiB region for restricted bo */
++			list_add(&ev->bind_link, &last);
++		else
++			list_add_tail(&ev->bind_link, &last);
++	}
++
++	list_splice_tail(&last, &eb->unbound);
++	return unpinned;
++}
++
++static int eb_reserve(struct i915_execbuffer *eb)
++{
++	struct eb_vma *ev;
++	unsigned int pass;
++	int err = 0;
++
++	/*
++	 * We have one more buffers that we couldn't bind, which could be due to
++	 * various reasons. To resolve this we have 4 passes, with every next
++	 * level turning the screws tighter:
++	 *
++	 * 0. Unbind all objects that do not match the GTT constraints for the
++	 * execbuffer (fenceable, mappable, alignment etc). Bind all new
++	 * objects.  This avoids unnecessary unbinding of later objects in order
++	 * to make room for the earlier objects *unless* we need to defragment.
++	 *
++	 * 1. Reorder the buffers, where objects with the most restrictive
++	 * placement requirements go first (ignoring fixed location buffers for
++	 * now).  For example, objects needing the mappable aperture (the first
++	 * 256M of GTT), should go first vs objects that can be placed just
++	 * about anywhere. Repeat the previous pass.
++	 *
++	 * 2. Consider buffers that are pinned at a fixed location. Also try to
++	 * evict the entire VM this time, leaving only objects that we were
++	 * unable to lock. Try again to bind the buffers. (still using the new
++	 * buffer order).
++	 *
++	 * 3. We likely have object lock contention for one or more stubborn
++	 * objects in the VM, for which we need to evict to make forward
++	 * progress (perhaps we are fighting the shrinker?). When evicting the
++	 * VM this time around, anything that we can't lock we now track using
++	 * the busy_bo, using the full lock (after dropping the vm->mutex to
++	 * prevent deadlocks), instead of trylock. We then continue to evict the
++	 * VM, this time with the stubborn object locked, which we can now
++	 * hopefully unbind (if still bound in the VM). Repeat until the VM is
++	 * evicted. Finally we should be able bind everything.
++	 */
++	for (pass = 0; pass <= 3; pass++) {
++		int pin_flags = PIN_USER | PIN_VALIDATE;
++
++		if (pass == 0)
++			pin_flags |= PIN_NONBLOCK;
++
++		if (pass >= 1)
++			eb_unbind(eb, pass >= 2);
++
++		if (pass == 2) {
++			err = mutex_lock_interruptible(&eb->context->vm->mutex);
++			if (!err) {
++				err = i915_gem_evict_vm(eb->context->vm, &eb->ww, NULL);
++				mutex_unlock(&eb->context->vm->mutex);
++			}
++			if (err)
++				return err;
++		}
++
++		if (pass == 3) {
++retry:
++			err = mutex_lock_interruptible(&eb->context->vm->mutex);
++			if (!err) {
++				struct drm_i915_gem_object *busy_bo = NULL;
++
++				err = i915_gem_evict_vm(eb->context->vm, &eb->ww, &busy_bo);
++				mutex_unlock(&eb->context->vm->mutex);
++				if (err && busy_bo) {
++					err = i915_gem_object_lock(busy_bo, &eb->ww);
++					i915_gem_object_put(busy_bo);
++					if (!err)
++						goto retry;
++				}
++			}
++			if (err)
++				return err;
++		}
++
++		list_for_each_entry(ev, &eb->unbound, bind_link) {
++			err = eb_reserve_vma(eb, ev, pin_flags);
++			if (err)
++				break;
++		}
++
++		if (err != -ENOSPC)
++			break;
++	}
++
++	return err;
++}
++
++static int eb_select_context(struct i915_execbuffer *eb)
++{
++	struct i915_gem_context *ctx;
++
++	ctx = i915_gem_context_lookup(eb->file->driver_priv, eb->args->rsvd1);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	eb->gem_context = ctx;
++	if (i915_gem_context_has_full_ppgtt(ctx))
++		eb->invalid_flags |= EXEC_OBJECT_NEEDS_GTT;
++
++	return 0;
++}
++
++static int __eb_add_lut(struct i915_execbuffer *eb,
++			u32 handle, struct i915_vma *vma)
++{
++	struct i915_gem_context *ctx = eb->gem_context;
++	struct i915_lut_handle *lut;
++	int err;
++
++	lut = i915_lut_handle_alloc();
++	if (unlikely(!lut))
++		return -ENOMEM;
++
++	i915_vma_get(vma);
++	if (!atomic_fetch_inc(&vma->open_count))
++		i915_vma_reopen(vma);
++	lut->handle = handle;
++	lut->ctx = ctx;
++
++	/* Check that the context hasn't been closed in the meantime */
++	err = -EINTR;
++	if (!mutex_lock_interruptible(&ctx->lut_mutex)) {
++		if (likely(!i915_gem_context_is_closed(ctx)))
++			err = radix_tree_insert(&ctx->handles_vma, handle, vma);
++		else
++			err = -ENOENT;
++		if (err == 0) { /* And nor has this handle */
++			struct drm_i915_gem_object *obj = vma->obj;
++
++			spin_lock(&obj->lut_lock);
++			if (idr_find(&eb->file->object_idr, handle) == obj) {
++				list_add(&lut->obj_link, &obj->lut_list);
++			} else {
++				radix_tree_delete(&ctx->handles_vma, handle);
++				err = -ENOENT;
++			}
++			spin_unlock(&obj->lut_lock);
++		}
++		mutex_unlock(&ctx->lut_mutex);
++	}
++	if (unlikely(err))
++		goto err;
++
++	return 0;
++
++err:
++	i915_vma_close(vma);
++	i915_vma_put(vma);
++	i915_lut_handle_free(lut);
++	return err;
++}
++
++static struct i915_vma *eb_lookup_vma(struct i915_execbuffer *eb, u32 handle)
++{
++	struct i915_address_space *vm = eb->context->vm;
++
++	do {
++		struct drm_i915_gem_object *obj;
++		struct i915_vma *vma;
++		int err;
++
++		rcu_read_lock();
++		vma = radix_tree_lookup(&eb->gem_context->handles_vma, handle);
++		if (likely(vma && vma->vm == vm))
++			vma = i915_vma_tryget(vma);
++		rcu_read_unlock();
++		if (likely(vma))
++			return vma;
++
++		xg_eb_add(XG_EB_LUT_MISS, 0);
++		obj = i915_gem_object_lookup(eb->file, handle);
++		if (unlikely(!obj))
++			return ERR_PTR(-ENOENT);
++
++		/*
++		 * If the user has opted-in for protected-object tracking, make
++		 * sure the object encryption can be used.
++		 * We only need to do this when the object is first used with
++		 * this context, because the context itself will be banned when
++		 * the protected objects become invalid.
++		 */
++		if (i915_gem_context_uses_protected_content(eb->gem_context) &&
++		    i915_gem_object_is_protected(obj)) {
++			err = intel_pxp_key_check(eb->i915->pxp, intel_bo_to_drm_bo(obj), true);
++			if (err) {
++				i915_gem_object_put(obj);
++				return ERR_PTR(err);
++			}
++		}
++
++		vma = i915_vma_instance(obj, vm, NULL);
++		if (IS_ERR(vma)) {
++			i915_gem_object_put(obj);
++			return vma;
++		}
++
++		err = __eb_add_lut(eb, handle, vma);
++		if (likely(!err))
++			return vma;
++
++		i915_gem_object_put(obj);
++		if (err != -EEXIST)
++			return ERR_PTR(err);
++	} while (1);
++}
++
++static int eb_lookup_vmas(struct i915_execbuffer *eb)
++{
++	unsigned int i, current_batch = 0;
++	int err = 0;
++
++	INIT_LIST_HEAD(&eb->relocs);
++
++	for (i = 0; i < eb->buffer_count; i++) {
++		struct i915_vma *vma;
++
++		u64 xg_t = xg_eb_t();
++
++		vma = eb_lookup_vma(eb, eb->exec[i].handle);
++		xg_eb_note(XG_EB_LUT, xg_t);
++		if (IS_ERR(vma)) {
++			err = PTR_ERR(vma);
++			goto err;
++		}
++
++		err = eb_validate_vma(eb, &eb->exec[i], vma);
++		if (unlikely(err)) {
++			i915_vma_put(vma);
++			goto err;
++		}
++
++		err = eb_add_vma(eb, &current_batch, i, vma);
++		if (err)
++			return err;
++
++		if (i915_gem_object_is_userptr(vma->obj)) {
++			xg_t = xg_eb_t();
++			err = i915_gem_object_userptr_submit_init(vma->obj);
++			xg_t = ktime_get_ns() - xg_t;
++			xg_eb_add(XG_EB_UPTR, xg_t);
++			if (xg_t > 20000)
++				xg_eb_add(XG_EB_UPTR_SLOW, xg_t);
++			if (err) {
++				if (i + 1 < eb->buffer_count) {
++					/*
++					 * Execbuffer code expects last vma entry to be NULL,
++					 * since we already initialized this entry,
++					 * set the next value to NULL or we mess up
++					 * cleanup handling.
++					 */
++					eb->vma[i + 1].vma = NULL;
++				}
++
++				return err;
++			}
++
++			eb->vma[i].flags |= __EXEC_OBJECT_USERPTR_INIT;
++			eb->args->flags |= __EXEC_USERPTR_USED;
++		}
++	}
++
++	return 0;
++
++err:
++	eb->vma[i].vma = NULL;
++	return err;
++}
++
++static int eb_lock_vmas(struct i915_execbuffer *eb)
++{
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < eb->buffer_count; i++) {
++		struct eb_vma *ev = &eb->vma[i];
++		struct i915_vma *vma = ev->vma;
++
++		err = i915_gem_object_lock(vma->obj, &eb->ww);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int eb_validate_vmas(struct i915_execbuffer *eb)
++{
++	unsigned int i;
++	int err;
++
++	u64 xg_t = xg_eb_t();
++
++	INIT_LIST_HEAD(&eb->unbound);
++
++	err = eb_lock_vmas(eb);
++	xg_eb_note(XG_EB_LOCK, xg_t);
++	if (err)
++		return err;
++
++	xg_t = xg_eb_t();
++	for (i = 0; i < eb->buffer_count; i++) {
++		struct drm_i915_gem_exec_object2 *entry = &eb->exec[i];
++		struct eb_vma *ev = &eb->vma[i];
++		struct i915_vma *vma = ev->vma;
++
++		err = eb_pin_vma(eb, entry, ev);
++		if (err == -EDEADLK)
++			return err;
++
++		if (!err) {
++			if (entry->offset != i915_vma_offset(vma)) {
++				entry->offset = i915_vma_offset(vma) | UPDATE;
++				eb->args->flags |= __EXEC_HAS_RELOC;
++			}
++		} else {
++			eb_unreserve_vma(ev);
++
++			list_add_tail(&ev->bind_link, &eb->unbound);
++			if (drm_mm_node_allocated(&vma->node)) {
++				err = i915_vma_unbind(vma);
++				if (err)
++					return err;
++			}
++		}
++
++		/* Reserve enough slots to accommodate composite fences */
++		err = dma_resv_reserve_fences(vma->obj->base.resv, eb->num_batches);
++		if (err)
++			return err;
++
++		GEM_BUG_ON(drm_mm_node_allocated(&vma->node) &&
++			   eb_vma_misplaced(&eb->exec[i], vma, ev->flags));
++	}
++
++	xg_eb_note(XG_EB_PIN, xg_t);
++	if (!list_empty(&eb->unbound)) {
++		xg_t = xg_eb_t();
++		err = eb_reserve(eb);
++		xg_eb_note(XG_EB_RESERVE, xg_t);
++		return err;
++	}
++
++	return 0;
++}
++
++static struct eb_vma *
++eb_get_vma(const struct i915_execbuffer *eb, unsigned long handle)
++{
++	if (eb->lut_size < 0) {
++		if (handle >= -eb->lut_size)
++			return NULL;
++		return &eb->vma[handle];
++	} else {
++		struct hlist_head *head;
++		struct eb_vma *ev;
++
++		head = &eb->buckets[hash_32(handle, eb->lut_size)];
++		hlist_for_each_entry(ev, head, node) {
++			if (ev->handle == handle)
++				return ev;
++		}
++		return NULL;
++	}
++}
++
++static void eb_release_vmas(struct i915_execbuffer *eb, bool final)
++{
++	const unsigned int count = eb->buffer_count;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		struct eb_vma *ev = &eb->vma[i];
++		struct i915_vma *vma = ev->vma;
++
++		if (!vma)
++			break;
++
++		eb_unreserve_vma(ev);
++
++		if (final)
++			i915_vma_put(vma);
++	}
++
++	eb_capture_release(eb);
++	eb_unpin_engine(eb);
++}
++
++static void eb_destroy(const struct i915_execbuffer *eb)
++{
++	if (eb->lut_size > 0)
++		kfree(eb->buckets);
++}
++
++static u64
++relocation_target(const struct drm_i915_gem_relocation_entry *reloc,
++		  const struct i915_vma *target)
++{
++	return gen8_canonical_addr((int)reloc->delta + i915_vma_offset(target));
++}
++
++static void reloc_cache_init(struct reloc_cache *cache,
++			     struct drm_i915_private *i915)
++{
++	cache->page = -1;
++	cache->vaddr = 0;
++	/* Must be a variable in the struct to allow GCC to unroll. */
++	cache->graphics_ver = GRAPHICS_VER(i915);
++	cache->has_llc = HAS_LLC(i915);
++	cache->use_64bit_reloc = HAS_64BIT_RELOC(i915);
++	cache->has_fence = cache->graphics_ver < 4;
++	cache->needs_unfenced = INTEL_INFO(i915)->unfenced_needs_alignment;
++	cache->node.flags = 0;
++}
++
++static void *unmask_page(unsigned long p)
++{
++	return (void *)(uintptr_t)(p & PAGE_MASK);
++}
++
++static unsigned int unmask_flags(unsigned long p)
++{
++	return p & ~PAGE_MASK;
++}
++
++#define KMAP 0x4 /* after CLFLUSH_FLAGS */
++
++static struct i915_ggtt *cache_to_ggtt(struct reloc_cache *cache)
++{
++	struct drm_i915_private *i915 =
++		container_of(cache, struct i915_execbuffer, reloc_cache)->i915;
++	return to_gt(i915)->ggtt;
++}
++
++static void reloc_cache_unmap(struct reloc_cache *cache)
++{
++	void *vaddr;
++
++	if (!cache->vaddr)
++		return;
++
++	vaddr = unmask_page(cache->vaddr);
++	if (cache->vaddr & KMAP)
++		kunmap_local(vaddr);
++	else
++		io_mapping_unmap_atomic((void __iomem *)vaddr);
++}
++
++static void reloc_cache_remap(struct reloc_cache *cache,
++			      struct drm_i915_gem_object *obj)
++{
++	void *vaddr;
++
++	if (!cache->vaddr)
++		return;
++
++	if (cache->vaddr & KMAP) {
++		struct page *page = i915_gem_object_get_page(obj, cache->page);
++
++		vaddr = kmap_local_page(page);
++		cache->vaddr = unmask_flags(cache->vaddr) |
++			(unsigned long)vaddr;
++	} else {
++		struct i915_ggtt *ggtt = cache_to_ggtt(cache);
++		unsigned long offset;
++
++		offset = cache->node.start;
++		if (!drm_mm_node_allocated(&cache->node))
++			offset += cache->page << PAGE_SHIFT;
++
++		cache->vaddr = (unsigned long)
++			io_mapping_map_atomic_wc(&ggtt->iomap, offset);
++	}
++}
++
++static void reloc_cache_reset(struct reloc_cache *cache, struct i915_execbuffer *eb)
++{
++	void *vaddr;
++
++	if (!cache->vaddr)
++		return;
++
++	vaddr = unmask_page(cache->vaddr);
++	if (cache->vaddr & KMAP) {
++		struct drm_i915_gem_object *obj =
++			(struct drm_i915_gem_object *)cache->node.mm;
++		if (cache->vaddr & CLFLUSH_AFTER)
++			mb();
++
++		kunmap_local(vaddr);
++		i915_gem_object_finish_access(obj);
++	} else {
++		struct i915_ggtt *ggtt = cache_to_ggtt(cache);
++
++		intel_gt_flush_ggtt_writes(ggtt->vm.gt);
++		io_mapping_unmap_atomic((void __iomem *)vaddr);
++
++		if (drm_mm_node_allocated(&cache->node)) {
++			ggtt->vm.clear_range(&ggtt->vm,
++					     cache->node.start,
++					     cache->node.size);
++			mutex_lock(&ggtt->vm.mutex);
++			drm_mm_remove_node(&cache->node);
++			mutex_unlock(&ggtt->vm.mutex);
++		} else {
++			i915_vma_unpin((struct i915_vma *)cache->node.mm);
++		}
++	}
++
++	cache->vaddr = 0;
++	cache->page = -1;
++}
++
++static void *reloc_kmap(struct drm_i915_gem_object *obj,
++			struct reloc_cache *cache,
++			unsigned long pageno)
++{
++	void *vaddr;
++	struct page *page;
++
++	if (cache->vaddr) {
++		kunmap_local(unmask_page(cache->vaddr));
++	} else {
++		unsigned int flushes;
++		int err;
++
++		err = i915_gem_object_prepare_write(obj, &flushes);
++		if (err)
++			return ERR_PTR(err);
++
++		BUILD_BUG_ON(KMAP & CLFLUSH_FLAGS);
++		BUILD_BUG_ON((KMAP | CLFLUSH_FLAGS) & PAGE_MASK);
++
++		cache->vaddr = flushes | KMAP;
++		cache->node.mm = (void *)obj;
++		if (flushes)
++			mb();
++	}
++
++	page = i915_gem_object_get_page(obj, pageno);
++	if (!obj->mm.dirty)
++		set_page_dirty(page);
++
++	vaddr = kmap_local_page(page);
++	cache->vaddr = unmask_flags(cache->vaddr) | (unsigned long)vaddr;
++	cache->page = pageno;
++
++	return vaddr;
++}
++
++static void *reloc_iomap(struct i915_vma *batch,
++			 struct i915_execbuffer *eb,
++			 unsigned long page)
++{
++	struct drm_i915_gem_object *obj = batch->obj;
++	struct reloc_cache *cache = &eb->reloc_cache;
++	struct i915_ggtt *ggtt = cache_to_ggtt(cache);
++	unsigned long offset;
++	void *vaddr;
++
++	if (cache->vaddr) {
++		intel_gt_flush_ggtt_writes(ggtt->vm.gt);
++		io_mapping_unmap_atomic((void __force __iomem *) unmask_page(cache->vaddr));
++	} else {
++		struct i915_vma *vma = ERR_PTR(-ENODEV);
++		int err;
++
++		if (i915_gem_object_is_tiled(obj))
++			return ERR_PTR(-EINVAL);
++
++		if (use_cpu_reloc(cache, obj))
++			return NULL;
++
++		err = i915_gem_object_set_to_gtt_domain(obj, true);
++		if (err)
++			return ERR_PTR(err);
++
++		/*
++		 * i915_gem_object_ggtt_pin_ww may attempt to remove the batch
++		 * VMA from the object list because we no longer pin.
++		 *
++		 * Only attempt to pin the batch buffer to ggtt if the current batch
++		 * is not inside ggtt, or the batch buffer is not misplaced.
++		 */
++		if (!i915_is_ggtt(batch->vm) ||
++		    !i915_vma_misplaced(batch, 0, 0, PIN_MAPPABLE)) {
++			vma = i915_gem_object_ggtt_pin_ww(obj, &eb->ww, NULL, 0, 0,
++							  PIN_MAPPABLE |
++							  PIN_NONBLOCK /* NOWARN */ |
++							  PIN_NOEVICT);
++		}
++
++		if (vma == ERR_PTR(-EDEADLK))
++			return vma;
++
++		if (IS_ERR(vma)) {
++			memset(&cache->node, 0, sizeof(cache->node));
++			mutex_lock(&ggtt->vm.mutex);
++			err = drm_mm_insert_node_in_range
++				(&ggtt->vm.mm, &cache->node,
++				 PAGE_SIZE, 0, I915_COLOR_UNEVICTABLE,
++				 0, ggtt->mappable_end,
++				 DRM_MM_INSERT_LOW);
++			mutex_unlock(&ggtt->vm.mutex);
++			if (err) /* no inactive aperture space, use cpu reloc */
++				return NULL;
++		} else {
++			cache->node.start = i915_ggtt_offset(vma);
++			cache->node.mm = (void *)vma;
++		}
++	}
++
++	offset = cache->node.start;
++	if (drm_mm_node_allocated(&cache->node)) {
++		ggtt->vm.insert_page(&ggtt->vm,
++				     i915_gem_object_get_dma_address(obj, page),
++				     offset,
++				     i915_gem_get_pat_index(ggtt->vm.i915,
++							    I915_CACHE_NONE),
++				     0);
++	} else {
++		offset += page << PAGE_SHIFT;
++	}
++
++	vaddr = (void __force *)io_mapping_map_atomic_wc(&ggtt->iomap,
++							 offset);
++	cache->page = page;
++	cache->vaddr = (unsigned long)vaddr;
++
++	return vaddr;
++}
++
++static void *reloc_vaddr(struct i915_vma *vma,
++			 struct i915_execbuffer *eb,
++			 unsigned long page)
++{
++	struct reloc_cache *cache = &eb->reloc_cache;
++	void *vaddr;
++
++	if (cache->page == page) {
++		vaddr = unmask_page(cache->vaddr);
++	} else {
++		vaddr = NULL;
++		if ((cache->vaddr & KMAP) == 0)
++			vaddr = reloc_iomap(vma, eb, page);
++		if (!vaddr)
++			vaddr = reloc_kmap(vma->obj, cache, page);
++	}
++
++	return vaddr;
++}
++
++static void clflush_write32(u32 *addr, u32 value, unsigned int flushes)
++{
++	if (unlikely(flushes & (CLFLUSH_BEFORE | CLFLUSH_AFTER))) {
++		if (flushes & CLFLUSH_BEFORE)
++			drm_clflush_virt_range(addr, sizeof(*addr));
++
++		*addr = value;
++
++		/*
++		 * Writes to the same cacheline are serialised by the CPU
++		 * (including clflush). On the write path, we only require
++		 * that it hits memory in an orderly fashion and place
++		 * mb barriers at the start and end of the relocation phase
++		 * to ensure ordering of clflush wrt to the system.
++		 */
++		if (flushes & CLFLUSH_AFTER)
++			drm_clflush_virt_range(addr, sizeof(*addr));
++	} else
++		*addr = value;
++}
++
++static u64
++relocate_entry(struct i915_vma *vma,
++	       const struct drm_i915_gem_relocation_entry *reloc,
++	       struct i915_execbuffer *eb,
++	       const struct i915_vma *target)
++{
++	u64 target_addr = relocation_target(reloc, target);
++	u64 offset = reloc->offset;
++	bool wide = eb->reloc_cache.use_64bit_reloc;
++	void *vaddr;
++
++repeat:
++	vaddr = reloc_vaddr(vma, eb,
++			    offset >> PAGE_SHIFT);
++	if (IS_ERR(vaddr))
++		return PTR_ERR(vaddr);
++
++	GEM_BUG_ON(!IS_ALIGNED(offset, sizeof(u32)));
++	clflush_write32(vaddr + offset_in_page(offset),
++			lower_32_bits(target_addr),
++			eb->reloc_cache.vaddr);
++
++	if (wide) {
++		offset += sizeof(u32);
++		target_addr >>= 32;
++		wide = false;
++		goto repeat;
++	}
++
++	return target->node.start | UPDATE;
++}
++
++static u64
++eb_relocate_entry(struct i915_execbuffer *eb,
++		  struct eb_vma *ev,
++		  const struct drm_i915_gem_relocation_entry *reloc)
++{
++	struct drm_i915_private *i915 = eb->i915;
++	struct eb_vma *target;
++	int err;
++
++	/* we've already hold a reference to all valid objects */
++	target = eb_get_vma(eb, reloc->target_handle);
++	if (unlikely(!target))
++		return -ENOENT;
++
++	/* Validate that the target is in a valid r/w GPU domain */
++	if (unlikely(reloc->write_domain & (reloc->write_domain - 1))) {
++		drm_dbg(&i915->drm, "reloc with multiple write domains: "
++			  "target %d offset %d "
++			  "read %08x write %08x\n",
++			  reloc->target_handle,
++			  (int) reloc->offset,
++			  reloc->read_domains,
++			  reloc->write_domain);
++		return -EINVAL;
++	}
++	if (unlikely((reloc->write_domain | reloc->read_domains)
++		     & ~I915_GEM_GPU_DOMAINS)) {
++		drm_dbg(&i915->drm, "reloc with read/write non-GPU domains: "
++			  "target %d offset %d "
++			  "read %08x write %08x\n",
++			  reloc->target_handle,
++			  (int) reloc->offset,
++			  reloc->read_domains,
++			  reloc->write_domain);
++		return -EINVAL;
++	}
++
++	if (reloc->write_domain) {
++		target->flags |= EXEC_OBJECT_WRITE;
++
++		/*
++		 * Sandybridge PPGTT errata: We need a global gtt mapping
++		 * for MI and pipe_control writes because the gpu doesn't
++		 * properly redirect them through the ppgtt for non_secure
++		 * batchbuffers.
++		 */
++		if (reloc->write_domain == I915_GEM_DOMAIN_INSTRUCTION &&
++		    GRAPHICS_VER(eb->i915) == 6 &&
++		    !i915_vma_is_bound(target->vma, I915_VMA_GLOBAL_BIND)) {
++			struct i915_vma *vma = target->vma;
++
++			reloc_cache_unmap(&eb->reloc_cache);
++			mutex_lock(&vma->vm->mutex);
++			err = i915_vma_bind(target->vma,
++					    target->vma->obj->pat_index,
++					    PIN_GLOBAL, NULL, NULL);
++			mutex_unlock(&vma->vm->mutex);
++			reloc_cache_remap(&eb->reloc_cache, ev->vma->obj);
++			if (err)
++				return err;
++		}
++	}
++
++	/*
++	 * If the relocation already has the right value in it, no
++	 * more work needs to be done.
++	 */
++	if (!DBG_FORCE_RELOC &&
++	    gen8_canonical_addr(i915_vma_offset(target->vma)) == reloc->presumed_offset)
++		return 0;
++
++	/* Check that the relocation address is valid... */
++	if (unlikely(reloc->offset >
++		     ev->vma->size - (eb->reloc_cache.use_64bit_reloc ? 8 : 4))) {
++		drm_dbg(&i915->drm, "Relocation beyond object bounds: "
++			  "target %d offset %d size %d.\n",
++			  reloc->target_handle,
++			  (int)reloc->offset,
++			  (int)ev->vma->size);
++		return -EINVAL;
++	}
++	if (unlikely(reloc->offset & 3)) {
++		drm_dbg(&i915->drm, "Relocation not 4-byte aligned: "
++			  "target %d offset %d.\n",
++			  reloc->target_handle,
++			  (int)reloc->offset);
++		return -EINVAL;
++	}
++
++	/*
++	 * If we write into the object, we need to force the synchronisation
++	 * barrier, either with an asynchronous clflush or if we executed the
++	 * patching using the GPU (though that should be serialised by the
++	 * timeline). To be completely sure, and since we are required to
++	 * do relocations we are already stalling, disable the user's opt
++	 * out of our synchronisation.
++	 */
++	ev->flags &= ~EXEC_OBJECT_ASYNC;
++
++	/* and update the user's relocation entry */
++	return relocate_entry(ev->vma, reloc, eb, target->vma);
++}
++
++static int eb_relocate_vma(struct i915_execbuffer *eb, struct eb_vma *ev)
++{
++#define N_RELOC(x) ((x) / sizeof(struct drm_i915_gem_relocation_entry))
++	struct drm_i915_gem_relocation_entry stack[N_RELOC(512)];
++	const struct drm_i915_gem_exec_object2 *entry = ev->exec;
++	struct drm_i915_gem_relocation_entry __user *urelocs =
++		u64_to_user_ptr(entry->relocs_ptr);
++	unsigned long remain = entry->relocation_count;
++
++	if (unlikely(remain > N_RELOC(INT_MAX)))
++		return -EINVAL;
++
++	/*
++	 * We must check that the entire relocation array is safe
++	 * to read. However, if the array is not writable the user loses
++	 * the updated relocation values.
++	 */
++	if (unlikely(!access_ok(urelocs, remain * sizeof(*urelocs))))
++		return -EFAULT;
++
++	do {
++		struct drm_i915_gem_relocation_entry *r = stack;
++		unsigned int count =
++			min_t(unsigned long, remain, ARRAY_SIZE(stack));
++		unsigned int copied;
++
++		/*
++		 * This is the fast path and we cannot handle a pagefault
++		 * whilst holding the struct mutex lest the user pass in the
++		 * relocations contained within a mmaped bo. For in such a case
++		 * we, the page fault handler would call i915_gem_fault() and
++		 * we would try to acquire the struct mutex again. Obviously
++		 * this is bad and so lockdep complains vehemently.
++		 */
++		pagefault_disable();
++		copied = __copy_from_user_inatomic(r, urelocs, count * sizeof(r[0]));
++		pagefault_enable();
++		if (unlikely(copied)) {
++			remain = -EFAULT;
++			goto out;
++		}
++
++		remain -= count;
++		do {
++			u64 offset = eb_relocate_entry(eb, ev, r);
++
++			if (likely(offset == 0)) {
++			} else if ((s64)offset < 0) {
++				remain = (int)offset;
++				goto out;
++			} else {
++				/*
++				 * Note that reporting an error now
++				 * leaves everything in an inconsistent
++				 * state as we have *already* changed
++				 * the relocation value inside the
++				 * object. As we have not changed the
++				 * reloc.presumed_offset or will not
++				 * change the execobject.offset, on the
++				 * call we may not rewrite the value
++				 * inside the object, leaving it
++				 * dangling and causing a GPU hang. Unless
++				 * userspace dynamically rebuilds the
++				 * relocations on each execbuf rather than
++				 * presume a static tree.
++				 *
++				 * We did previously check if the relocations
++				 * were writable (access_ok), an error now
++				 * would be a strange race with mprotect,
++				 * having already demonstrated that we
++				 * can read from this userspace address.
++				 */
++				offset = gen8_canonical_addr(offset & ~UPDATE);
++				__put_user(offset,
++					   &urelocs[r - stack].presumed_offset);
++			}
++		} while (r++, --count);
++		urelocs += ARRAY_SIZE(stack);
++	} while (remain);
++out:
++	reloc_cache_reset(&eb->reloc_cache, eb);
++	return remain;
++}
++
++static int
++eb_relocate_vma_slow(struct i915_execbuffer *eb, struct eb_vma *ev)
++{
++	const struct drm_i915_gem_exec_object2 *entry = ev->exec;
++	struct drm_i915_gem_relocation_entry *relocs =
++		u64_to_ptr(typeof(*relocs), entry->relocs_ptr);
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < entry->relocation_count; i++) {
++		u64 offset = eb_relocate_entry(eb, ev, &relocs[i]);
++
++		if ((s64)offset < 0) {
++			err = (int)offset;
++			goto err;
++		}
++	}
++	err = 0;
++err:
++	reloc_cache_reset(&eb->reloc_cache, eb);
++	return err;
++}
++
++static int check_relocations(const struct drm_i915_gem_exec_object2 *entry)
++{
++	const char __user *addr, *end;
++	unsigned long size;
++	char __maybe_unused c;
++
++	size = entry->relocation_count;
++	if (size == 0)
++		return 0;
++
++	if (size > N_RELOC(INT_MAX))
++		return -EINVAL;
++
++	addr = u64_to_user_ptr(entry->relocs_ptr);
++	size *= sizeof(struct drm_i915_gem_relocation_entry);
++	if (!access_ok(addr, size))
++		return -EFAULT;
++
++	end = addr + size;
++	for (; addr < end; addr += PAGE_SIZE) {
++#ifdef __linux__
++		int err = __get_user(c, addr);
++#elif defined(__FreeBSD__)
++		// XXX: Move deconst to lkpi?
++		int err = __get_user(c, __DECONST(char *, addr));
++#endif
++		if (err)
++			return err;
++	}
++#ifdef __linux__
++	return __get_user(c, end - 1);
++#elif defined(__FreeBSD__)
++	return __get_user(c, __DECONST(char *, end - 1));
++#endif
++}
++
++static int eb_copy_relocations(const struct i915_execbuffer *eb)
++{
++	struct drm_i915_gem_relocation_entry *relocs;
++	const unsigned int count = eb->buffer_count;
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < count; i++) {
++		const unsigned int nreloc = eb->exec[i].relocation_count;
++		struct drm_i915_gem_relocation_entry __user *urelocs;
++		unsigned long size;
++		unsigned long copied;
++
++		if (nreloc == 0)
++			continue;
++
++		err = check_relocations(&eb->exec[i]);
++		if (err)
++			goto err;
++
++		urelocs = u64_to_user_ptr(eb->exec[i].relocs_ptr);
++		size = nreloc * sizeof(*relocs);
++
++		relocs = kvmalloc_array(1, size, GFP_KERNEL);
++		if (!relocs) {
++			err = -ENOMEM;
++			goto err;
++		}
++
++		/* copy_from_user is limited to < 4GiB */
++		copied = 0;
++		do {
++			unsigned int len =
++				min_t(u64, BIT_ULL(31), size - copied);
++
++			if (__copy_from_user((char *)relocs + copied,
++					     (char __user *)urelocs + copied,
++					     len))
++				goto end;
++
++			copied += len;
++		} while (copied < size);
++
++		/*
++		 * As we do not update the known relocation offsets after
++		 * relocating (due to the complexities in lock handling),
++		 * we need to mark them as invalid now so that we force the
++		 * relocation processing next time. Just in case the target
++		 * object is evicted and then rebound into its old
++		 * presumed_offset before the next execbuffer - if that
++		 * happened we would make the mistake of assuming that the
++		 * relocations were valid.
++		 */
++		if (!user_access_begin(urelocs, size))
++			goto end;
++
++		for (copied = 0; copied < nreloc; copied++)
++			unsafe_put_user(-1,
++					&urelocs[copied].presumed_offset,
++					end_user);
++		user_access_end();
++
++		eb->exec[i].relocs_ptr = (uintptr_t)relocs;
++	}
++
++	return 0;
++
++end_user:
++	user_access_end();
++end:
++	kvfree(relocs);
++	err = -EFAULT;
++err:
++	while (i--) {
++		relocs = u64_to_ptr(typeof(*relocs), eb->exec[i].relocs_ptr);
++		if (eb->exec[i].relocation_count)
++			kvfree(relocs);
++	}
++	return err;
++}
++
++static int eb_prefault_relocations(const struct i915_execbuffer *eb)
++{
++	const unsigned int count = eb->buffer_count;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		int err;
++
++		err = check_relocations(&eb->exec[i]);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int eb_reinit_userptr(struct i915_execbuffer *eb)
++{
++	const unsigned int count = eb->buffer_count;
++	unsigned int i;
++	int ret;
++
++	if (likely(!(eb->args->flags & __EXEC_USERPTR_USED)))
++		return 0;
++
++	for (i = 0; i < count; i++) {
++		struct eb_vma *ev = &eb->vma[i];
++
++		if (!i915_gem_object_is_userptr(ev->vma->obj))
++			continue;
++
++		ret = i915_gem_object_userptr_submit_init(ev->vma->obj);
++		if (ret)
++			return ret;
++
++		ev->flags |= __EXEC_OBJECT_USERPTR_INIT;
++	}
++
++	return 0;
++}
++
++static noinline int eb_relocate_parse_slow(struct i915_execbuffer *eb)
++{
++	bool have_copy = false;
++	struct eb_vma *ev;
++	int err = 0;
++
++repeat:
++	if (signal_pending(current)) {
++		err = -ERESTARTSYS;
++		goto out;
++	}
++
++	/* We may process another execbuffer during the unlock... */
++	eb_release_vmas(eb, false);
++	i915_gem_ww_ctx_fini(&eb->ww);
++
++	/*
++	 * We take 3 passes through the slowpatch.
++	 *
++	 * 1 - we try to just prefault all the user relocation entries and
++	 * then attempt to reuse the atomic pagefault disabled fast path again.
++	 *
++	 * 2 - we copy the user entries to a local buffer here outside of the
++	 * local and allow ourselves to wait upon any rendering before
++	 * relocations
++	 *
++	 * 3 - we already have a local copy of the relocation entries, but
++	 * were interrupted (EAGAIN) whilst waiting for the objects, try again.
++	 */
++	if (!err) {
++		err = eb_prefault_relocations(eb);
++	} else if (!have_copy) {
++		err = eb_copy_relocations(eb);
++		have_copy = err == 0;
++	} else {
++		cond_resched();
++		err = 0;
++	}
++
++	if (!err)
++		err = eb_reinit_userptr(eb);
++
++	i915_gem_ww_ctx_init(&eb->ww, true);
++	if (err)
++		goto out;
++
++	/* reacquire the objects */
++repeat_validate:
++	err = eb_pin_engine(eb, false);
++	if (err)
++		goto err;
++
++	err = eb_validate_vmas(eb);
++	if (err)
++		goto err;
++
++	GEM_BUG_ON(!eb->batches[0]);
++
++	list_for_each_entry(ev, &eb->relocs, reloc_link) {
++		if (!have_copy) {
++			err = eb_relocate_vma(eb, ev);
++			if (err)
++				break;
++		} else {
++			err = eb_relocate_vma_slow(eb, ev);
++			if (err)
++				break;
++		}
++	}
++
++	if (err == -EDEADLK)
++		goto err;
++
++	if (err && !have_copy)
++		goto repeat;
++
++	if (err)
++		goto err;
++
++	/* as last step, parse the command buffer */
++	err = eb_parse(eb);
++	if (err)
++		goto err;
++
++	/*
++	 * Leave the user relocations as are, this is the painfully slow path,
++	 * and we want to avoid the complication of dropping the lock whilst
++	 * having buffers reserved in the aperture and so causing spurious
++	 * ENOSPC for random operations.
++	 */
++
++err:
++	if (err == -EDEADLK) {
++		eb_release_vmas(eb, false);
++		err = i915_gem_ww_ctx_backoff(&eb->ww);
++		if (!err)
++			goto repeat_validate;
++	}
++
++	if (err == -EAGAIN)
++		goto repeat;
++
++out:
++	if (have_copy) {
++		const unsigned int count = eb->buffer_count;
++		unsigned int i;
++
++		for (i = 0; i < count; i++) {
++			const struct drm_i915_gem_exec_object2 *entry =
++				&eb->exec[i];
++			struct drm_i915_gem_relocation_entry *relocs;
++
++			if (!entry->relocation_count)
++				continue;
++
++			relocs = u64_to_ptr(typeof(*relocs), entry->relocs_ptr);
++			kvfree(relocs);
++		}
++	}
++
++	return err;
++}
++
++static int eb_relocate_parse(struct i915_execbuffer *eb)
++{
++	int err;
++	bool throttle = true;
++	u64 xg_t;
++
++retry:
++	xg_t = xg_eb_t();
++	err = eb_pin_engine(eb, throttle);
++	xg_eb_note(XG_EB_PIN_ENGINE, xg_t);
++	if (err) {
++		if (err != -EDEADLK)
++			return err;
++
++		goto err;
++	}
++
++	/* only throttle once, even if we didn't need to throttle */
++	throttle = false;
++
++	xg_t = xg_eb_t();
++	err = eb_validate_vmas(eb);
++	xg_eb_note(XG_EB_VALIDATE, xg_t);
++	if (err == -EAGAIN)
++		goto slow;
++	else if (err)
++		goto err;
++
++	xg_t = xg_eb_t();
++	/* The objects are in their final locations, apply the relocations. */
++	if (eb->args->flags & __EXEC_HAS_RELOC) {
++		struct eb_vma *ev;
++
++		list_for_each_entry(ev, &eb->relocs, reloc_link) {
++			err = eb_relocate_vma(eb, ev);
++			if (err)
++				break;
++		}
++
++		if (err == -EDEADLK)
++			goto err;
++		else if (err)
++			goto slow;
++	}
++
++	if (!err)
++		err = eb_parse(eb);
++	xg_eb_note(XG_EB_RELOC, xg_t);
++
++err:
++	if (err == -EDEADLK) {
++		eb_release_vmas(eb, false);
++		err = i915_gem_ww_ctx_backoff(&eb->ww);
++		if (!err)
++			goto retry;
++	}
++
++	return err;
++
++slow:
++	err = eb_relocate_parse_slow(eb);
++	if (err)
++		/*
++		 * If the user expects the execobject.offset and
++		 * reloc.presumed_offset to be an exact match,
++		 * as for using NO_RELOC, then we cannot update
++		 * the execobject.offset until we have completed
++		 * relocation.
++		 */
++		eb->args->flags &= ~__EXEC_HAS_RELOC;
++
++	return err;
++}
++
++/*
++ * Using two helper loops for the order of which requests / batches are created
++ * and added the to backend. Requests are created in order from the parent to
++ * the last child. Requests are added in the reverse order, from the last child
++ * to parent. This is done for locking reasons as the timeline lock is acquired
++ * during request creation and released when the request is added to the
++ * backend. To make lockdep happy (see intel_context_timeline_lock) this must be
++ * the ordering.
++ */
++#define for_each_batch_create_order(_eb, _i) \
++	for ((_i) = 0; (_i) < (_eb)->num_batches; ++(_i))
++#define for_each_batch_add_order(_eb, _i) \
++	BUILD_BUG_ON(!typecheck(int, _i)); \
++	for ((_i) = (_eb)->num_batches - 1; (_i) >= 0; --(_i))
++
++static struct i915_request *
++eb_find_first_request_added(struct i915_execbuffer *eb)
++{
++	int i;
++
++	for_each_batch_add_order(eb, i)
++		if (eb->requests[i])
++			return eb->requests[i];
++
++	GEM_BUG_ON("Request not found");
++
++	return NULL;
++}
++
++#if IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR)
++
++/* Stage with GFP_KERNEL allocations before we enter the signaling critical path */
++static int eb_capture_stage(struct i915_execbuffer *eb)
++{
++	const unsigned int count = eb->buffer_count;
++	unsigned int i = count, j;
++
++	while (i--) {
++		struct eb_vma *ev = &eb->vma[i];
++		struct i915_vma *vma = ev->vma;
++		unsigned int flags = ev->flags;
++
++		if (!(flags & EXEC_OBJECT_CAPTURE))
++			continue;
++
++		if (i915_gem_context_is_recoverable(eb->gem_context) &&
++		    (IS_DGFX(eb->i915) || GRAPHICS_VER_FULL(eb->i915) > IP_VER(12, 0)))
++			return -EINVAL;
++
++		for_each_batch_create_order(eb, j) {
++			struct i915_capture_list *capture;
++
++			capture = kmalloc(sizeof(*capture), GFP_KERNEL);
++			if (!capture)
++				continue;
++
++			capture->next = eb->capture_lists[j];
++			capture->vma_res = i915_vma_resource_get(vma->resource);
++			eb->capture_lists[j] = capture;
++		}
++	}
++
++	return 0;
++}
++
++/* Commit once we're in the critical path */
++static void eb_capture_commit(struct i915_execbuffer *eb)
++{
++	unsigned int j;
++
++	for_each_batch_create_order(eb, j) {
++		struct i915_request *rq = eb->requests[j];
++
++		if (!rq)
++			break;
++
++		rq->capture_list = eb->capture_lists[j];
++		eb->capture_lists[j] = NULL;
++	}
++}
++
++/*
++ * Release anything that didn't get committed due to errors.
++ * The capture_list will otherwise be freed at request retire.
++ */
++static void eb_capture_release(struct i915_execbuffer *eb)
++{
++	unsigned int j;
++
++	for_each_batch_create_order(eb, j) {
++		if (eb->capture_lists[j]) {
++			i915_request_free_capture_list(eb->capture_lists[j]);
++			eb->capture_lists[j] = NULL;
++		}
++	}
++}
++
++static void eb_capture_list_clear(struct i915_execbuffer *eb)
++{
++	memset(eb->capture_lists, 0, sizeof(eb->capture_lists));
++}
++
++#else
++
++static int eb_capture_stage(struct i915_execbuffer *eb)
++{
++	return 0;
++}
++
++static void eb_capture_commit(struct i915_execbuffer *eb)
++{
++}
++
++static void eb_capture_release(struct i915_execbuffer *eb)
++{
++}
++
++static void eb_capture_list_clear(struct i915_execbuffer *eb)
++{
++}
++
++#endif
++
++static int eb_move_to_gpu(struct i915_execbuffer *eb)
++{
++	const unsigned int count = eb->buffer_count;
++	unsigned int i = count;
++	int err = 0, j;
++	const u64 xg_t = xg_eb_t();
++
++	while (i--) {
++		struct eb_vma *ev = &eb->vma[i];
++		struct i915_vma *vma = ev->vma;
++		unsigned int flags = ev->flags;
++		struct drm_i915_gem_object *obj = vma->obj;
++
++		assert_vma_held(vma);
++
++		/*
++		 * If the GPU is not _reading_ through the CPU cache, we need
++		 * to make sure that any writes (both previous GPU writes from
++		 * before a change in snooping levels and normal CPU writes)
++		 * caught in that cache are flushed to main memory.
++		 *
++		 * We want to say
++		 *   obj->cache_dirty &&
++		 *   !(obj->cache_coherent & I915_BO_CACHE_COHERENT_FOR_READ)
++		 * but gcc's optimiser doesn't handle that as well and emits
++		 * two jumps instead of one. Maybe one day...
++		 *
++		 * FIXME: There is also sync flushing in set_pages(), which
++		 * serves a different purpose(some of the time at least).
++		 *
++		 * We should consider:
++		 *
++		 *   1. Rip out the async flush code.
++		 *
++		 *   2. Or make the sync flushing use the async clflush path
++		 *   using mandatory fences underneath. Currently the below
++		 *   async flush happens after we bind the object.
++		 */
++		if (unlikely(obj->cache_dirty & ~obj->cache_coherent)) {
++			const u64 xg_c = xg_eb_t();
++
++			if (i915_gem_clflush_object(obj, 0))
++				flags &= ~EXEC_OBJECT_ASYNC;
++			xg_eb_note(XG_EB_CLFLUSH, xg_c);
++			atomic64_inc(&xg_eb_clflush_objs);
++			atomic64_add(obj->base.size, &xg_eb_clflush_bytes);
++		}
++
++		/* We only need to await on the first request */
++		if (err == 0 && !(flags & EXEC_OBJECT_ASYNC)) {
++			err = i915_request_await_object
++				(eb_find_first_request_added(eb), obj,
++				 flags & EXEC_OBJECT_WRITE);
++		}
++
++		for_each_batch_add_order(eb, j) {
++			if (err)
++				break;
++			if (!eb->requests[j])
++				continue;
++
++			err = _i915_vma_move_to_active(vma, eb->requests[j],
++						       j ? NULL :
++						       eb->composite_fence ?
++						       eb->composite_fence :
++						       &eb->requests[j]->fence,
++						       flags | __EXEC_OBJECT_NO_RESERVE |
++						       __EXEC_OBJECT_NO_REQUEST_AWAIT);
++		}
++	}
++
++#ifdef CONFIG_MMU_NOTIFIER
++	if (!err && (eb->args->flags & __EXEC_USERPTR_USED)) {
++		for (i = 0; i < count; i++) {
++			struct eb_vma *ev = &eb->vma[i];
++			struct drm_i915_gem_object *obj = ev->vma->obj;
++
++			if (!i915_gem_object_is_userptr(obj))
++				continue;
++
++			err = i915_gem_object_userptr_submit_done(obj);
++			if (err)
++				break;
++		}
++	}
++#endif
++
++	if (unlikely(err))
++		goto err_skip;
++
++	/* Unconditionally flush any chipset caches (for streaming writes). */
++	intel_gt_chipset_flush(eb->gt);
++	eb_capture_commit(eb);
++	xg_eb_note(XG_EB_MOVE, xg_t);
++
++	return 0;
++
++err_skip:
++	for_each_batch_create_order(eb, j) {
++		if (!eb->requests[j])
++			break;
++
++		i915_request_set_error_once(eb->requests[j], err);
++	}
++	return err;
++}
++
++static int i915_gem_check_execbuffer(struct drm_i915_private *i915,
++				     struct drm_i915_gem_execbuffer2 *exec)
++{
++	if (exec->flags & __I915_EXEC_ILLEGAL_FLAGS)
++		return -EINVAL;
++
++	/* Kernel clipping was a DRI1 misfeature */
++	if (!(exec->flags & (I915_EXEC_FENCE_ARRAY |
++			     I915_EXEC_USE_EXTENSIONS))) {
++		if (exec->num_cliprects || exec->cliprects_ptr)
++			return -EINVAL;
++	}
++
++	if (exec->DR4 == 0xffffffff) {
++		drm_dbg(&i915->drm, "UXA submitting garbage DR4, fixing up\n");
++		exec->DR4 = 0;
++	}
++	if (exec->DR1 || exec->DR4)
++		return -EINVAL;
++
++	if ((exec->batch_start_offset | exec->batch_len) & 0x7)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int i915_reset_gen7_sol_offsets(struct i915_request *rq)
++{
++	u32 *cs;
++	int i;
++
++	if (GRAPHICS_VER(rq->i915) != 7 || rq->engine->id != RCS0) {
++		drm_dbg(&rq->i915->drm, "sol reset is gen7/rcs only\n");
++		return -EINVAL;
++	}
++
++	cs = intel_ring_begin(rq, 4 * 2 + 2);
++	if (IS_ERR(cs))
++		return PTR_ERR(cs);
++
++	*cs++ = MI_LOAD_REGISTER_IMM(4);
++	for (i = 0; i < 4; i++) {
++		*cs++ = i915_mmio_reg_offset(GEN7_SO_WRITE_OFFSET(i));
++		*cs++ = 0;
++	}
++	*cs++ = MI_NOOP;
++	intel_ring_advance(rq, cs);
++
++	return 0;
++}
++
++static struct i915_vma *
++shadow_batch_pin(struct i915_execbuffer *eb,
++		 struct drm_i915_gem_object *obj,
++		 struct i915_address_space *vm,
++		 unsigned int flags)
++{
++	struct i915_vma *vma;
++	int err;
++
++	vma = i915_vma_instance(obj, vm, NULL);
++	if (IS_ERR(vma))
++		return vma;
++
++	err = i915_vma_pin_ww(vma, &eb->ww, 0, 0, flags | PIN_VALIDATE);
++	if (err)
++		return ERR_PTR(err);
++
++	return vma;
++}
++
++static struct i915_vma *eb_dispatch_secure(struct i915_execbuffer *eb, struct i915_vma *vma)
++{
++	/*
++	 * snb/ivb/vlv conflate the "batch in ppgtt" bit with the "non-secure
++	 * batch" bit. Hence we need to pin secure batches into the global gtt.
++	 * hsw should have this fixed, but bdw mucks it up again. */
++	if (eb->batch_flags & I915_DISPATCH_SECURE)
++		return i915_gem_object_ggtt_pin_ww(vma->obj, &eb->ww, NULL, 0, 0, PIN_VALIDATE);
++
++	return NULL;
++}
++
++static int eb_parse(struct i915_execbuffer *eb)
++{
++	struct drm_i915_private *i915 = eb->i915;
++	struct intel_gt_buffer_pool_node *pool = eb->batch_pool;
++	struct i915_vma *shadow, *trampoline, *batch;
++	unsigned long len;
++	int err;
++
++	if (!eb_use_cmdparser(eb)) {
++		batch = eb_dispatch_secure(eb, eb->batches[0]->vma);
++		if (IS_ERR(batch))
++			return PTR_ERR(batch);
++
++		goto secure_batch;
++	}
++
++	if (intel_context_is_parallel(eb->context))
++		return -EINVAL;
++
++	len = eb->batch_len[0];
++	if (!CMDPARSER_USES_GGTT(eb->i915)) {
++		/*
++		 * ppGTT backed shadow buffers must be mapped RO, to prevent
++		 * post-scan tampering
++		 */
++		if (!eb->context->vm->has_read_only) {
++			drm_dbg(&i915->drm,
++				"Cannot prevent post-scan tampering without RO capable vm\n");
++			return -EINVAL;
++		}
++	} else {
++		len += I915_CMD_PARSER_TRAMPOLINE_SIZE;
++	}
++	if (unlikely(len < eb->batch_len[0])) /* last paranoid check of overflow */
++		return -EINVAL;
++
++	if (!pool) {
++		pool = intel_gt_get_buffer_pool(eb->gt, len,
++						I915_MAP_WB);
++		if (IS_ERR(pool))
++			return PTR_ERR(pool);
++		eb->batch_pool = pool;
++	}
++
++	err = i915_gem_object_lock(pool->obj, &eb->ww);
++	if (err)
++		return err;
++
++	shadow = shadow_batch_pin(eb, pool->obj, eb->context->vm, PIN_USER);
++	if (IS_ERR(shadow))
++		return PTR_ERR(shadow);
++
++	intel_gt_buffer_pool_mark_used(pool);
++	i915_gem_object_set_readonly(shadow->obj);
++	shadow->private = pool;
++
++	trampoline = NULL;
++	if (CMDPARSER_USES_GGTT(eb->i915)) {
++		trampoline = shadow;
++
++		shadow = shadow_batch_pin(eb, pool->obj,
++					  &eb->gt->ggtt->vm,
++					  PIN_GLOBAL);
++		if (IS_ERR(shadow))
++			return PTR_ERR(shadow);
++
++		shadow->private = pool;
++
++		eb->batch_flags |= I915_DISPATCH_SECURE;
++	}
++
++	batch = eb_dispatch_secure(eb, shadow);
++	if (IS_ERR(batch))
++		return PTR_ERR(batch);
++
++	err = dma_resv_reserve_fences(shadow->obj->base.resv, 1);
++	if (err)
++		return err;
++
++	err = intel_engine_cmd_parser(eb->context->engine,
++				      eb->batches[0]->vma,
++				      eb->batch_start_offset,
++				      eb->batch_len[0],
++				      shadow, trampoline);
++	if (err)
++		return err;
++
++	eb->batches[0] = &eb->vma[eb->buffer_count++];
++	eb->batches[0]->vma = i915_vma_get(shadow);
++	eb->batches[0]->flags = __EXEC_OBJECT_HAS_PIN;
++
++	eb->trampoline = trampoline;
++	eb->batch_start_offset = 0;
++
++secure_batch:
++	if (batch) {
++		if (intel_context_is_parallel(eb->context))
++			return -EINVAL;
++
++		eb->batches[0] = &eb->vma[eb->buffer_count++];
++		eb->batches[0]->flags = __EXEC_OBJECT_HAS_PIN;
++		eb->batches[0]->vma = i915_vma_get(batch);
++	}
++	return 0;
++}
++
++static int eb_request_submit(struct i915_execbuffer *eb,
++			     struct i915_request *rq,
++			     struct i915_vma *batch,
++			     u64 batch_len)
++{
++	int err;
++
++	if (intel_context_nopreempt(rq->context))
++		__set_bit(I915_FENCE_FLAG_NOPREEMPT, &rq->fence.flags);
++
++	if (eb->args->flags & I915_EXEC_GEN7_SOL_RESET) {
++		err = i915_reset_gen7_sol_offsets(rq);
++		if (err)
++			return err;
++	}
++
++	/*
++	 * After we completed waiting for other engines (using HW semaphores)
++	 * then we can signal that this request/batch is ready to run. This
++	 * allows us to determine if the batch is still waiting on the GPU
++	 * or actually running by checking the breadcrumb.
++	 */
++	if (rq->context->engine->emit_init_breadcrumb) {
++		err = rq->context->engine->emit_init_breadcrumb(rq);
++		if (err)
++			return err;
++	}
++
++	err = rq->context->engine->emit_bb_start(rq,
++						 i915_vma_offset(batch) +
++						 eb->batch_start_offset,
++						 batch_len,
++						 eb->batch_flags);
++	if (err)
++		return err;
++
++	if (eb->trampoline) {
++		GEM_BUG_ON(intel_context_is_parallel(rq->context));
++		GEM_BUG_ON(eb->batch_start_offset);
++		err = rq->context->engine->emit_bb_start(rq,
++							 i915_vma_offset(eb->trampoline) +
++							 batch_len, 0, 0);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static int eb_submit(struct i915_execbuffer *eb)
++{
++	unsigned int i;
++	int err;
++
++	err = eb_move_to_gpu(eb);
++
++	for_each_batch_create_order(eb, i) {
++		if (!eb->requests[i])
++			break;
++
++		trace_i915_request_queue(eb->requests[i], eb->batch_flags);
++		if (!err)
++			err = eb_request_submit(eb, eb->requests[i],
++						eb->batches[i]->vma,
++						eb->batch_len[i]);
++	}
++
++	return err;
++}
++
++/*
++ * Find one BSD ring to dispatch the corresponding BSD command.
++ * The engine index is returned.
++ */
++static unsigned int
++gen8_dispatch_bsd_engine(struct drm_i915_private *i915,
++			 struct drm_file *file)
++{
++	struct drm_i915_file_private *file_priv = file->driver_priv;
++
++	/* Check whether the file_priv has already selected one ring. */
++	if ((int)file_priv->bsd_engine < 0)
++		file_priv->bsd_engine =
++			get_random_u32_below(i915->engine_uabi_class_count[I915_ENGINE_CLASS_VIDEO]);
++
++	return file_priv->bsd_engine;
++}
++
++static const enum intel_engine_id user_ring_map[] = {
++	[I915_EXEC_DEFAULT]	= RCS0,
++	[I915_EXEC_RENDER]	= RCS0,
++	[I915_EXEC_BLT]		= BCS0,
++	[I915_EXEC_BSD]		= VCS0,
++	[I915_EXEC_VEBOX]	= VECS0
++};
++
++static struct i915_request *eb_throttle(struct i915_execbuffer *eb, struct intel_context *ce)
++{
++	struct intel_ring *ring = ce->ring;
++	struct intel_timeline *tl = ce->timeline;
++	struct i915_request *rq;
++
++	/*
++	 * Completely unscientific finger-in-the-air estimates for suitable
++	 * maximum user request size (to avoid blocking) and then backoff.
++	 */
++	if (intel_ring_update_space(ring) >= PAGE_SIZE)
++		return NULL;
++
++	/*
++	 * Find a request that after waiting upon, there will be at least half
++	 * the ring available. The hysteresis allows us to compete for the
++	 * shared ring and should mean that we sleep less often prior to
++	 * claiming our resources, but not so long that the ring completely
++	 * drains before we can submit our next request.
++	 */
++	list_for_each_entry(rq, &tl->requests, link) {
++		if (rq->ring != ring)
++			continue;
++
++		if (__intel_ring_space(rq->postfix,
++				       ring->emit, ring->size) > ring->size / 2)
++			break;
++	}
++	if (&rq->link == &tl->requests)
++		return NULL; /* weird, we will check again later for real */
++
++	return i915_request_get(rq);
++}
++
++static int eb_pin_timeline(struct i915_execbuffer *eb, struct intel_context *ce,
++			   bool throttle)
++{
++	struct intel_timeline *tl;
++	struct i915_request *rq = NULL;
++
++	/*
++	 * Take a local wakeref for preparing to dispatch the execbuf as
++	 * we expect to access the hardware fairly frequently in the
++	 * process, and require the engine to be kept awake between accesses.
++	 * Upon dispatch, we acquire another prolonged wakeref that we hold
++	 * until the timeline is idle, which in turn releases the wakeref
++	 * taken on the engine, and the parent device.
++	 */
++	tl = intel_context_timeline_lock(ce);
++	if (IS_ERR(tl))
++		return PTR_ERR(tl);
++
++	intel_context_enter(ce);
++	if (throttle)
++		rq = eb_throttle(eb, ce);
++	intel_context_timeline_unlock(tl);
++
++	if (rq) {
++		bool nonblock = eb->file->filp->f_flags & O_NONBLOCK;
++		long timeout = nonblock ? 0 : MAX_SCHEDULE_TIMEOUT;
++
++		if (i915_request_wait(rq, I915_WAIT_INTERRUPTIBLE,
++				      timeout) < 0) {
++			i915_request_put(rq);
++
++			/*
++			 * Error path, cannot use intel_context_timeline_lock as
++			 * that is user interruptable and this clean up step
++			 * must be done.
++			 */
++			mutex_lock(&ce->timeline->mutex);
++			intel_context_exit(ce);
++			mutex_unlock(&ce->timeline->mutex);
++
++			if (nonblock)
++				return -EWOULDBLOCK;
++			else
++				return -EINTR;
++		}
++		i915_request_put(rq);
++	}
++
++	return 0;
++}
++
++static int eb_pin_engine(struct i915_execbuffer *eb, bool throttle)
++{
++	struct intel_context *ce = eb->context, *child;
++	int err;
++	int i = 0, j = 0;
++
++	GEM_BUG_ON(eb->args->flags & __EXEC_ENGINE_PINNED);
++
++	if (unlikely(intel_context_is_banned(ce)))
++		return -EIO;
++
++	/*
++	 * Pinning the contexts may generate requests in order to acquire
++	 * GGTT space, so do this first before we reserve a seqno for
++	 * ourselves.
++	 */
++	err = intel_context_pin_ww(ce, &eb->ww);
++	if (err)
++		return err;
++	for_each_child(ce, child) {
++		err = intel_context_pin_ww(child, &eb->ww);
++		GEM_BUG_ON(err);	/* perma-pinned should incr a counter */
++	}
++
++	for_each_child(ce, child) {
++		err = eb_pin_timeline(eb, child, throttle);
++		if (err)
++			goto unwind;
++		++i;
++	}
++	err = eb_pin_timeline(eb, ce, throttle);
++	if (err)
++		goto unwind;
++
++	eb->args->flags |= __EXEC_ENGINE_PINNED;
++	return 0;
++
++unwind:
++	for_each_child(ce, child) {
++		if (j++ < i) {
++			mutex_lock(&child->timeline->mutex);
++			intel_context_exit(child);
++			mutex_unlock(&child->timeline->mutex);
++		}
++	}
++	for_each_child(ce, child)
++		intel_context_unpin(child);
++	intel_context_unpin(ce);
++	return err;
++}
++
++static void eb_unpin_engine(struct i915_execbuffer *eb)
++{
++	struct intel_context *ce = eb->context, *child;
++
++	if (!(eb->args->flags & __EXEC_ENGINE_PINNED))
++		return;
++
++	eb->args->flags &= ~__EXEC_ENGINE_PINNED;
++
++	for_each_child(ce, child) {
++		mutex_lock(&child->timeline->mutex);
++		intel_context_exit(child);
++		mutex_unlock(&child->timeline->mutex);
++
++		intel_context_unpin(child);
++	}
++
++	mutex_lock(&ce->timeline->mutex);
++	intel_context_exit(ce);
++	mutex_unlock(&ce->timeline->mutex);
++
++	intel_context_unpin(ce);
++}
++
++static unsigned int
++eb_select_legacy_ring(struct i915_execbuffer *eb)
++{
++	struct drm_i915_private *i915 = eb->i915;
++	struct drm_i915_gem_execbuffer2 *args = eb->args;
++	unsigned int user_ring_id = args->flags & I915_EXEC_RING_MASK;
++
++	if (user_ring_id != I915_EXEC_BSD &&
++	    (args->flags & I915_EXEC_BSD_MASK)) {
++		drm_dbg(&i915->drm,
++			"execbuf with non bsd ring but with invalid "
++			"bsd dispatch flags: %d\n", (int)(args->flags));
++		return -1;
++	}
++
++	if (user_ring_id == I915_EXEC_BSD &&
++	    i915->engine_uabi_class_count[I915_ENGINE_CLASS_VIDEO] > 1) {
++		unsigned int bsd_idx = args->flags & I915_EXEC_BSD_MASK;
++
++		if (bsd_idx == I915_EXEC_BSD_DEFAULT) {
++			bsd_idx = gen8_dispatch_bsd_engine(i915, eb->file);
++		} else if (bsd_idx >= I915_EXEC_BSD_RING1 &&
++			   bsd_idx <= I915_EXEC_BSD_RING2) {
++			bsd_idx >>= I915_EXEC_BSD_SHIFT;
++			bsd_idx--;
++		} else {
++			drm_dbg(&i915->drm,
++				"execbuf with unknown bsd ring: %u\n",
++				bsd_idx);
++			return -1;
++		}
++
++		return _VCS(bsd_idx);
++	}
++
++	if (user_ring_id >= ARRAY_SIZE(user_ring_map)) {
++		drm_dbg(&i915->drm, "execbuf with unknown ring: %u\n",
++			user_ring_id);
++		return -1;
++	}
++
++	return user_ring_map[user_ring_id];
++}
++
++static int
++eb_select_engine(struct i915_execbuffer *eb)
++{
++	struct intel_context *ce, *child;
++	struct intel_gt *gt;
++	unsigned int idx;
++	int err;
++
++	if (i915_gem_context_user_engines(eb->gem_context))
++		idx = eb->args->flags & I915_EXEC_RING_MASK;
++	else
++		idx = eb_select_legacy_ring(eb);
++
++	ce = i915_gem_context_get_engine(eb->gem_context, idx);
++	if (IS_ERR(ce))
++		return PTR_ERR(ce);
++
++	if (intel_context_is_parallel(ce)) {
++		if (eb->buffer_count < ce->parallel.number_children + 1) {
++			intel_context_put(ce);
++			return -EINVAL;
++		}
++		if (eb->batch_start_offset || eb->args->batch_len) {
++			intel_context_put(ce);
++			return -EINVAL;
++		}
++	}
++	eb->num_batches = ce->parallel.number_children + 1;
++	gt = ce->engine->gt;
++
++	for_each_child(ce, child)
++		intel_context_get(child);
++	eb->wakeref = intel_gt_pm_get(ce->engine->gt);
++	/*
++	 * Keep GT0 active on MTL so that i915_vma_parked() doesn't
++	 * free VMAs while execbuf ioctl is validating VMAs.
++	 */
++	if (gt->info.id)
++		eb->wakeref_gt0 = intel_gt_pm_get(to_gt(gt->i915));
++
++	if (!test_bit(CONTEXT_ALLOC_BIT, &ce->flags)) {
++		err = intel_context_alloc_state(ce);
++		if (err)
++			goto err;
++	}
++	for_each_child(ce, child) {
++		if (!test_bit(CONTEXT_ALLOC_BIT, &child->flags)) {
++			err = intel_context_alloc_state(child);
++			if (err)
++				goto err;
++		}
++	}
++
++	/*
++	 * ABI: Before userspace accesses the GPU (e.g. execbuffer), report
++	 * EIO if the GPU is already wedged.
++	 */
++	err = intel_gt_terminally_wedged(ce->engine->gt);
++	if (err)
++		goto err;
++
++	if (!i915_vm_tryget(ce->vm)) {
++		err = -ENOENT;
++		goto err;
++	}
++
++	eb->context = ce;
++	eb->gt = ce->engine->gt;
++
++	/*
++	 * Make sure engine pool stays alive even if we call intel_context_put
++	 * during ww handling. The pool is destroyed when last pm reference
++	 * is dropped, which breaks our -EDEADLK handling.
++	 */
++	return err;
++
++err:
++	if (gt->info.id)
++		intel_gt_pm_put(to_gt(gt->i915), eb->wakeref_gt0);
++
++	intel_gt_pm_put(ce->engine->gt, eb->wakeref);
++	for_each_child(ce, child)
++		intel_context_put(child);
++	intel_context_put(ce);
++	return err;
++}
++
++static void
++eb_put_engine(struct i915_execbuffer *eb)
++{
++	struct intel_context *child;
++
++	i915_vm_put(eb->context->vm);
++	/*
++	 * This works in conjunction with eb_select_engine() to prevent
++	 * i915_vma_parked() from interfering while execbuf validates vmas.
++	 */
++	if (eb->gt->info.id)
++		intel_gt_pm_put(to_gt(eb->gt->i915), eb->wakeref_gt0);
++	intel_gt_pm_put(eb->context->engine->gt, eb->wakeref);
++	for_each_child(eb->context, child)
++		intel_context_put(child);
++	intel_context_put(eb->context);
++}
++
++static void
++__free_fence_array(struct eb_fence *fences, unsigned int n)
++{
++	while (n--) {
++		drm_syncobj_put(ptr_mask_bits(fences[n].syncobj, 2));
++		dma_fence_put(fences[n].dma_fence);
++		dma_fence_chain_free(fences[n].chain_fence);
++	}
++	kvfree(fences);
++}
++
++static int
++add_timeline_fence_array(struct i915_execbuffer *eb,
++			 const struct drm_i915_gem_execbuffer_ext_timeline_fences *timeline_fences)
++{
++	struct drm_i915_gem_exec_fence __user *user_fences;
++	u64 __user *user_values;
++	struct eb_fence *f;
++	u64 nfences;
++	int err = 0;
++
++	nfences = timeline_fences->fence_count;
++	if (!nfences)
++		return 0;
++
++	/* Check multiplication overflow for access_ok() and kvmalloc_array() */
++	BUILD_BUG_ON(sizeof(size_t) > sizeof(unsigned long));
++	if (nfences > min_t(unsigned long,
++			    ULONG_MAX / sizeof(*user_fences),
++			    SIZE_MAX / sizeof(*f)) - eb->num_fences)
++		return -EINVAL;
++
++	user_fences = u64_to_user_ptr(timeline_fences->handles_ptr);
++	if (!access_ok(user_fences, nfences * sizeof(*user_fences)))
++		return -EFAULT;
++
++	user_values = u64_to_user_ptr(timeline_fences->values_ptr);
++	if (!access_ok(user_values, nfences * sizeof(*user_values)))
++		return -EFAULT;
++
++	f = krealloc(eb->fences,
++		     (eb->num_fences + nfences) * sizeof(*f),
++		     __GFP_NOWARN | GFP_KERNEL);
++	if (!f)
++		return -ENOMEM;
++
++	eb->fences = f;
++	f += eb->num_fences;
++
++	BUILD_BUG_ON(~(ARCH_KMALLOC_MINALIGN - 1) &
++		     ~__I915_EXEC_FENCE_UNKNOWN_FLAGS);
++
++	while (nfences--) {
++		struct drm_i915_gem_exec_fence user_fence;
++		struct drm_syncobj *syncobj;
++		struct dma_fence *fence = NULL;
++		u64 point;
++
++		if (__copy_from_user(&user_fence,
++				     user_fences++,
++				     sizeof(user_fence)))
++			return -EFAULT;
++
++		if (user_fence.flags & __I915_EXEC_FENCE_UNKNOWN_FLAGS)
++			return -EINVAL;
++
++		if (__get_user(point, user_values++))
++			return -EFAULT;
++
++		syncobj = drm_syncobj_find(eb->file, user_fence.handle);
++		if (!syncobj) {
++			drm_dbg(&eb->i915->drm,
++				"Invalid syncobj handle provided\n");
++			return -ENOENT;
++		}
++
++		fence = drm_syncobj_fence_get(syncobj);
++
++		if (!fence && user_fence.flags &&
++		    !(user_fence.flags & I915_EXEC_FENCE_SIGNAL)) {
++			drm_dbg(&eb->i915->drm,
++				"Syncobj handle has no fence\n");
++			drm_syncobj_put(syncobj);
++			return -EINVAL;
++		}
++
++		if (fence)
++			err = dma_fence_chain_find_seqno(&fence, point);
++
++		if (err && !(user_fence.flags & I915_EXEC_FENCE_SIGNAL)) {
++			drm_dbg(&eb->i915->drm,
++				"Syncobj handle missing requested point %llu\n",
++				point);
++			dma_fence_put(fence);
++			drm_syncobj_put(syncobj);
++			return err;
++		}
++
++		/*
++		 * A point might have been signaled already and
++		 * garbage collected from the timeline. In this case
++		 * just ignore the point and carry on.
++		 */
++		if (!fence && !(user_fence.flags & I915_EXEC_FENCE_SIGNAL)) {
++			drm_syncobj_put(syncobj);
++			continue;
++		}
++
++		/*
++		 * For timeline syncobjs we need to preallocate chains for
++		 * later signaling.
++		 */
++		if (point != 0 && user_fence.flags & I915_EXEC_FENCE_SIGNAL) {
++			/*
++			 * Waiting and signaling the same point (when point !=
++			 * 0) would break the timeline.
++			 */
++			if (user_fence.flags & I915_EXEC_FENCE_WAIT) {
++				drm_dbg(&eb->i915->drm,
++					"Trying to wait & signal the same timeline point.\n");
++				dma_fence_put(fence);
++				drm_syncobj_put(syncobj);
++				return -EINVAL;
++			}
++
++			f->chain_fence = dma_fence_chain_alloc();
++			if (!f->chain_fence) {
++				drm_syncobj_put(syncobj);
++				dma_fence_put(fence);
++				return -ENOMEM;
++			}
++		} else {
++			f->chain_fence = NULL;
++		}
++
++		f->syncobj = ptr_pack_bits(syncobj, user_fence.flags, 2);
++		f->dma_fence = fence;
++		f->value = point;
++		f++;
++		eb->num_fences++;
++	}
++
++	return 0;
++}
++
++static int add_fence_array(struct i915_execbuffer *eb)
++{
++	struct drm_i915_gem_execbuffer2 *args = eb->args;
++	struct drm_i915_gem_exec_fence __user *user;
++	unsigned long num_fences = args->num_cliprects;
++	struct eb_fence *f;
++
++	if (!(args->flags & I915_EXEC_FENCE_ARRAY))
++		return 0;
++
++	if (!num_fences)
++		return 0;
++
++	/* Check multiplication overflow for access_ok() and kvmalloc_array() */
++	BUILD_BUG_ON(sizeof(size_t) > sizeof(unsigned long));
++	if (num_fences > min_t(unsigned long,
++			       ULONG_MAX / sizeof(*user),
++			       SIZE_MAX / sizeof(*f) - eb->num_fences))
++		return -EINVAL;
++
++	user = u64_to_user_ptr(args->cliprects_ptr);
++	if (!access_ok(user, num_fences * sizeof(*user)))
++		return -EFAULT;
++
++	f = krealloc(eb->fences,
++		     (eb->num_fences + num_fences) * sizeof(*f),
++		     __GFP_NOWARN | GFP_KERNEL);
++	if (!f)
++		return -ENOMEM;
++
++	eb->fences = f;
++	f += eb->num_fences;
++	while (num_fences--) {
++		struct drm_i915_gem_exec_fence user_fence;
++		struct drm_syncobj *syncobj;
++		struct dma_fence *fence = NULL;
++
++		if (__copy_from_user(&user_fence, user++, sizeof(user_fence)))
++			return -EFAULT;
++
++		if (user_fence.flags & __I915_EXEC_FENCE_UNKNOWN_FLAGS)
++			return -EINVAL;
++
++		syncobj = drm_syncobj_find(eb->file, user_fence.handle);
++		if (!syncobj) {
++			drm_dbg(&eb->i915->drm,
++				"Invalid syncobj handle provided\n");
++			return -ENOENT;
++		}
++
++		if (user_fence.flags & I915_EXEC_FENCE_WAIT) {
++			fence = drm_syncobj_fence_get(syncobj);
++			if (!fence) {
++				drm_dbg(&eb->i915->drm,
++					"Syncobj handle has no fence\n");
++				drm_syncobj_put(syncobj);
++				return -EINVAL;
++			}
++		}
++
++		BUILD_BUG_ON(~(ARCH_KMALLOC_MINALIGN - 1) &
++			     ~__I915_EXEC_FENCE_UNKNOWN_FLAGS);
++
++		f->syncobj = ptr_pack_bits(syncobj, user_fence.flags, 2);
++		f->dma_fence = fence;
++		f->value = 0;
++		f->chain_fence = NULL;
++		f++;
++		eb->num_fences++;
++	}
++
++	return 0;
++}
++
++static void put_fence_array(struct eb_fence *fences, int num_fences)
++{
++	if (fences)
++		__free_fence_array(fences, num_fences);
++}
++
++static int
++await_fence_array(struct i915_execbuffer *eb,
++		  struct i915_request *rq)
++{
++	unsigned int n;
++	int err;
++
++	for (n = 0; n < eb->num_fences; n++) {
++		if (!eb->fences[n].dma_fence)
++			continue;
++
++		err = i915_request_await_dma_fence(rq, eb->fences[n].dma_fence);
++		if (err < 0)
++			return err;
++	}
++
++	return 0;
++}
++
++static void signal_fence_array(const struct i915_execbuffer *eb,
++			       struct dma_fence * const fence)
++{
++	unsigned int n;
++
++	for (n = 0; n < eb->num_fences; n++) {
++		struct drm_syncobj *syncobj;
++		unsigned int flags;
++
++		syncobj = ptr_unpack_bits(eb->fences[n].syncobj, &flags, 2);
++		if (!(flags & I915_EXEC_FENCE_SIGNAL))
++			continue;
++
++		if (eb->fences[n].chain_fence) {
++			drm_syncobj_add_point(syncobj,
++					      eb->fences[n].chain_fence,
++					      fence,
++					      eb->fences[n].value);
++			/*
++			 * The chain's ownership is transferred to the
++			 * timeline.
++			 */
++			eb->fences[n].chain_fence = NULL;
++		} else {
++			drm_syncobj_replace_fence(syncobj, fence);
++		}
++	}
++}
++
++static int
++parse_timeline_fences(struct i915_user_extension __user *ext, void *data)
++{
++	struct i915_execbuffer *eb = data;
++	struct drm_i915_gem_execbuffer_ext_timeline_fences timeline_fences;
++
++	if (copy_from_user(&timeline_fences, ext, sizeof(timeline_fences)))
++		return -EFAULT;
++
++	return add_timeline_fence_array(eb, &timeline_fences);
++}
++
++static void retire_requests(struct intel_timeline *tl, struct i915_request *end)
++{
++	struct i915_request *rq, *rn;
++
++	list_for_each_entry_safe(rq, rn, &tl->requests, link)
++		if (rq == end || !i915_request_retire(rq))
++			break;
++}
++
++static int eb_request_add(struct i915_execbuffer *eb, struct i915_request *rq,
++			  int err, bool last_parallel)
++{
++	struct intel_timeline * const tl = i915_request_timeline(rq);
++	struct i915_sched_attr attr = {};
++	struct i915_request *prev;
++
++	lockdep_assert_held(&tl->mutex);
++	lockdep_unpin_lock(&tl->mutex, rq->cookie);
++
++	trace_i915_request_add(rq);
++
++	xg_rq_track(rq, likely(!intel_context_is_closed(eb->context)) ? eb->gem_context->sched.priority : 0);
++	prev = __i915_request_commit(rq);
++
++	/* Check that the context wasn't destroyed before submission */
++	if (likely(!intel_context_is_closed(eb->context))) {
++		attr = eb->gem_context->sched;
++	} else {
++		/* Serialise with context_close via the add_to_timeline */
++		i915_request_set_error_once(rq, -ENOENT);
++		__i915_request_skip(rq);
++		err = -ENOENT; /* override any transient errors */
++	}
++
++	if (intel_context_is_parallel(eb->context)) {
++		if (err) {
++			__i915_request_skip(rq);
++			set_bit(I915_FENCE_FLAG_SKIP_PARALLEL,
++				&rq->fence.flags);
++		}
++		if (last_parallel)
++			set_bit(I915_FENCE_FLAG_SUBMIT_PARALLEL,
++				&rq->fence.flags);
++	}
++
++	__i915_request_queue(rq, &attr);
++
++	/* Try to clean up the client's timeline after submitting the request */
++	if (prev)
++		retire_requests(tl, prev);
++
++	mutex_unlock(&tl->mutex);
++
++	return err;
++}
++
++static int eb_requests_add(struct i915_execbuffer *eb, int err)
++{
++	int i;
++
++	/*
++	 * We iterate in reverse order of creation to release timeline mutexes in
++	 * same order.
++	 */
++	for_each_batch_add_order(eb, i) {
++		struct i915_request *rq = eb->requests[i];
++
++		if (!rq)
++			continue;
++		err |= eb_request_add(eb, rq, err, i == 0);
++	}
++
++	return err;
++}
++
++static const i915_user_extension_fn execbuf_extensions[] = {
++	[DRM_I915_GEM_EXECBUFFER_EXT_TIMELINE_FENCES] = parse_timeline_fences,
++};
++
++static int
++parse_execbuf2_extensions(struct drm_i915_gem_execbuffer2 *args,
++			  struct i915_execbuffer *eb)
++{
++	if (!(args->flags & I915_EXEC_USE_EXTENSIONS))
++		return 0;
++
++	/* The execbuf2 extension mechanism reuses cliprects_ptr. So we cannot
++	 * have another flag also using it at the same time.
++	 */
++	if (eb->args->flags & I915_EXEC_FENCE_ARRAY)
++		return -EINVAL;
++
++	if (args->num_cliprects != 0)
++		return -EINVAL;
++
++	return i915_user_extensions(u64_to_user_ptr(args->cliprects_ptr),
++				    execbuf_extensions,
++				    ARRAY_SIZE(execbuf_extensions),
++				    eb);
++}
++
++static void eb_requests_get(struct i915_execbuffer *eb)
++{
++	unsigned int i;
++
++	for_each_batch_create_order(eb, i) {
++		if (!eb->requests[i])
++			break;
++
++		i915_request_get(eb->requests[i]);
++	}
++}
++
++static void eb_requests_put(struct i915_execbuffer *eb)
++{
++	unsigned int i;
++
++	for_each_batch_create_order(eb, i) {
++		if (!eb->requests[i])
++			break;
++
++		i915_request_put(eb->requests[i]);
++	}
++}
++
++static struct sync_file *
++eb_composite_fence_create(struct i915_execbuffer *eb, int out_fence_fd)
++{
++	struct sync_file *out_fence = NULL;
++	struct dma_fence_array *fence_array;
++	struct dma_fence **fences;
++	unsigned int i;
++
++	GEM_BUG_ON(!intel_context_is_parent(eb->context));
++
++	fences = kmalloc_array(eb->num_batches, sizeof(*fences), GFP_KERNEL);
++	if (!fences)
++		return ERR_PTR(-ENOMEM);
++
++	for_each_batch_create_order(eb, i) {
++		fences[i] = &eb->requests[i]->fence;
++		__set_bit(I915_FENCE_FLAG_COMPOSITE,
++			  &eb->requests[i]->fence.flags);
++	}
++
++	fence_array = dma_fence_array_create(eb->num_batches,
++					     fences,
++					     eb->context->parallel.fence_context,
++					     eb->context->parallel.seqno++,
++					     false);
++	if (!fence_array) {
++		kfree(fences);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	/* Move ownership to the dma_fence_array created above */
++	for_each_batch_create_order(eb, i)
++		dma_fence_get(fences[i]);
++
++	if (out_fence_fd != -1) {
++		out_fence = sync_file_create(&fence_array->base);
++		/* sync_file now owns fence_arry, drop creation ref */
++		dma_fence_put(&fence_array->base);
++		if (!out_fence)
++			return ERR_PTR(-ENOMEM);
++	}
++
++	eb->composite_fence = &fence_array->base;
++
++	return out_fence;
++}
++
++static struct sync_file *
++eb_fences_add(struct i915_execbuffer *eb, struct i915_request *rq,
++	      struct dma_fence *in_fence, int out_fence_fd)
++{
++	struct sync_file *out_fence = NULL;
++	int err;
++
++	if (unlikely(eb->gem_context->syncobj)) {
++		struct dma_fence *fence;
++
++		fence = drm_syncobj_fence_get(eb->gem_context->syncobj);
++		err = i915_request_await_dma_fence(rq, fence);
++		dma_fence_put(fence);
++		if (err)
++			return ERR_PTR(err);
++	}
++
++	if (in_fence) {
++		if (eb->args->flags & I915_EXEC_FENCE_SUBMIT)
++			err = i915_request_await_execution(rq, in_fence);
++		else
++			err = i915_request_await_dma_fence(rq, in_fence);
++		if (err < 0)
++			return ERR_PTR(err);
++	}
++
++	if (eb->fences) {
++		err = await_fence_array(eb, rq);
++		if (err)
++			return ERR_PTR(err);
++	}
++
++	if (intel_context_is_parallel(eb->context)) {
++		out_fence = eb_composite_fence_create(eb, out_fence_fd);
++		if (IS_ERR(out_fence))
++			return ERR_PTR(-ENOMEM);
++	} else if (out_fence_fd != -1) {
++		out_fence = sync_file_create(&rq->fence);
++		if (!out_fence)
++			return ERR_PTR(-ENOMEM);
++	}
++
++	return out_fence;
++}
++
++static struct intel_context *
++eb_find_context(struct i915_execbuffer *eb, unsigned int context_number)
++{
++	struct intel_context *child;
++
++	if (likely(context_number == 0))
++		return eb->context;
++
++	for_each_child(eb->context, child)
++		if (!--context_number)
++			return child;
++
++	GEM_BUG_ON("Context not found");
++
++	return NULL;
++}
++
++static struct sync_file *
++eb_requests_create(struct i915_execbuffer *eb, struct dma_fence *in_fence,
++		   int out_fence_fd)
++{
++	struct sync_file *out_fence = NULL;
++	unsigned int i;
++
++	for_each_batch_create_order(eb, i) {
++		/* Allocate a request for this batch buffer nice and early. */
++		eb->requests[i] = i915_request_create(eb_find_context(eb, i));
++		if (IS_ERR(eb->requests[i])) {
++			out_fence = ERR_CAST(eb->requests[i]);
++			eb->requests[i] = NULL;
++			return out_fence;
++		}
++
++		/*
++		 * Only the first request added (committed to backend) has to
++		 * take the in fences into account as all subsequent requests
++		 * will have fences inserted inbetween them.
++		 */
++		if (i + 1 == eb->num_batches) {
++			out_fence = eb_fences_add(eb, eb->requests[i],
++						  in_fence, out_fence_fd);
++			if (IS_ERR(out_fence))
++				return out_fence;
++		}
++
++		/*
++		 * Not really on stack, but we don't want to call
++		 * kfree on the batch_snapshot when we put it, so use the
++		 * _onstack interface.
++		 */
++		if (eb->batches[i]->vma)
++			eb->requests[i]->batch_res =
++				i915_vma_resource_get(eb->batches[i]->vma->resource);
++		if (eb->batch_pool) {
++			GEM_BUG_ON(intel_context_is_parallel(eb->context));
++			intel_gt_buffer_pool_mark_active(eb->batch_pool,
++							 eb->requests[i]);
++		}
++	}
++
++	return out_fence;
++}
++
++static int
++i915_gem_do_execbuffer(struct drm_device *dev,
++		       struct drm_file *file,
++		       struct drm_i915_gem_execbuffer2 *args,
++		       struct drm_i915_gem_exec_object2 *exec)
++{
++	struct drm_i915_private *i915 = to_i915(dev);
++	struct i915_execbuffer eb;
++	struct dma_fence *in_fence = NULL;
++	struct sync_file *out_fence = NULL;
++	int out_fence_fd = -1;
++	int err;
++	const u64 xg_t0 = xg_eb_t();
++	u64 xg_t = xg_t0;
++
++	BUILD_BUG_ON(__EXEC_INTERNAL_FLAGS & ~__I915_EXEC_ILLEGAL_FLAGS);
++	BUILD_BUG_ON(__EXEC_OBJECT_INTERNAL_FLAGS &
++		     ~__EXEC_OBJECT_UNKNOWN_FLAGS);
++
++	eb.i915 = i915;
++	eb.file = file;
++	eb.args = args;
++	if (DBG_FORCE_RELOC || !(args->flags & I915_EXEC_NO_RELOC))
++		args->flags |= __EXEC_HAS_RELOC;
++
++	eb.exec = exec;
++	eb.vma = (struct eb_vma *)(exec + args->buffer_count + 1);
++	eb.vma[0].vma = NULL;
++	eb.batch_pool = NULL;
++
++	eb.invalid_flags = __EXEC_OBJECT_UNKNOWN_FLAGS;
++	reloc_cache_init(&eb.reloc_cache, eb.i915);
++
++	eb.buffer_count = args->buffer_count;
++	eb.batch_start_offset = args->batch_start_offset;
++	eb.trampoline = NULL;
++
++	eb.fences = NULL;
++	eb.num_fences = 0;
++
++	eb_capture_list_clear(&eb);
++
++	memset(eb.requests, 0, sizeof(struct i915_request *) *
++	       ARRAY_SIZE(eb.requests));
++	eb.composite_fence = NULL;
++
++	eb.batch_flags = 0;
++	if (args->flags & I915_EXEC_SECURE) {
++		if (GRAPHICS_VER(i915) >= 11)
++			return -ENODEV;
++
++		/* Return -EPERM to trigger fallback code on old binaries. */
++		if (!HAS_SECURE_BATCHES(i915))
++			return -EPERM;
++
++		if (!drm_is_current_master(file) || !capable(CAP_SYS_ADMIN))
++			return -EPERM;
++
++		eb.batch_flags |= I915_DISPATCH_SECURE;
++	}
++	if (args->flags & I915_EXEC_IS_PINNED)
++		eb.batch_flags |= I915_DISPATCH_PINNED;
++
++	err = parse_execbuf2_extensions(args, &eb);
++	if (err)
++		goto err_ext;
++
++	err = add_fence_array(&eb);
++	if (err)
++		goto err_ext;
++
++#define IN_FENCES (I915_EXEC_FENCE_IN | I915_EXEC_FENCE_SUBMIT)
++	if (args->flags & IN_FENCES) {
++		if ((args->flags & IN_FENCES) == IN_FENCES)
++			return -EINVAL;
++
++		in_fence = sync_file_get_fence(lower_32_bits(args->rsvd2));
++		if (!in_fence) {
++			err = -EINVAL;
++			goto err_ext;
++		}
++	}
++#undef IN_FENCES
++
++	if (args->flags & I915_EXEC_FENCE_OUT) {
++		out_fence_fd = get_unused_fd_flags(O_CLOEXEC);
++		if (out_fence_fd < 0) {
++			err = out_fence_fd;
++			goto err_in_fence;
++		}
++	}
++
++	xg_eb_note(XG_EB_EXT, xg_t);
++	xg_t = xg_eb_t();
++	atomic64_add(args->buffer_count, &xg_eb_bufs);
++	if (args->buffer_count > READ_ONCE(xg_eb_bufs_max))
++		WRITE_ONCE(xg_eb_bufs_max, args->buffer_count);
++	err = eb_create(&eb);
++	if (err)
++		goto err_out_fence;
++
++	GEM_BUG_ON(!eb.lut_size);
++
++	err = eb_select_context(&eb);
++	if (unlikely(err))
++		goto err_destroy;
++
++	err = eb_select_engine(&eb);
++	if (unlikely(err))
++		goto err_context;
++
++	xg_eb_note(XG_EB_SETUP, xg_t);
++	xg_t = xg_eb_t();
++	err = eb_lookup_vmas(&eb);
++	xg_eb_note(XG_EB_LOOKUP, xg_t);
++	if (err) {
++		eb_release_vmas(&eb, true);
++		goto err_engine;
++	}
++
++	i915_gem_ww_ctx_init(&eb.ww, true);
++
++	err = eb_relocate_parse(&eb);
++	if (err) {
++		/*
++		 * If the user expects the execobject.offset and
++		 * reloc.presumed_offset to be an exact match,
++		 * as for using NO_RELOC, then we cannot update
++		 * the execobject.offset until we have completed
++		 * relocation.
++		 */
++		args->flags &= ~__EXEC_HAS_RELOC;
++		goto err_vma;
++	}
++
++	ww_acquire_done(&eb.ww.ctx);
++	xg_t = xg_eb_t();
++	err = eb_capture_stage(&eb);
++	if (err)
++		goto err_vma;
++
++	out_fence = eb_requests_create(&eb, in_fence, out_fence_fd);
++	if (IS_ERR(out_fence)) {
++		err = PTR_ERR(out_fence);
++		out_fence = NULL;
++		if (eb.requests[0])
++			goto err_request;
++		else
++			goto err_vma;
++	}
++
++	xg_eb_note(XG_EB_REQ_CREATE, xg_t);
++	xg_t = xg_eb_t();
++	err = eb_submit(&eb);
++	xg_eb_note(XG_EB_SUBMIT, xg_t);
++	xg_t = xg_eb_t();
++
++err_request:
++	eb_requests_get(&eb);
++	err = eb_requests_add(&eb, err);
++
++	if (eb.fences)
++		signal_fence_array(&eb, eb.composite_fence ?
++				   eb.composite_fence :
++				   &eb.requests[0]->fence);
++
++	if (unlikely(eb.gem_context->syncobj)) {
++		drm_syncobj_replace_fence(eb.gem_context->syncobj,
++					  eb.composite_fence ?
++					  eb.composite_fence :
++					  &eb.requests[0]->fence);
++	}
++
++	if (out_fence) {
++		if (err == 0) {
++			fd_install(out_fence_fd, out_fence->file);
++			args->rsvd2 &= GENMASK_ULL(31, 0); /* keep in-fence */
++			args->rsvd2 |= (u64)out_fence_fd << 32;
++			out_fence_fd = -1;
++		} else {
++			fput(out_fence->file);
++		}
++	}
++
++	if (!out_fence && eb.composite_fence)
++		dma_fence_put(eb.composite_fence);
++
++	eb_requests_put(&eb);
++	xg_eb_note(XG_EB_REQ_ADD, xg_t);
++	xg_t = xg_eb_t();
++
++err_vma:
++	eb_release_vmas(&eb, true);
++	WARN_ON(err == -EDEADLK);
++	i915_gem_ww_ctx_fini(&eb.ww);
++
++	if (eb.batch_pool)
++		intel_gt_buffer_pool_put(eb.batch_pool);
++err_engine:
++	eb_put_engine(&eb);
++err_context:
++	i915_gem_context_put(eb.gem_context);
++err_destroy:
++	eb_destroy(&eb);
++err_out_fence:
++	if (out_fence_fd != -1)
++		put_unused_fd(out_fence_fd);
++err_in_fence:
++	dma_fence_put(in_fence);
++err_ext:
++	put_fence_array(eb.fences, eb.num_fences);
++	xg_eb_note(XG_EB_RELEASE, xg_t);
++	xg_eb_note(XG_EB_DO, xg_t0);
++	return err;
++}
++
++static size_t eb_element_size(void)
++{
++	return sizeof(struct drm_i915_gem_exec_object2) + sizeof(struct eb_vma);
++}
++
++static bool check_buffer_count(size_t count)
++{
++	const size_t sz = eb_element_size();
++
++	/*
++	 * When using LUT_HANDLE, we impose a limit of INT_MAX for the lookup
++	 * array size (see eb_create()). Otherwise, we can accept an array as
++	 * large as can be addressed (though use large arrays at your peril)!
++	 */
++
++	return !(count < 1 || count > INT_MAX || count > SIZE_MAX / sz - 1);
++}
++
++int
++i915_gem_execbuffer2_ioctl(struct drm_device *dev, void *data,
++			   struct drm_file *file)
++{
++	struct drm_i915_private *i915 = to_i915(dev);
++	struct drm_i915_gem_execbuffer2 *args = data;
++	struct drm_i915_gem_exec_object2 *exec2_list;
++	const size_t count = args->buffer_count;
++	const u64 xg_t0 = xg_eb_t();
++	int err;
++
++	if (!check_buffer_count(count)) {
++		drm_dbg(&i915->drm, "execbuf2 with %zd buffers\n", count);
++		return -EINVAL;
++	}
++
++	err = i915_gem_check_execbuffer(i915, args);
++	if (err)
++		return err;
++
++	/* Allocate extra slots for use by the command parser */
++	exec2_list = kvmalloc_array(count + 2, eb_element_size(),
++				    __GFP_NOWARN | GFP_KERNEL);
++	if (exec2_list == NULL) {
++		drm_dbg(&i915->drm, "Failed to allocate exec list for %zd buffers\n",
++			count);
++		return -ENOMEM;
++	}
++	if (copy_from_user(exec2_list,
++			   u64_to_user_ptr(args->buffers_ptr),
++			   sizeof(*exec2_list) * count)) {
++		drm_dbg(&i915->drm, "copy %zd exec entries failed\n", count);
++		kvfree(exec2_list);
++		return -EFAULT;
++	}
++
++	err = i915_gem_do_execbuffer(dev, file, args, exec2_list);
++
++	/*
++	 * Now that we have begun execution of the batchbuffer, we ignore
++	 * any new error after this point. Also given that we have already
++	 * updated the associated relocations, we try to write out the current
++	 * object locations irrespective of any error.
++	 */
++	if (args->flags & __EXEC_HAS_RELOC) {
++		struct drm_i915_gem_exec_object2 __user *user_exec_list =
++			u64_to_user_ptr(args->buffers_ptr);
++		unsigned int i;
++
++		/* Copy the new buffer offsets back to the user's exec list. */
++		/*
++		 * Note: count * sizeof(*user_exec_list) does not overflow,
++		 * because we checked 'count' in check_buffer_count().
++		 *
++		 * And this range already got effectively checked earlier
++		 * when we did the "copy_from_user()" above.
++		 */
++		if (!user_write_access_begin(user_exec_list,
++					     count * sizeof(*user_exec_list)))
++			goto end;
++
++		for (i = 0; i < args->buffer_count; i++) {
++			if (!(exec2_list[i].offset & UPDATE))
++				continue;
++
++			exec2_list[i].offset =
++				gen8_canonical_addr(exec2_list[i].offset & PIN_OFFSET_MASK);
++			unsafe_put_user(exec2_list[i].offset,
++					&user_exec_list[i].offset,
++					end_user);
++		}
++end_user:
++		user_write_access_end();
++end:;
++	}
++
++	args->flags &= ~__I915_EXEC_UNKNOWN_FLAGS;
++	kvfree(exec2_list);
++	xg_eb_note(XG_EB_IOCTL, xg_t0);
++	return err;
++}
