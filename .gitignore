@@ -21,8 +21,9 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Logs and trial artefacts
+# Logs and trial artefacts (the published measurement logs under logs/ are kept)
 *.log
+!/logs/**/*.log
 *.jsonl
 *.sample.txt
 soak-*/

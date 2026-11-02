@@ -1,0 +1,243 @@
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: ptpso: vs c479601a fs 394291c7 | 
+pid 6434 NVMTL: ptpso: vs c479601a fs 394291c7 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 44d03494 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs a19031ed | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs 0379daf3 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 6cd711ad | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs c8f53aed | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs 3a6115d8 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs c8ba9c29 | 
+pid 6434 NVMTL: ptpso: vs 80d9141d fs c3b27b9e | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 1300993a | 
+pid 6434 NVMTL: ptpso: vs 80d9141d fs 63cf3004 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 26c60b3a | 
+pid 6434 NVMTL: vk: host imports so far: 1758 (28620 MB, 853 of them >= 1 MB); surface cache 19325 hits, 1107 imports, 1074 freed, 0 uncached; misses on a cached ID with another size 0; 23 entries in use; last miss id 58
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 31a1191d | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 38c06f49 | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs ce9f888f | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 0b5dadc6 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 855b6eaa | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs c8ba9c29 | 
+pid 6434 NVMTL: ptpso: vs 80d9141d fs dbf332ca | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 0b329fdd | 
+pid 6434 NVMTL: ptpso: vs 80d9141d fs bccf88ab | 
+pid 6434 NVMTL: ptpso: vs 7c42564c fs e8e1b8c7 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs ad672086 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 4af63692 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 908711aa | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 0b329fdd | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 2bee134a | 
+pid 6434 NVMTL: ptpso: vs ea0f75bc fs f1c2052c | 
+pid 6434 NVMTL: ptpso: vs ea0f75bc fs bc904a2a | 
+pid 6434 NVMTL: ptpso: vs c479601a fs 59cf4476 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 324643ec | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs 9599e558 | 
+pid 6434 NVMTL: newTextureWithDescriptor:iosurface:0x6000019a04c0 plane:0 -> 0x7fcbfa74d5e0 (360x360 fmt 80)   [logged 20480 times now]
+pid 6434 NVMTL: surface 62 360x360 pitch 1536 -> an image in the surface's own pages (no copies)   [logged 20480 times now]
+pid 6434 NVMTL: ptpso: vs 80d9141d fs 7c486f03 | 
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs c4d515d4 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs b5bd662d | 
+pid 6434 NVMTL: ptpso: vs e56152b2 fs 3ae77b68 | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs cf8ae76a | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 9633bbc3 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 9633bbc3 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 7a8e0346 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs c985876a | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 9633bbc3 | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs 3a076de8 | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs 3fedc7b5 | 
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 1d95a51e | 
+pid 6434 NVMTL: ptpso: vs 7c42564c fs 9f5c2e30 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 15b51e1c | 
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: host imports so far: 1809 (29923 MB, 891 of them >= 1 MB); surface cache 19580 hits, 1152 imports, 1119 freed, 0 uncached; misses on a cached ID with another size 0; 19 entries in use; last miss id 42
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 57 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 57 3840x2340 drawn into a private copy (7 surfaces)
+pid 6434 NVMTL: ptpso: vs 189eda9f fs 067517e0 | 
+pid 6434 NVMTL: page-off: surface 57: the accelerator took no current mark -- copied out now
+pid 6434 NVMTL: G13 surface-out #4: 3840x2340 surface 0x600001961560 seed 1, 31.60 ms
+pid 6434 NVMTL: page-off: surface 57: private copy gone after 0.18 s, never drawn -- no more copies for it
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 7acb213e | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 15b51e1c | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 0e13bc2e | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs d233d240 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs ee2841db | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs d233d240 | 
+pid 6434 NVMTL: ptpso: vs fd6069c9 fs 02f6220e | 
+pid 6434 NVMTL: ptpso: vs 491ee443 fs 49b8eb34 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs c4d515d4 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs e1832a8c | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 86a8a24b | 
+pid 6434 NVMTL: ptpso: vs 5ed70bc6 fs c890a8bb | 
+pid 6434 NVMTL: newBufferWithLength:10800 storage 0 -> 0x7fcbfbc34560
+pid 6434 NVMTL: newBufferWithLength:10800 storage 0 -> 0x7fcbfbc560b0
+pid 6434 NVMTL: newBufferWithLength:8208 storage 0 -> 0x7fcbfbc34560
+pid 6434 NVMTL: newBufferWithLength:8208 storage 0 -> 0x7fcbfbcecba0
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: newBufferWithLength:9696 storage 0 -> 0x7fcbfbe1b340
+pid 6434 NVMTL: newBufferWithLength:9696 storage 0 -> 0x7fcbfbe23fc0
+pid 6434 NVMTL: newBufferWithLength:6864 storage 0 -> 0x7fcbfa741fd0
+pid 6434 NVMTL: newBufferWithLength:6864 storage 0 -> 0x7fcbfa70dcc0
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 52dc6097 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 54988de2 | 
+pid 6434 NVMTL: ptpso: vs 4c8e34ab fs 551a6e5a | 
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: newBufferWithLength:7152 storage 0 -> 0x7fcbfb87ecb0
+pid 6434 NVMTL: newBufferWithLength:7152 storage 0 -> 0x7fcbfb86bee0
+pid 6434 NVMTL: newBufferWithLength:15648 storage 0 -> 0x7fcbfbc49640
+pid 6434 NVMTL: newBufferWithLength:15648 storage 0 -> 0x7fcbfbc3a1f0
+pid 6434 NVMTL: newBufferWithLength:6912 storage 0 -> 0x7fcbfba4b6e0
+pid 6434 NVMTL: newBufferWithLength:6912 storage 0 -> 0x7fcbfba90ed0
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: host imports so far: 1857 (30986 MB, 922 of them >= 1 MB); surface cache 19791 hits, 1191 imports, 1162 freed, 0 uncached; misses on a cached ID with another size 0; 18 entries in use; last miss id 73
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 88 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 88 3840x2340 drawn into a private copy (8 surfaces)
+pid 6434 NVMTL: page-off: surface 88: the accelerator took no current mark -- copied out now
+pid 6434 NVMTL: G13 surface-out #5: 3840x2340 surface 0x60000195e610 seed 1, 10.60 ms
+pid 6434 NVMTL: page-off: surface 88: private copy gone after 0.30 s, never drawn -- no more copies for it
+pid 6434 NVMTL: newBufferWithLength:9216 storage 0 -> 0x7fcbfb86bee0
+pid 6434 NVMTL: newBufferWithLength:9216 storage 0 -> 0x7fcbfb8cf550
+pid 6434 NVMTL: newBufferWithLength:5952 storage 0 -> 0x7fcbfba35530
+pid 6434 NVMTL: newBufferWithLength:5952 storage 0 -> 0x7fcbfba461a0
+pid 6434 NVMTL: newBufferWithLength:7344 storage 0 -> 0x7fcbfb86bee0
+pid 6434 NVMTL: newBufferWithLength:7344 storage 0 -> 0x7fcbfb81da40
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: newBufferWithLength:7392 storage 0 -> 0x7fcbfb86bee0
+pid 6434 NVMTL: newBufferWithLength:7392 storage 0 -> 0x7fcbfb879c00
+pid 6434 NVMTL: newBufferWithLength:8160 storage 0 -> 0x7fcbfb86bee0
+pid 6434 NVMTL: newBufferWithLength:8160 storage 0 -> 0x7fcbfb894c10
+pid 6434 NVMTL: newBufferWithLength:5808 storage 0 -> 0x7fcbfb86bee0
+pid 6434 NVMTL: newBufferWithLength:5808 storage 0 -> 0x7fcbfb894c10
+pid 6434 NVMTL: newBufferWithLength:4320 storage 0 -> 0x7fcbfa741fd0
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: newTextureWithDescriptor: 1536x128 -> 0x7fcbea7107f0   [logged 4096 times now]
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: host imports so far: 1883 (31639 MB, 941 of them >= 1 MB); surface cache 20038 hits, 1212 imports, 1181 freed, 0 uncached; misses on a cached ID with another size 0; 18 entries in use; last miss id 40
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: submit census over 24576 submissions - surface upload (host)=11, -[XeMTLCommandBuffer(EventSubmission) nvmtlSubmitAhead]=24197, surface readback (host)=14, tex upload sync=354
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: host imports so far: 2037 (32394 MB, 963 of them >= 1 MB); surface cache 20700 hits, 1237 imports, 1199 freed, 0 uncached; misses on a cached ID with another size 0; 19 entries in use; last miss id 73
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 41 1274x1538 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 5120 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 41 1274x1538 drawn into a private copy (6 surfaces)
+pid 6434 NVMTL: page-off: surface 41: the accelerator took no current mark -- copied out now
+pid 6434 NVMTL: G13 surface-out #6: 1274x1538 surface 0x600001970c00 seed 1, 2.43 ms
+pid 6434 NVMTL: page-off: surface 41: private copy gone after 0.07 s, never drawn -- no more copies for it
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 51 1274x1538 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 5120 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 51 1274x1538 drawn into a private copy (7 surfaces)
+pid 6434 NVMTL: page-off: surface 51: the accelerator took no current mark -- copied out now
+pid 6434 NVMTL: page-off: surface 51: private copy gone after 0.03 s, never drawn -- no more copies for it
+pid 6434 NVMTL: vk: host imports so far: 2095 (33416 MB, 999 of them >= 1 MB); surface cache 20986 hits, 1290 imports, 1249 freed, 0 uncached; misses on a cached ID with another size 0; 17 entries in use; last miss id 84
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: nvk-reason: W anv_descriptor_set.c:1200: VK_ERROR_OUT_OF_POOL_MEMORY
+pid 6434 NVMTL: vk: commit high-water: 1262 descriptor sets = 631 draws in one command buffer (2 pools open)
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 105 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 105 3840x2340 drawn into a private copy (8 surfaces)
+pid 6434 NVMTL: page-off: surface 105: the accelerator took no current mark -- copied out now
+pid 6434 NVMTL: page-off: surface 105: private copy gone after 0.35 s, never drawn -- no more copies for it
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: host imports so far: 2141 (34582 MB, 1033 of them >= 1 MB); surface cache 21461 hits, 1331 imports, 1291 freed, 0 uncached; misses on a cached ID with another size 0; 27 entries in use; last miss id 75
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: image accounting: VRAM images asked 186 MB, 64K-aligned 190 MB (+3 waste); system images 0 -> 0 MB; all our allocations 1071 MB (BAR1 0 MB); NVK charges heap0 1072 MB -> NON-IMAGE 882 MB
+pid 6434 NVMTL: image census: 28672 made, 28523 gone, 149 live; VRAM 186 MB, system memory 0 MB (0 spilled); card 49152 MB; budget 27398 MB used 1072 MB (measured); MTLTexture objects 152 live, 50817 released
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 42 3840x2400 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 42 3840x2400 drawn into a private copy (6 surfaces)
+pid 6434 NVMTL: page-off: surface 42: private copy gone after 0.20 s, never drawn -- no more copies for it
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: buffer texture: VkFormat 16 stays single-format - its sRGB/linear view format 22 is refused (linear features 0x0, VkResult -11)
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 52 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 52 3840x2340 drawn into a private copy (7 surfaces)
+pid 6434 NVMTL: page-off: surface 52: private copy gone after 0.18 s, never drawn -- no more copies for it
+pid 6434 NVMTL: vk: host imports so far: 2206 (35544 MB, 1061 of them >= 1 MB); surface cache 22189 hits, 1369 imports, 1322 freed, 0 uncached; misses on a cached ID with another size 0; 19 entries in use; last miss id 57
+pid 6434 NVMTL: item 7: surface 90 3840x2400 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 90 3840x2400 drawn into a private copy (8 surfaces)
+pid 6434 NVMTL: page-off: surface 90: private copy gone after 0.28 s, drawn, copied to its pages -- no more copies for it
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: buffer texture: 3840x2340 VkFormat 44 pitch 15360 bound at 0 (DRM linear, align 4, size 35942400, storage 0, render 1, view pair 50)   [logged 24576 times now]
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: vk: host imports so far: 2252 (36505 MB, 1089 of them >= 1 MB); surface cache 22520 hits, 1403 imports, 1362 freed, 0 uncached; misses on a cached ID with another size 0; 19 entries in use; last miss id 86
+pid 6434 NVMTL: passtime: ARMED for 400 passes
+pid 6434 NVMTL: item 7: surface 51 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 51 3840x2340 drawn into a private copy (6 surfaces)
+pid 6434 NVMTL: page-off: surface 51: private copy gone after 0.21 s, never drawn -- no more copies for it
+pid 6434 NVMTL: item 7: surface 37 3840x2400 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 37 3840x2400 drawn into a private copy (7 surfaces)
+pid 6434 NVMTL: page-off: surface 37: private copy gone after 0.24 s, never drawn -- no more copies for it
+pid 6434 NVMTL: buffer texture: VkFormat 16 stays single-format - its sRGB/linear view format 22 is refused (linear features 0x0, VkResult -11)
+pid 6434 NVMTL: vk: host imports so far: 2342 (37743 MB, 1125 of them >= 1 MB); surface cache 22987 hits, 1449 imports, 1403 freed, 0 uncached; misses on a cached ID with another size 0; 19 entries in use; last miss id 37
+pid 6434 NVMTL: buffer park (park): 2 parked, 0 reused, 0 evicted, 0 drained; 2 held, 53248000 bytes
+pid 6434 NVMTL: newSamplerStateWithDescriptor: -> 0x6000030a35d0 (linear, clamp)   [logged 12288 times now]
+pid 6434 NVMTL: newTextureWithDescriptor:iosurface:0x60000197c690 plane:0 -> 0x7fcbfbc35430 (508x508 fmt 80)   [logged 24576 times now]
+pid 6434 NVMTL: surface 51 508x508 pitch 2048 -> an image in the surface's own pages (no copies)   [logged 24576 times now]
+pid 6434 NVMTL: vk: pre-submit prologue census: 12288 submits carried 13395 managed uploads + 25 zero fills (1002313 KB) - each WAS its own submit; 0 prologues failed
+pid 6434 NVMTL: vk: host imports so far: 2399 (39049 MB, 1163 of them >= 1 MB); surface cache 23616 hits, 1499 imports, 1454 freed, 0 uncached; misses on a cached ID with another size 0; 20 entries in use; last miss id 82
+pid 6434 NVMTL: pixel sampler: {
+pid 6434 NVMTL: item 7: surface 89 3840x2400 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 89 3840x2400 drawn into a private copy (8 surfaces)
+pid 6434 NVMTL: page-off: surface 89: private copy gone after 0.19 s, never drawn -- no more copies for it
+pid 6434 NVMTL: vk: submit census over 28672 submissions - surface upload (host)=19, -[XeMTLCommandBuffer(EventSubmission) nvmtlSubmitAhead]=28205, surface readback (host)=23, tex upload sync=425
+pid 6434 NVMTL: item 7: surface 42 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 42 3840x2340 drawn into a private copy (6 surfaces)
+pid 6434 NVMTL: page-off: surface 42: private copy gone after 0.18 s, never drawn -- no more copies for it
+pid 6434 NVMTL: vk: host imports so far: 2466 (39840 MB, 1186 of them >= 1 MB); surface cache 24407 hits, 1531 imports, 1486 freed, 0 uncached; misses on a cached ID with another size 0; 30 entries in use; last miss id 71
+pid 6434 NVMTL: buffer park (park): 3 parked, 1 reused, 0 evicted, 0 drained; 2 held, 53248000 bytes
+pid 6434 NVMTL: item 7: surface 107 3840x2340 plane 0 -> a private image, copied in and out (the family VRAM could not be used; row 15360 bytes, 0 plane(s))
+pid 6434 NVMTL: page-off: surface 107 3840x2340 drawn into a private copy (7 surfaces)
+pid 6434 NVMTL: page-off: surface 107: private copy gone after 0.21 s, never drawn -- no more copies for it
+pid 6434 NVMTL: image accounting: VRAM images asked 197 MB, 64K-aligned 202 MB (+4 waste); system images 0 -> 0 MB; all our allocations 913 MB (BAR1 0 MB); NVK charges heap0 910 MB -> NON-IMAGE 707 MB
+pid 6434 NVMTL: image census: 32768 made, 32576 gone, 192 live; VRAM 197 MB, system memory 0 MB (0 spilled); card 49152 MB; budget 27459 MB used 910 MB (measured); MTLTexture objects 194 live, 56826 released
+pid 6434 NVMTL: vk: host imports so far: 2527 (40561 MB, 1207 of them >= 1 MB); surface cache 24814 hits, 1564 imports, 1527 freed, 0 uncached; misses on a cached ID with another size 0; 18 entries in use; last miss id 38
+pid 6434 NVMTL: vk: host imports so far: 2561 (41249 MB, 1227 of them >= 1 MB); surface cache 25101 hits, 1592 imports, 1562 freed, 0 uncached; misses on a cached ID with another size 0; 21 entries in use; last miss id 37
