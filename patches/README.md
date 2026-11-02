@@ -1,6 +1,6 @@
 # patches/ —— 改动补丁系列
 
-本目录把项目里实际验证过的改动整理成二十二个可以按序应用的补丁。每个补丁开头的注释写明了基点提交、涉及文件、应用命令与改动意图，补丁体本身保持标准 unified diff，`a/` 与 `b/` 前缀可以直接配合 `patch -p1` 或 `git apply`。
+本目录把项目里实际验证过的改动整理成二十七个可以按序应用的补丁。每个补丁开头的注释写明了基点提交、涉及文件、应用命令与改动意图，补丁体本身保持标准 unified diff，`a/` 与 `b/` 前缀可以直接配合 `patch -p1` 或 `git apply`。
 
 ## 源码基点与组件补丁链
 
@@ -15,13 +15,13 @@
 
 | 组件 | 补丁链 |
 | --- | --- |
-| XeGfx core / xkpi | `0001 → 0008 → 0011 → 0020 → 0022` |
-| XeGfxAccel | `0002 → 0009 → 0012` |
+| XeGfx core / xkpi | `0001 → 0008 → 0011 → 0020 → 0022 → 0023` |
+| XeGfxAccel | `0002 → 0009 → 0012 → 0024` |
 | XeGfxIntelFB | `0003 → 0010 → 0014` |
 | XeGfxAGDC | `0004 → 0013 → 0017` |
-| XeGfxDisplay | `0015 → 0018 → 0021` |
-| native-display tools | `0016 → 0019` |
-| XeMTL | `0005 → 0006 → 0007` |
+| XeGfxDisplay | `0015 → 0018 → 0021 → 0025` |
+| native-display tools | `0016 → 0019 → 0027` |
+| XeMTL | `0005 → 0006 → 0007 → 0026` |
 
 ### 逐补丁前置状态
 
@@ -51,6 +51,11 @@
 | 0020 | `0020-core-aux-edid-dpcd.patch` | `0001 → 0008 → 0011` | `gpu/xkpi/src/i915/xg_display_hook.{c,h}`、`gpu/xegfx/shim/src/xnu/xg_kext.cpp` |
 | 0021 | `0021-adapter-edid-ddc.patch` | `0015 → 0018` | `kexts/XeGfxDisplay/src/XeGfxDisplay.{h,cpp}` |
 | 0022 | `0022-core-k1-staged-edp-takeover.patch` | `0001 → 0008 → 0011 → 0020` | `gpu/xegfx/shim/src/xnu/xg_kext.cpp`、`gpu/xkpi/src/i915/{xg_display_hook.c,xg_display_hook.h,intel_bios.c,intel_display_driver.c}`、`gpu/xkpi/exclude.txt`；新增 `gpu/xkpi/src/i915/intel_modeset_setup.c` |
+| 0023 | `0023-core-kms-boot-commit-joiner-cursor.patch` | `0001 → 0008 → 0011 → 0020 → 0022` | `gpu/xegfx/shim/src/xnu/xg_kext.cpp`、`gpu/xegfx/shim/include/xg_i915.h`、`gpu/xkpi/src/i915/{xg_display_hook.c,xg_display_hook.h,intel_display_driver.c,intel_modeset_setup.c,xg_i915_exec.c}`、`gpu/xkpi/exclude.txt`；新增 `gpu/xkpi/src/i915/i915_gem_execbuffer.c` |
+| 0024 | `0024-accel-deferred-flip-tile4-pageoff.patch` | `0002 → 0009 → 0012` | `kexts/NVRM/accel/{nvrm-accel.cpp,xegfx_accel_names.h}` |
+| 0025 | `0025-adapter-kms-modes-cursor-bootmode.patch` | `0015 → 0018 → 0021` | `kexts/XeGfxDisplay/src/{XeGfxDisplay.h,XeGfxDisplay.cpp,xegfx_kms_kapi.h}` |
+| 0026 | `0026-plugin-marks-tile4-pageoff.patch` | 本系列 0007 之后的插件树 | `plugin/{NVMTLEventSync.m,NVMTLObjects.h,NVMTLObjects.m,XeMTLDevice.m,nvmtl_vk.c,nvmtl_vk.h}` |
+| 0027 | `0027-tools-frame-rate-and-pageoff-measurement.patch` | `0016 → 0019` | `tools/m4a2-bootguard.sh`、`tools/m3db-preflight.sh`；新增 `tools/` 下的帧率、page-off 测量工具，`tools/e1/`、`tools/apple-kc/` |
 
 ## 应用方法
 
@@ -65,7 +70,7 @@ done
 
 patch -p1 -E < /path/to/patches/0013-agdc-m3d-in-kernel-arm.patch
 
-for n in 0014 0015 0016 0017 0018 0019 0020 0021 0022; do
+for n in 0014 0015 0016 0017 0018 0019 0020 0021 0022 0023 0024 0025 0027; do
   patch -p1 < /path/to/patches/$n-*.patch
 done
 ```
@@ -79,6 +84,7 @@ cd NvGfx-497d521
 patch -p1 --remove-empty-files < /path/to/patches/0005-plugin-xemtl-port.patch
 patch -p1 < /path/to/patches/0006-plugin-host-import.patch
 patch -p1 < /path/to/patches/0007-plugin-first-loss-journal.patch
+patch -p1 < /path/to/patches/0026-plugin-marks-tile4-pageoff.patch
 ```
 
 `--remove-empty-files` 用于处理 `0005` 中的文件替换。最终得到当前 core/display 源码树与 XeMTL plugin 源码树。
@@ -88,7 +94,7 @@ patch -p1 < /path/to/patches/0007-plugin-first-loss-journal.patch
 补丁系列使用对应上游基点进行重放验证：
 
 1. 在 `5a19a73f` 上按组件链应用 core、accel、IntelFB、AGDC、XeGfxDisplay 与 tools 补丁
-2. 在 `497d521e` 的 `plugin/` 上应用 `0005 → 0006 → 0007`
+2. 在 `497d521e` 的 `plugin/` 上应用 `0005 → 0006 → 0007 → 0026`
 3. 对补丁后的源码文件与实际构建输入做逐文件比对
 4. 检查 unified diff 应用结果、符号标记与新增文件
 
