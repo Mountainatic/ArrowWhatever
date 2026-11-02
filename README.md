@@ -4,6 +4,8 @@
 
 项目基于 [XeGfx](https://github.com/watchthelight-labs/XeGfx) 和 [NvGfx](https://github.com/watchthelight-labs/NvGfx/tree/xe)，结合 [Mesa ANV](https://gitlab.freedesktop.org/mesa/mesa) 与 [XeMTL](https://github.com/watchthelight-labs/NvGfx/tree/497d521e925bd760c8cde5bbc17d9bf96d2ee2b4/plugin)，建立了从 Metal 图形渲染、GPU 命令提交到内建屏显示的完整路径。在此基础上，ArrowWhatever 进一步实现了 Intel 原生显示、高刷新率 HiDPI、零拷贝翻转和 GPU 渲染优化，并使用 [i915](https://github.com/torvalds/linux/tree/master/drivers/gpu/drm/i915) 驱动内建屏，实现了硬件光标和 GPU 加速。
 
+![macOS Tahoe 桌面与 240 Hz 内建屏设置](assets/tahoe-desktop.avif)
+
 ## 当前实现
 
 项目已经打通了 macOS 图形系统与 Intel 核显之间的主要链路。
@@ -19,6 +21,8 @@
 | 渲染优化   | Tile4 扫描、IOSurface Device Cache、page-off 与 CCS 压缩      |
 
 当前的开发工作集中在进一步提高 WindowServer 的合成吞吐，优化渲染与显示之间的并行性，并完善不同图形负载下的内存一致性与稳定性。目前实际帧率约 70fps，部分系统 UI 和神奇效果显示有卡顿。
+
+![Intel Xe-LPG 核显与 HiDPI 显示信息](assets/intel-gpu-info.avif)
 
 ## 工作原理
 
