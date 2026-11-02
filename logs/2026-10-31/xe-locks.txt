@@ -1,0 +1,12 @@
+CPU locks seen 24859, lookups failed 0
+  id     size        marks    locks  unlocks  last lock
+    1  3840x2400       8030     6696     6696  0s ago
+    2  3840x2340         10        9        9  22s ago
+    3  3840x2400          2        0        0  -
+    4  3840x2400       8032     6721     6721  0s ago
+    5  3840x2400       5512     5003     5003  0s ago
+    6  3840x60            7        6        6  86s ago
+    7  3840x2400       2637     2630     2630  152s ago
+    8  3840x2400          3        2        2  147s ago
+    9  3840x2400          1        0        0  -
+   10  3840x2400       3098     2586     2586  0s ago
