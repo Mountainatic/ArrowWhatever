@@ -11,10 +11,10 @@ SHA-256 的前 12 位）。10-30 的构建是 `0024`/`0026` 之前的中间版�
 
 | 文件 | 内容 | 构建 |
 | --- | --- | --- |
-| `anim-genie-1810.tsv` | `tools/anim-probe`：自己的窗口最小化再恢复（神奇效果），每 20 ms 记录翻页数、是否按序、是否 forced、worker 等 GPU 的时间、arm 时间 | accel `e708488e2959`（等 GT 空闲，运行时 `early=0`、`idle_ms=120`） |
+| `anim-genie-1810.tsv` | `scripts/tools/anim-probe.m`：自己的窗口最小化再恢复（神奇效果），每 20 ms 记录翻页数、是否按序、是否 forced、worker 等 GPU 的时间、arm 时间 | accel `e708488e2959`（等 GT 空闲，运行时 `early=0`、`idle_ms=120`） |
 | `anim-genie-small-1828.tsv`、`anim-genie-large-1828.tsv` | 同上，小窗口 500×330 和大窗口 1800×1100，加 GPU 频率列 | 同上，core 带 GPU 频率读数（`debug.xegfx_gt_act`） |
 | `anim-genie-mark-small.tsv`、`anim-genie-mark-large.tsv` | 同上，worker 改为只等这一帧合成的标记之后 | accel UUID 90ED0224 + 插件 `5d28d1339731` |
-| `mark-timeouts.txt` | `tools/mark-timeout-watch.sh`：标记等待超时（100 ms）累计次数、最长等待、快照超时、forced 的时间序列。21:53–21:55 另一个进程在跑一次几百 ms 的 GPU 基准 | 同上 |
+| `mark-timeouts.txt` | `scripts/tools/mark-timeout-watch.sh`：标记等待超时（100 ms）累计次数、最长等待、快照超时、forced 的时间序列。21:53–21:55 另一个进程在跑一次几百 ms 的 GPU 基准 | 同上 |
 
 列：`t_s` 秒，`phase` idle/动画，`flips` 这 20 ms 里的翻页数，`ordered`/`forced` 按序或超时强制 arm 的翻页，
 `idle_last_us` worker 最后一次等 GPU 的时间，`arm_last_us` 写 `PLANE_SURF` 到锁存，`gt_mhz` GPU 实际频率。
@@ -27,7 +27,7 @@ SHA-256 的前 12 位）。10-30 的构建是 `0024`/`0026` 之前的中间版�
 | `pageoff-probe-passtime.log.gz` | fps-probe 期间的 passtime，page-off 延迟升级版（131 翻页/s） | accel `9f9e03d718ea`、插件 `bfc4b0b29d67` |
 | `pageoff-tile4-probe-passtime.log.gz` | 同上，加 Tile4 | 同上，`iop_xe_tile4=1` |
 | `ccs-on-passtime.log.gz`、`ccs-off-passtime.log.gz` | 压缩 A/B：fps-probe 各两次，私有拷贝带 CCS 和 `INTEL_DEBUG=noccs`（97–99 对 76 翻页/s） | accel `9f9e03d718ea`、插件 `0a26febb51ee` |
-| `genie-lazy-flips.txt`、`genie-lazy-passtime.log.gz` | 两次神奇效果，60 s：`tools/flip-sampler.pl`（每 10 ms 一次翻页计数，ms 与累计数）和 passtime（带每个 pass 的 draw 次数）；临时 surface 还是 linear | accel `9f9e03d718ea`、插件 `c23c5688366b` |
+| `genie-lazy-flips.txt`、`genie-lazy-passtime.log.gz` | 两次神奇效果，60 s：`scripts/tools/flip-sampler.pl`（每 10 ms 一次翻页计数，ms 与累计数）和 passtime（带每个 pass 的 draw 次数）；临时 surface 还是 linear | accel `9f9e03d718ea`、插件 `c23c5688366b` |
 | `genie-coherent-flips.txt`、`genie-coherent-passtime.log.gz`、`genie-coherent-plugin.log` | 同上，私有拷贝立即建立，并带一致性规则（最忙的几秒 89/85/76 对 60/59/48 翻页/s） | accel `7f8443ddc21e`、插件 `31b5f29a17c4` |
 | `tl-probe-pageoff-off.txt` | `debug.nvaccel_iop_xe_tl`：fps-probe 期间最后 200 帧的时间线，page-off 关，Tile4 开（58 翻页/s） | accel `b9ca64f267e3`、插件 `31b5f29a17c4`（page-off 开关文件被重启清掉） |
 | `tl-probe-defaults.txt` | 同上，默认配置（82 翻页/s） | accel `8ee59d21f885`（= `0024`）、插件 `9d368ef407c4`（= `0026`） |
@@ -37,5 +37,5 @@ passtime 每行：`cb` 命令缓冲序号、`pass` 序号、目标尺寸、格�
 前四个不同的着色器哈希，新版本末尾还有 `draws`。时间线每行：两帧间隔、排队到取出、取出到合成完成、合成完成到 arm、
 arm 到锁存、锁存到通知、通知到下一帧排进来（µs），最后是 surface ID、是否提前通知、是否成功。
 
-汇总脚本：`tools/passtime-summ.py`、`tools/passtime-sizes.py`、`tools/anim-summary.py`。分析见 `docs/frame-pipeline.md` 和
+采集与汇总工具都在 `scripts/tools/`（补丁 `0027` 也把它们加进源码树的 `tools/`）：`fps-probe.m`、`anim-probe.m`、`flip-sampler.pl`、`mark-timeout-watch.sh` 采集，`anim-summary.py`（读 stdin）、`passtime-summ.py`、`passtime-sizes.py` 汇总，后两个可以直接读 `.gz`，例如 `python3 scripts/tools/passtime-sizes.py logs/2026-10-31/genie-lazy-passtime.log.gz logs/2026-10-31/genie-coherent-passtime.log.gz`。时间线和 `xe-locks` 是 sysctl 的原样输出，不需要工具。分析见 `docs/frame-pipeline.md` 和
 `docs/page-off-and-compression.md`。

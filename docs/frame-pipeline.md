@@ -10,7 +10,7 @@ K9（`0009`、`0012`）的 worker 在写 `PLANE_SURF` 之前等**整个 GT 空�
 1. **surface 标记**：插件在 commit 时把 WindowServer 这一帧的 surface 标成 pending，GPU 做完以后标成 ready
    （DRM client selector 1）。accel 的 worker 只等这一帧自己的标记（`markonly`），快照或 GT 空闲轮询只作为后备。
 2. **WindowServer 不再等**：插件的 `commitAndWaitUntilSubmitted` 只等 scheduled（`/private/tmp/xemtl-ws-nowait`，
-   开机由 `tools/e1` 的 LaunchDaemon 重建），排序完全交给 accel。
+   开机由补丁 `0027` 加入源码树的 `tools/e1` LaunchDaemon 重建），排序完全交给 accel。
 3. **HIGH 优先级**：WindowServer 的 Vulkan 队列用 `VK_KHR_global_priority` 的 HIGH，GuC 先调度它的合成。
 4. **超时也照样 arm**：GPU 忙超过 `iop_xe_idle_ms`（默认 120）时照样上屏这一帧，并计入 `idle_forced`，不会再
    因为连续失败把 defer 永久关掉；卡住的事务由逃生口直接报告完成，同样不会关掉 defer。

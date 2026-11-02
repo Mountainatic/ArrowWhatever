@@ -1120,17 +1120,17 @@
 +++ b/tools/passtime-sizes.py
 @@ -0,0 +1,19 @@
 +# passtime-sizes: per (target size, shader pair) pass time and per-draw time, and the cb distribution, for one or two
-+# passtime logs with draw counts (§36.12 genie captures).  Usage: passtime-sizes.py a.log [b.log]
-+import re, sys, collections
++# passtime logs with draw counts (§36.12 genie captures).  Usage: passtime-sizes.py a.log[.gz] [b.log[.gz]]
++import re, sys, collections, gzip, os
 +def load(f):
 +    d = collections.defaultdict(list); cb = collections.defaultdict(float)
-+    for l in open(f):
++    for l in (gzip.open(f, 'rt') if f.endswith('.gz') else open(f)):
 +        m = re.match(r'cb (\d+) pass \d+ (\d+x\d+) fmt \d+ gpu_us ([\d.]+) gap_us [\d.]+ fs (\w+) (\w+) \w+ \w+ draws (\d+)', l)
 +        if m: d[(m[2], m[4] + ' ' + m[5])].append((float(m[3]) / 1e3, int(m[6]))); cb[m[1]] += float(m[3]) / 1e3
 +    return d, sorted(cb.values())
 +logs = [load(f) for f in sys.argv[1:]]
 +for f, (d, v) in zip(sys.argv[1:], logs):
-+    print('%s: %d cbs  p50 %.2f p90 %.2f p99 %.1f max %.1f ms; >8 ms %d, >12 ms %d' % (f.split('/')[-2], len(v), v[len(v)//2], v[int(.9*len(v))], v[int(.99*len(v))], v[-1], sum(1 for x in v if x > 8), sum(1 for x in v if x > 12)))
++    print('%s: %d cbs  p50 %.2f p90 %.2f p99 %.1f max %.1f ms; >8 ms %d, >12 ms %d' % (os.path.basename(f), len(v), v[len(v)//2], v[int(.9*len(v))], v[int(.99*len(v))], v[-1], sum(1 for x in v if x > 8), sum(1 for x in v if x > 12)))
 +keys = [('3840x2340', '394291c7 44d03494'), ('3979x2479', '394291c7 44d03494'), ('4067x2567', '394291c7 44d03494'), ('3979x2479', 'c8ba9c29 c8f53aed'), ('3840x2400', 'f1c2052c 00000000'), ('3840x2400', '394291c7 44d03494')]
 +for k in keys:
 +    out = []
@@ -1140,12 +1140,13 @@
 +    print('%-10s %-18s | %s' % (k[0], k[1], ' | '.join(out)))
 --- /dev/null
 +++ b/tools/passtime-summ.py
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,14 @@
 +# passtime-summ: summarise a WindowServer nvmtl-passtime log (§32.17): per-cb GPU time and time per target size.
-+import sys, re, statistics as st
++# Usage: passtime-summ.py passtime.log[.gz]
++import sys, re, gzip, statistics as st
 +from collections import defaultdict
 +cb, size = defaultdict(float), defaultdict(lambda: [0, 0.0])
-+for l in open(sys.argv[1]):
++for l in (gzip.open(sys.argv[1], 'rt') if sys.argv[1].endswith('.gz') else open(sys.argv[1])):
 +    m = re.match(r'cb (\d+) pass \d+ (\d+x\d+) fmt \d+ gpu_us ([\d.]+)', l)
 +    if not m: continue
 +    cb[int(m[1])] += float(m[3]); size[m[2]][0] += 1; size[m[2]][1] += float(m[3])

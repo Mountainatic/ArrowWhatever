@@ -1,6 +1,6 @@
 # scripts/ —— 安装、试验与压测脚本
 
-本目录收录项目里实际使用过的脚本与两个小工具源码。仓库内文件一律从脚本自身位置定位；仓库外的源码树、helper 与 kext 构建产物必须通过 `XEGFX_*` 环境变量显式指定，不再猜测开发机上的日期工作目录。系统安装目标（如 `/Library/Extensions`、`/Library/XeGfxTrial`）仍使用固定绝对路径。
+本目录收录项目里实际使用过的脚本与测量小工具源码。仓库内文件一律从脚本自身位置定位；仓库外的源码树、helper 与 kext 构建产物必须通过 `XEGFX_*` 环境变量显式指定，不再猜测开发机上的日期工作目录。系统安装目标（如 `/Library/Extensions`、`/Library/XeGfxTrial`）仍使用固定绝对路径。
 
 ## 目录
 
@@ -14,6 +14,12 @@
 | `tools/ca_bench2.m` | CoreAnimation 动画窗口负载，驱动 WindowServer 反复 present |
 | `tools/soak_surface_churn.m` | IOSurface / layer 内容高速创建与丢弃，制造 userptr pin/unpin 抖动 |
 | `tools/display_probe.c` | 打印主显示器的 CGDisplayMode 刷新率与 CVDisplayLink 名义刷新周期，用来核对刷新率修复 |
+| `tools/fps-probe.m` | 每个 display-link tick 改一次 layer 颜色，逼 WindowServer 每个 vblank 合成一帧；配合 accel 计数看多少帧真正上屏 |
+| `tools/anim-probe.m` | 自己的窗口最小化再恢复（神奇效果），每 20 ms 记录翻页数、worker 等 GPU 的时间与 GPU 频率 |
+| `tools/anim-summary.py` | 把 anim-probe 的输出（stdin）汇总成 100 ms 一格 |
+| `tools/flip-sampler.pl` | 每 10 ms 记录一次 accel 的翻页计数（时间 ms 与累计数），卡顿表现为两次计数之间的空档 |
+| `tools/mark-timeout-watch.sh` | 合成标记等待超时或最长等待增长时打印一行带时间的记录 |
+| `tools/passtime-summ.py`、`tools/passtime-sizes.py` | 汇总插件的 passtime 日志（可直接读 `.gz`）：每个命令缓冲的 GPU 时间、按目标尺寸与着色器的 pass 和每次 draw 时间 |
 
 ## 环境变量
 
@@ -48,7 +54,7 @@
 
 ## 编译小工具
 
-两个 Objective-C 工具与一个 C 探针都用系统自带的 Command Line Tools 直接编译：
+这些 Objective-C 工具与 C 探针都用系统自带的 Command Line Tools 直接编译：
 
 ```sh
 clang -O2 -framework Cocoa -framework QuartzCore \
@@ -58,6 +64,9 @@ clang -O2 -framework Cocoa -framework QuartzCore -framework IOSurface \
       -o /tmp/soak_surface_churn scripts/tools/soak_surface_churn.m
 clang -O2 -framework ApplicationServices -framework CoreVideo \
       -o /tmp/display_probe scripts/tools/display_probe.c
+clang -O2 -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo \
+      -o /tmp/fps-probe scripts/tools/fps-probe.m
+clang -O2 -fobjc-arc -framework Cocoa -o /tmp/anim-probe scripts/tools/anim-probe.m
 ```
 
 ## 语法检查
