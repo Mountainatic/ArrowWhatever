@@ -1,0 +1,1388 @@
+# 0025 XeGfxDisplay: i915 modesets (K2-K4), joined HiDPI modes, hardware cursor, boot mode
+#
+# Base:  kexts/XeGfxDisplay after 0015 + 0018 + 0021
+# Files: kexts/XeGfxDisplay/src/XeGfxDisplay.h, kexts/XeGfxDisplay/src/XeGfxDisplay.cpp,
+#        kexts/XeGfxDisplay/src/xegfx_kms_kapi.h
+# Apply: patch -p1 < patches/0025-adapter-kms-modes-cursor-bootmode.patch
+#
+# With a K2 core (0023) the adapter lists the panel's fixed modes (60/240/300 Hz) and scaled HiDPI desktops as
+# detailed timings and switches them through the KAPI (K3 setMode, plane-only commits for a new desktop size);
+# modes that need the pipe joiner are offered when the core reports it.  C1: kIOHardwareCursorAttribute is 1 and
+# setCursorImage/setCursorState go to the core's cursor plane (moves coalesced to the vblank thread).  K4: every
+# successful setDisplayMode is saved as NVRAM xegfx-disp-bootmode; at start the adapter adopts the core's boot state
+# (getTiming(XEGFX_KMS_BOOT_STATE_INDEX)) and reports the matching detailed timing as current, so WindowServer finds
+# the panel already in its mode.  Backlight and vblank waits use the new KAPI calls.
+# Status: in daily use with 0023/0024.
+#
+--- a/kexts/XeGfxDisplay/src/XeGfxDisplay.h
++++ b/kexts/XeGfxDisplay/src/XeGfxDisplay.h
+@@ -283,6 +283,8 @@
+ static_assert(offsetof(struct XeGfxPresent, flipCount) == 64,
+               "XeGfxPresent.flipCount must be at offset 64");
+ #endif
++
++class XeGfxBacklightHandler;   /* B1, XeGfxDisplay.cpp */
+ 
+ class XeGfxFramebuffer : public IOFramebuffer
+ {    OSDeclareDefaultStructors(XeGfxFramebuffer)
+@@ -409,6 +411,12 @@
+     void     loadNubEdid(IOService *provider);   /* panel EDID the core read over AUX */
+     bool     buildModeTable();                   /* M2 */
+     bool     buildMeasuredModeTable(const void *bytes, uint32_t length); /* M3a */
++    void     buildK3Modes();                     /* K3: fixed modes at other refresh rates */
++    void     publishScalerCaps();                /* A1: IOFBScalerInfo + IOFBTimingRange */
++    bool     scaledOk(const IODetailedTimingInformationV2 *dt, const char **why) const;  /* A1 */
++    int      dtIndex(IODisplayModeID mode) const;  /* A1: fDT index of a scaled mode, or -1 */
++    IOReturn setDesktop(uint32_t w, uint32_t h);   /* A1: KAPI setPlane + scanout view */
++    int      s3Index(IODisplayModeID mode) const;  /* S3 mode id -> fMeasuredModes index, or -1 */
+     void     logMeasuredModes() const;                                  /* M3a */
+     static bool parseNvk5Timing(const uint32_t *words, uint32_t wordCount,
+                                 struct XeGfxKmsTiming *out,
+@@ -526,6 +534,42 @@
+     struct XeGfxMeasuredMode fMeasuredModes[XEGFX_DISPLAY_MAX_MEASURED_MODES];
+     uint32_t  fMeasuredModeCount = 0;
+     bool      fMeasuredOk = false;  /* words parsed and converted          */
++    /*
++     * K3: fMeasuredModes[2..] are the panel's other fixed modes (same raster, another refresh rate) that the core can
++     * commit through KAPI setMode; [1] stays the inactive HiDPI candidate.  fKmsIdx maps an fMeasuredModes index to
++     * the core's fixed-mode index, fS3Cur is the index the pipe runs now.
++     */
++    bool      fK3 = false;
++    uint32_t  fK3Count = 0;
++    uint32_t  fS3Cur = 0;
++    uint32_t  fKmsIdx[XEGFX_DISPLAY_MAX_MEASURED_MODES] = {};
++    /*
++     * A1: scaled desktops (docs/03-PLAN §30.19).  CoreDisplay proposes them from IOFBScalerInfo as detailed timings
++     * whose raster is one of the base modes above and whose horizontalScaled x verticalScaled is the desktop; they
++     * are kept here with the base they scale (fDtBase, an fMeasuredModes index).  The scanout is allocated for the
++     * largest desktop and fScanout[0].width/height/pitch describe the desktop on the plane now (fDeskW x fDeskH).
++     * s3Index() returns XEGFX_A1_DT_INDEX + i for fDT[i].
++     */
++#define XEGFX_A1_MAX_DT     64
++#define XEGFX_A1_DT_INDEX   100
++    bool      fScalerOk = false;
++    /* B1: the panel's brightness, a "backlight" IODisplayParameterHandler over KAPI backlight (docs/03-PLAN §30.26) */
++    XeGfxBacklightHandler *fBacklight = nullptr;
++    void      publishBacklight();
++    uint32_t  fNDT = 0;
++    IODetailedTimingInformationV2 fDT[XEGFX_A1_MAX_DT];
++    uint8_t   fDtBase[XEGFX_A1_MAX_DT] = {};
++    uint32_t  fDeskW = 0, fDeskH = 0;
++    uint64_t  fScanoutCapBytes = 0;   /* the allocation, for the largest desktop */
++    /*
++     * K4 (§32.20): the core booted into the mode last set (NVRAM xegfx-disp-bootmode).  fS3Cur and the desktop start
++     * as it committed them; fBootDeskPending until the detailed timing of that scaled desktop is known and reported as
++     * the current mode, so WindowServer's first setDisplayMode finds the panel already there.
++     */
++    bool      fBootDeskPending = false;
++    uint32_t  fBootSavedMHz = 0, fBootSavedW = 0, fBootSavedH = 0;
++    void      k4ApplyBootState();
++    void      k4SaveMode(uint32_t mhz, uint32_t w, uint32_t h);
+ 
+     /* ---- connector snapshot (M1) ------------------------------------- */
+     struct XeGfxKmsConnector fConn;
+@@ -555,6 +599,19 @@
+     IOTimerEventSource *fVblTimer = nullptr;
+     IOWorkLoop       *fWorkLoop  = nullptr;
+     uint64_t          fLastVblUs = 0;
++    /* E3: hardware vblank -- a kernel thread sleeps in the core's waitVblank (i915's vblank interrupt) and delivers
++     * each vblank, instead of the free-running IOTimer.  fVblLock serialises delivery with (un)registration. */
++    IOLock           *fVblLock       = nullptr;
++    volatile bool     fVblThreadRun  = false;   /* the thread keeps running while true         */
++    volatile bool     fVblThreadLive = false;   /* the thread has not exited yet               */
++    volatile bool     fVblThreadOn   = false;   /* a client wants vblanks (setInterruptState)  */
++    uint64_t          fVblHwWaits    = 0;       /* vblanks delivered from i915                 */
++    uint64_t          fVblHwMisses   = 0;       /* waits that failed; a synthetic tick instead */
++    uint64_t          fVblPropUs     = 0;       /* last XeGfxVblankCount publication           */
++    static void vblankThreadMain(void *arg, wait_result_t wr);
++    bool        startVblankThread();
++    void        stopVblankThread();
++    void        vblankPublishCount(uint64_t now);
+     uint32_t          fRefreshHz = 60;
+ 
+     /* ---- M3d: real FB service state (all gated by fM3d) -------------- */
+@@ -599,6 +656,10 @@
+     bool     fCurVisible = false;
+     uint32_t fCurSurface = 0xFFFFFFFFu;
+     uint16_t fCurW = 0, fCurH = 0;
++    /* C1: the core's hardware cursor (KAPI reserved[6]/[7]); NVRAM xegfx-disp-swcursor=1 keeps the software one */
++    bool     hwCursorOn();
++    uint32_t fCurImages = 0, fCurRefused = 0;
++    int      fSwCursor = -1;
+ 
+     /* ---- gamma ------------------------------------------------------- */
+     void    *fGamma = nullptr;
+--- a/kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
++++ b/kexts/XeGfxDisplay/src/XeGfxDisplay.cpp
+@@ -32,7 +32,22 @@
+ #include <mach/kmod.h>                /* kmod_info_t / _kmod_info symbol   */
+ #include <libkern/c++/OSIterator.h>
+ #include <libkern/c++/OSSymbol.h>
++#include <IOKit/graphics/IODisplay.h>   /* B1: IODisplayParameterHandler, brightness keys */
++#include <kern/thread.h>                /* E3: kernel_thread_start            */
++#include <mach/thread_act.h>            /* E3: thread_terminate               */
+ 
++/* IOFramebuffer keeps a detailed timing's mode id in the first reserved word (as NVRMFB names it) */
++#ifndef detailedTimingModeID
++#define detailedTimingModeID __reservedA[0]
++#endif
++
++/* A1: the accepted-timing comparison against one reference (defined with timingMatchesAccepted) */
++static bool xgDtMatches(const IODetailedTimingInformationV2 &a, const IODetailedTimingInformationV2 *dt);
++static inline bool xgDtMatchesBase(const IODetailedTimingInformationV2 &a, const IODetailedTimingInformationV2 *dt)
++{
++    return xgDtMatches(a, dt);
++}
++
+ /* M3d: defined in the helper section; readKapi() runs long before it. */
+ static bool xgKernelPointerOk(uint64_t ptr);
+ static const OSSymbol *xgSymbol(const char *name, const OSSymbol **cache);
+@@ -443,13 +458,17 @@
+     if (fS3) {
+         if (!info)
+             return kIOReturnBadArgument;
+-        if ((!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) || fMeasuredModeCount == 0 ||
+-            mode != fMeasuredModes[0].modeId)
++        int si = s3Index(mode);
++        if ((!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) || si < 0)
+             return kIOReturnUnsupported;
+         bzero(info, sizeof *info);
+         info->appleTimingID = kIOTimingIDInvalid;
+         info->flags         = kIODetailedTimingValid;
+-        info->detailedInfo.v2 = fAcceptedDt;
++        if (si >= XEGFX_A1_DT_INDEX) {
++            info->flags |= kIOScalingInfoValid;
++            info->detailedInfo.v2 = fDT[si - XEGFX_A1_DT_INDEX];
++        } else
++            info->detailedInfo.v2 = si == 0 ? fAcceptedDt : fMeasuredModes[si].dt;
+         return kIOReturnSuccess;
+     }
+ 
+@@ -483,10 +502,17 @@
+     if (fS3) {
+         if (!info)
+             return kIOReturnBadArgument;
+-        if ((!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) || fMeasuredModeCount == 0 ||
+-            mode != fMeasuredModes[0].modeId)
++        int si = s3Index(mode);
++        if ((!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) || si < 0)
+             return kIOReturnUnsupported;
+-        *info = fMeasuredModes[0].info;
++        if (si >= XEGFX_A1_DT_INDEX) {
++            const IODetailedTimingInformationV2 &d = fDT[si - XEGFX_A1_DT_INDEX];
++            *info = fMeasuredModes[fDtBase[si - XEGFX_A1_DT_INDEX]].info;
++            info->nominalWidth  = d.horizontalScaled;
++            info->nominalHeight = d.verticalScaled;
++            info->flags |= kDisplayModeSafeFlag | kDisplayModeNotPresetFlag;
++        } else
++            *info = fMeasuredModes[si].info;
+         return kIOReturnSuccess;
+     }
+ 
+@@ -529,7 +555,7 @@
+         /* One entry, from the measured table -- not from the KAPI table,
+          * which may advertise several modes this step deliberately hides. */
+         return (fMeasuredModeCount > 0 &&
+-            (fFbModeReady || (fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL))) ? 1 : 0;
++            (fFbModeReady || (fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL))) ? 1 + (fK3 ? fK3Count : 0) + fNDT : 0;
+     }
+     if (fInert)
+         return 0;
+@@ -545,6 +571,11 @@
+         if (!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL))
+             return kIOReturnUnsupported;
+         allDisplayModes[0] = fMeasuredModes[0].modeId;
++        uint32_t n = 1;
++        for (uint32_t i = 0; fK3 && i < fK3Count; i++)
++            allDisplayModes[n++] = fMeasuredModes[2 + i].modeId;
++        for (uint32_t i = 0; i < fNDT; i++)
++            allDisplayModes[n++] = (IODisplayModeID)fDT[i].detailedTimingModeID;
+         return kIOReturnSuccess;
+     }
+     for (IOItemCount i = 0; i < fIoModeCount; i++)
+@@ -557,9 +588,8 @@
+ {
+     if (fS3) {
+         /* The S3 table is pinned to the one measured raster, mode id 1. */
+-        if ((fFbModeReady || (fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) && fMeasuredModeCount > 0 &&
+-            modeId == fMeasuredModes[0].modeId)
+-            return 0;
++        if (fFbModeReady || (fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL))
++            return s3Index(modeId);
+         return -1;
+     }
+     for (IOItemCount i = 0; i < fIoModeCount; i++)
+@@ -831,9 +861,221 @@
+     fMeasuredOk = true;
+     logMeasuredModes();
+     return true;
++}
++
++/*
++ * K3: the panel's other refresh rates, from the core's fixed modes (KAPI modeset extension).  Only modes with the
++ * measured raster are offered; the one at the measured refresh is the way back to it.  300 Hz runs on i915's joiner
++ * (pipes A+B, over the 1.3056 GHz single-pipe dot clock); J1 has the accel write both pipes' PLANE_SURF.
++ */
++void
++XeGfxFramebuffer::buildK3Modes()
++{
++    fK3 = false;
++    fK3Count = 0;
++    fS3Cur = 0;
++    if (!fKapi || !fMeasuredOk || fMeasuredModeCount == 0 ||
++        !(fKapi->flags & XEGFX_KMS_KAPI_FLAG_MODESET) || !fKapi->setMode) {
++        XLOG("K3: core has no modeset extension; the measured refresh only");
++        return;
++    }
++    const struct XeGfxMeasuredMode base = fMeasuredModes[0];
++    bool haveNative = false;
++    uint32_t next = 2;      /* [1] is the inactive HiDPI candidate */
++
++    /*
++     * The core publishes the nub from intel_bios_init(), before its K2 boot commit; the fixed modes answer NOT_READY
++     * until that commit is done (10 s later on 2026-10-30 11:15, which cost that boot 240 Hz and every scaled mode).
++     * macOS reads the mode list once, so wait for the commit here: 250 ms polls, at most 30 s.
++     */
++    {
++        struct XeGfxKmsPanelTiming probe;
++        uint32_t rc = XEGFX_ERR_NOT_READY;
++        uint32_t waits = 0;
++        for (; waits < 120; waits++) {
++            bzero(&probe, sizeof probe);
++            rc = fKapi->getTiming(fCtx, XEGFX_KMS_FIXED_MODE_BASE, &probe);
++            if (rc != XEGFX_ERR_NOT_READY)
++                break;
++            IOSleep(250);
++        }
++        XLOG("K3: core fixed modes %s after %u ms (rc 0x%x)", rc == XEGFX_OK ? "ready" : "not available", waits * 250u, rc);
++    }
++
++    for (uint32_t n = 0; n < XEGFX_KMS_MAX_FIXED_MODES; n++) {
++        struct XeGfxKmsPanelTiming pt;
++        bzero(&pt, sizeof pt);
++        uint32_t rc = fKapi->getTiming(fCtx, XEGFX_KMS_FIXED_MODE_BASE + n, &pt);
++        if (rc != XEGFX_OK || pt.tag != XEGFX_NVK5_TIMING_TAG) {
++            if (n == 0)
++                XLOG("K3: no fixed mode from the core (rc 0x%x); the measured refresh only", rc);
++            break;
++        }
++        uint32_t words[XEGFX_NVK5_TIMING_WORDS];
++        memcpy(words, &pt, sizeof words);
++        struct XeGfxKmsTiming t;
++        uint64_t pclk = 0;
++        uint32_t mhz = 0;
++        const char *why = "";
++        if (!parseNvk5Timing(words, XEGFX_NVK5_TIMING_WORDS, &t, &pclk, &mhz, &why)) {
++            XLOG("K3: fixed mode %u rejected: %s", n, why);
++            continue;
++        }
++        if (t.hdisplay != base.t.hdisplay || t.vdisplay != base.t.vdisplay)
++            continue;
++        if (mhz + 1000u > base.refreshMHz && mhz < base.refreshMHz + 1000u) {
++            fKmsIdx[0] = n;
++            haveNative = true;
++            XLOG("K3: fixed mode %u = the measured %u.%03u Hz", n, mhz / 1000u, mhz % 1000u);
++            continue;
++        }
++        /* J1: a mode over one pipe's dot clock (300 Hz) is joined across pipes A+B by the core; the accel mirrors
++         * PLANE_SURF to pipe B, so it is offered like any other refresh rate. */
++        if (pclk > 1305600000ull)
++            XLOG("K3: fixed mode %u (%u Hz) runs joined across two pipes", n, mhz / 1000u);
++        if (next >= XEGFX_DISPLAY_MAX_MEASURED_MODES)
++            break;
++        struct XeGfxMeasuredMode *m = &fMeasuredModes[next];
++        *m = base;
++        m->modeId       = (IODisplayModeID)(next + 1);
++        m->t            = t;
++        m->pixelClockHz = pclk;
++        m->refreshMHz   = mhz;
++        m->scaled       = false;
++        timingToIo(&t, &m->dt);
++        m->dt.pixelClock = m->dt.minPixelClock = m->dt.maxPixelClock = pclk;
++        m->info.refreshRate = (IOFixed1616)(((uint64_t)mhz << 16) / 1000u);
++        fKmsIdx[next] = n;
++        XLOG("K3: mode %u = fixed mode %u, %ux%u %u.%03u Hz clock %llu Hz", (unsigned)m->modeId, n, t.hdisplay,
++             t.vdisplay, mhz / 1000u, mhz % 1000u, (unsigned long long)pclk);
++        next++;
++        fK3Count++;
++    }
++    if (!haveNative) {
++        fK3Count = 0;
++        XLOG("K3: the measured refresh is not among the core's fixed modes; not offering others");
++        return;
++    }
++    if (next > fMeasuredModeCount)
++        fMeasuredModeCount = next;
++    fK3 = fK3Count > 0;
++    setProperty("XeGfxK3Modes", (unsigned long long)fK3Count, 32);
++}
++
++int
++XeGfxFramebuffer::s3Index(IODisplayModeID mode) const
++{
++    if (fMeasuredModeCount == 0)
++        return -1;
++    if (mode == fMeasuredModes[0].modeId)
++        return 0;
++    for (uint32_t i = 0; fK3 && i < fK3Count; i++)
++        if (fMeasuredModes[2 + i].modeId == mode)
++            return (int)(2 + i);
++    int d = dtIndex(mode);
++    if (d >= 0)
++        return XEGFX_A1_DT_INDEX + d;
++    return -1;
++}
++
++int
++XeGfxFramebuffer::dtIndex(IODisplayModeID mode) const
++{
++    for (uint32_t i = 0; fScalerOk && i < fNDT; i++)
++        if ((IODisplayModeID)fDT[i].detailedTimingModeID == mode)
++            return (int)i;
++    return -1;
++}
++
++/*
++ * A1: a scaled desktop this framebuffer can put on the plane: both axes, stretch-to-fit only, no inset or border,
++ * within the scanout allocation and the core's plane limit, at most 2x down (as NVRMFB), and a width whose row pitch is
++ * whole 64-byte units (i915's linear stride; the accel refuses a frame whose pitch is not the plane's).
++ */
++bool
++XeGfxFramebuffer::scaledOk(const IODetailedTimingInformationV2 *dt, const char **why) const
++{
++    const uint32_t sw = dt->horizontalScaled, sh = dt->verticalScaled;
++    const char *w = nullptr;
++    if (!fScalerOk) w = "no scaler (core has no setPlane)";
++    else if (!sw || !sh) w = "one scaled axis";
++    else if (dt->horizontalScaledInset || dt->verticalScaledInset) w = "inset";
++    else if (dt->scalerFlags & ~(UInt32)kIOScaleStretchToFit) w = "rotation/axis flags";
++    else if (dt->horizontalBorderLeft | dt->horizontalBorderRight | dt->verticalBorderTop | dt->verticalBorderBottom) w = "borders";
++    else if (sw < 640 || sh < 400) w = "desktop below 640x400";
++    else if (sw > XEGFX_KMS_PLANE_MAX_W || sh > XEGFX_KMS_PLANE_MAX_H) w = "desktop above the plane limit";
++    else if ((uint64_t)sw * 4u * sh > fScanoutCapBytes) w = "desktop larger than the scanout allocation";
++    else if (sw > 2 * dt->horizontalActive || sh > 2 * dt->verticalActive) w = "downscale beyond 2x";
++    else if (sw & 15u) w = "width not a multiple of 16 (64-byte pitch)";
++    if (why) *why = w ? w : "";
++    return w == nullptr;
++}
++
++/* A1: put a w x h desktop on the plane (KAPI setPlane), then describe the scanout as that desktop */
++IOReturn
++XeGfxFramebuffer::setDesktop(uint32_t w, uint32_t h)
++{
++    if (w == fDeskW && h == fDeskH)
++        return kIOReturnSuccess;
++    XeGfxKmsSetPlaneFn setPlane = (XeGfxKmsSetPlaneFn)(uintptr_t)fKapi->reserved[3];
++    const uint32_t pitch = w * 4u;
++    uint64_t t0 = nowUs();
++    uint32_t rc = setPlane ? setPlane(fCtx, w, h, pitch) : XEGFX_ERR_UNSUPPORTED;
++    XLOG("A1: desktop %ux%u -> %ux%u pitch %u: KAPI setPlane rc 0x%x in %llu us", fDeskW, fDeskH, w, h, pitch, rc,
++         (unsigned long long)(nowUs() - t0));
++    if (rc != XEGFX_OK)
++        return kIOReturnError;
++    fDeskW = w;
++    fDeskH = h;
++    fScanout[0].width  = w;
++    fScanout[0].height = h;
++    fScanout[0].pitch  = pitch;
++    m3dPublishScanoutProps();
++    setProperty("XeGfxDesktop", (unsigned long long)(((uint64_t)w << 32) | h), 64);
++    return kIOReturnSuccess;
+ }
+ 
++/* A1: what NVRMFB publishes for this panel (docs/31 §31.4), with the plane limit as the scaler's maximum */
+ void
++XeGfxFramebuffer::publishScalerCaps()
++{
++    IODisplayScalerInformation si;
++    bzero(&si, sizeof si);
++    si.scalerFeatures = kIOScaleCanUpSamplePixels | kIOScaleCanDownSamplePixels;
++    si.maxHorizontalPixels = XEGFX_KMS_PLANE_MAX_W;
++    si.maxVerticalPixels = XEGFX_KMS_PLANE_MAX_H;
++    OSData *d = OSData::withBytes(&si, sizeof si);
++    if (d) { setProperty(kIOFBScalerInfoKey, d); d->release(); }
++    IODisplayTimingRangeV1 r;
++    bzero(&r, sizeof r);
++    r.minPixelClock = 25000000ull; r.maxPixelClock = 1200000000ull; r.maxPixelError = 0;
++    r.supportedSyncFlags = kIORangeSupportsSeparateSyncs;
++    r.supportedSignalLevels = 0; r.supportedSignalConfigs = kIODigitalSignal;
++    r.minFrameRate = 23; r.maxFrameRate = 500; r.minLineRate = 10000; r.maxLineRate = 1000000;
++    r.maxHorizontalTotal = 16384; r.maxVerticalTotal = 16384;
++    r.charSizeHorizontalActive = r.charSizeHorizontalBlanking = r.charSizeHorizontalSyncOffset = r.charSizeHorizontalSyncPulse = 1;
++    r.charSizeVerticalActive = r.charSizeVerticalBlanking = r.charSizeVerticalSyncOffset = r.charSizeVerticalSyncPulse = 1;
++    r.charSizeHorizontalBorderLeft = r.charSizeHorizontalBorderRight = r.charSizeVerticalBorderTop = r.charSizeVerticalBorderBottom = 1;
++    r.charSizeHorizontalTotal = r.charSizeVerticalTotal = 1;
++    r.minHorizontalActiveClocks = 320;  r.maxHorizontalActiveClocks = 8192;
++    r.minHorizontalBlankingClocks = 0;  r.maxHorizontalBlankingClocks = 8192;
++    r.minHorizontalSyncOffsetClocks = 0; r.maxHorizontalSyncOffsetClocks = 8192;
++    r.minHorizontalPulseWidthClocks = 1; r.maxHorizontalPulseWidthClocks = 8192;
++    r.minVerticalActiveClocks = 200;    r.maxVerticalActiveClocks = 8192;
++    r.minVerticalBlankingClocks = 0;    r.maxVerticalBlankingClocks = 8192;
++    r.minVerticalSyncOffsetClocks = 0;  r.maxVerticalSyncOffsetClocks = 8192;
++    r.minVerticalPulseWidthClocks = 1;  r.maxVerticalPulseWidthClocks = 8192;
++    r.maxNumLinks = 1; r.minLink0PixelClock = 25000; r.maxLink0PixelClock = 1200000;
++    r.supportedPixelEncoding = kIORangePixelEncodingRGB444; r.supportedBitsPerColorComponent = kIORangeBitsPerColorComponent8;
++    r.supportedColorimetryModes = kIORangeColorimetryNativeRGB | kIORangeColorimetrysRGB;
++    r.supportedDynamicRangeModes = kIORangeDynamicRangeSDR;
++    OSData *g = OSData::withBytes(&r, sizeof r);
++    if (g) { setProperty(kIOFBTimingRangeKey, g); g->release(); }
++    XLOG("A1: published IOFBScalerInfo (up+down, max %ux%u) + IOFBTimingRange", XEGFX_KMS_PLANE_MAX_W,
++         XEGFX_KMS_PLANE_MAX_H);
++}
++
++void
+ XeGfxFramebuffer::logMeasuredModes() const
+ {
+     for (uint32_t i = 0; i < fMeasuredModeCount; i++) {
+@@ -909,8 +1151,33 @@
+      * setMode, so accepting a foreign timing would only mislead CoreDisplay.
+      */
+     if (fS3) {
+-        const IODetailedTimingInformationV2 *dt =
+-            (const IODetailedTimingInformationV2 *)description;
++        /* CoreDisplay passes either a bare V2 timing or a whole IOFBDisplayModeDescription (as NVRMFB handles) */
++        IODetailedTimingInformationV2 *dt = descripSize == sizeof(IOFBDisplayModeDescription)
++            ? &((IOFBDisplayModeDescription *)description)->timingInfo.detailedInfo.v2
++            : (IODetailedTimingInformationV2 *)description;
++        if (dt->horizontalScaled || dt->verticalScaled) {
++            const char *why = "";
++            bool ok = timingMatchesAccepted(dt) && scaledOk(dt, &why);
++            if (!ok && !*why) why = "raster is not a base mode";
++            if (fValidateRejects < 48 || ok)
++                XLOG("A1: validate desktop %ux%u on %ux%u pclk %llu id 0x%x -> %s", (unsigned)dt->horizontalScaled,
++                     (unsigned)dt->verticalScaled, (unsigned)dt->horizontalActive, (unsigned)dt->verticalActive,
++                     (unsigned long long)dt->pixelClock, (unsigned)dt->detailedTimingModeID, ok ? "OK" : why);
++            if (!ok) {
++                fValidateRejects++;
++                return kIOReturnUnsupportedMode;
++            }
++            if (descripSize == sizeof(IOFBDisplayModeDescription)) {
++                IODisplayModeInformation *info = &((IOFBDisplayModeDescription *)description)->info;
++                const uint64_t tot = (uint64_t)(dt->horizontalActive + dt->horizontalBlanking) *
++                                     (dt->verticalActive + dt->verticalBlanking);
++                info->maxDepthIndex = 0;
++                info->nominalWidth  = dt->horizontalScaled;
++                info->nominalHeight = dt->verticalScaled;
++                info->refreshRate   = tot ? (UInt32)((dt->pixelClock << 16) / tot) : 0;
++            }
++            return kIOReturnSuccess;
++        }
+         /*
+          * Accept it even before enableController(): CoreDisplay validates the
+          * timing it is about to use BEFORE the handshake, and refusing the
+@@ -980,7 +1247,7 @@
+      */
+     if (fS3) {
+         uint32_t offered = array ? array->getCount() : 0;
+-        uint32_t kept = 0, bad = 0, dropped = 0;
++        uint32_t kept = 0, bad = 0, dropped = 0, nDT = 0;
+         OSArray *filtered = OSArray::withCapacity(1);
+ 
+         for (uint32_t i = 0; i < offered; i++) {
+@@ -996,6 +1263,23 @@
+             }
+             const IODetailedTimingInformationV2 *dt =
+                 (const IODetailedTimingInformationV2 *)entry->getBytesNoCopy();
++            if (dt->horizontalScaled || dt->verticalScaled) {
++                const char *why = "";
++                if (!timingMatchesAccepted(dt) || !scaledOk(dt, &why) || nDT >= XEGFX_A1_MAX_DT) {
++                    dropped++;
++                    continue;
++                }
++                int base = 0;
++                for (uint32_t k = 0; fK3 && k < fK3Count; k++)
++                    if (xgDtMatchesBase(fMeasuredModes[2 + k].dt, dt))
++                        base = (int)(2 + k);
++                fDT[nDT] = *dt;
++                fDtBase[nDT] = (uint8_t)base;
++                nDT++;
++                if (filtered)
++                    filtered->setObject(entry);
++                continue;
++            }
+             if (!timingMatchesAccepted(dt)) {
+                 dropped++;
+                 XLOG("S3: setDetailedTimings drop entry %u: %ux%u clk %llu Hz",
+@@ -1004,7 +1288,7 @@
+                      (unsigned long long)dt->pixelClock);
+                 continue;
+             }
+-            if (kept == 0 && filtered)
++            if (filtered && kept < 1 + (fK3 ? fK3Count : 0))
+                 filtered->setObject(entry);
+             kept++;
+         }
+@@ -1014,10 +1298,19 @@
+                 setProperty(kIOFBDetailedTimingsKey, filtered);
+             filtered->release();
+         }
++        fNDT = fScalerOk ? nDT : 0;
++        setProperty("XeGfxScaledModes", (unsigned long long)fNDT, 32);
++        for (uint32_t i = 0; fBootDeskPending && i < fNDT; i++)
++            if (fDtBase[i] == fS3Cur && fDT[i].horizontalScaled == fDeskW && fDT[i].verticalScaled == fDeskH) {
++                fCurrentId = (IODisplayModeID)fDT[i].detailedTimingModeID;
++                fCurrentIdx = 0;
++                fBootDeskPending = false;
++                XLOG("K4: the boot desktop %ux%u on mode %u is detailed timing 0x%x -- reported as the current mode",
++                     fDeskW, fDeskH, (unsigned)fMeasuredModes[fS3Cur].modeId, (unsigned)fCurrentId);
++            }
+         fDtRejects += dropped + bad;
+-        XLOG("S3: setDetailedTimings: %u offered, %u kept, %u dropped, %u "
+-             "malformed (running total %u); only the measured mode is "
+-             "re-published", offered, kept, dropped, bad, fDtRejects);
++        XLOG("S3: setDetailedTimings: %u offered, %u kept + %u scaled desktops, %u dropped, %u "
++             "malformed (running total %u)", offered, kept, fNDT, dropped, bad, fDtRejects);
+         return kIOReturnSuccess;
+     }
+ 
+@@ -1043,15 +1336,17 @@
+ {
+     if (fS3) {
+         if (depth != 0 || aperture != kIOFBSystemAperture || !info ||
+-            (!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) || fMeasuredModeCount == 0 ||
+-            mode != fMeasuredModes[0].modeId)
++            (!fFbModeReady && !(fM3d && fM3dChecks == XEGFX_M3D_CHECKS_ALL)) || s3Index(mode) < 0)
+             return kIOReturnBadArgument;
+-        *info = fMeasuredModes[0].px;
+-        if (fM3d && fScanoutMapped && fScanout[0].pitch) {
+-            info->bytesPerRow   = fScanout[0].pitch;
+-            info->bytesPerPlane = (UInt32)((IOByteCount)fScanout[0].pitch *
+-                                          fScanout[0].height);
++        *info = fMeasuredModes[0].px;   /* every K3 mode has the same raster */
++        /* A1: the mode's own desktop, whatever is on the plane now (pitch = width * 4, as setDesktop programs it) */
++        int si = s3Index(mode);
++        if (si >= XEGFX_A1_DT_INDEX) {
++            info->activeWidth  = fDT[si - XEGFX_A1_DT_INDEX].horizontalScaled;
++            info->activeHeight = fDT[si - XEGFX_A1_DT_INDEX].verticalScaled;
+         }
++        info->bytesPerRow   = info->activeWidth * 4u;
++        info->bytesPerPlane = info->bytesPerRow * info->activeHeight;
+         return kIOReturnSuccess;
+     }
+ 
+@@ -1110,6 +1405,13 @@
+         }
+         IOPhysicalAddress phys = (IOPhysicalAddress)fScanout[0].phys;
+         IOByteCount len = (IOByteCount)fScanout[0].pitch * fScanout[0].height;
++        /*
++         * A1: the whole allocation, not the desktop on the plane now.  IOFramebuffer publishes this length as
++         * IOFBMemorySize and CoreDisplay drops every mode whose pixels do not fit it -- with the 2560x1600 view that
++         * was 2880x1800 and up, i.e. every HiDPI desktop above native (2026-10-30 11:25).
++         */
++        if (fScalerOk && fScanoutCapBytes > len)
++            len = (IOByteCount)fScanoutCapBytes;
+         if (!phys || !len || phys > 0xffffffffull) {
+             XLOG("M3d: aperture rejected (phys 0x%llx len %llu)",
+                  (unsigned long long)phys, (unsigned long long)len);
+@@ -1275,11 +1577,46 @@
+ XeGfxFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth)
+ {
+     if (fS3) {
+-        if (depth != 0 || !fFbModeReady || fMeasuredModeCount == 0 ||
+-            mode != fMeasuredModes[0].modeId) {
++        int si = s3Index(mode);
++        if (depth != 0 || !fFbModeReady || si < 0) {
+             XLOG("S3: setDisplayMode(%u, depth %u) refused (ready=%d)",
+                  mode, depth, fFbModeReady ? 1 : 0);
+             return kIOReturnUnsupported;
++        }
++        /*
++         * K3: another refresh rate is a full modeset in i915 (KAPI setMode, ~1 s).  We are between IOFramebuffer's
++         * will/did mode-change notifications, so the accel does not flip meanwhile; i915 puts its placeholder back on
++         * the plane and the next flip replaces it.  On failure the pipe keeps the mode it had.
++         */
++        /* A1: a scaled mode runs on its base raster; the desktop is the scaled size, else the raster */
++        const bool scaled = si >= XEGFX_A1_DT_INDEX;
++        const int base = scaled ? fDtBase[si - XEGFX_A1_DT_INDEX] : si;
++        const uint32_t dw = scaled ? fDT[si - XEGFX_A1_DT_INDEX].horizontalScaled : fMeasuredModes[0].t.hdisplay;
++        const uint32_t dh = scaled ? fDT[si - XEGFX_A1_DT_INDEX].verticalScaled : fMeasuredModes[0].t.vdisplay;
++        bool changed = false;
++        if (fK3 && (uint32_t)base != fS3Cur) {
++            uint64_t t0 = nowUs();
++            uint32_t rc = fKapi->setMode(fCtx, 0, fKmsIdx[base]);
++            XLOG("K3: setDisplayMode(0x%x) -> KAPI setMode(%u) %u.%03u Hz rc 0x%x in %llu us", mode, fKmsIdx[base],
++                 fMeasuredModes[base].refreshMHz / 1000u, fMeasuredModes[base].refreshMHz % 1000u, rc,
++                 (unsigned long long)(nowUs() - t0));
++            if (rc != XEGFX_OK)
++                return kIOReturnError;
++            fS3Cur = (uint32_t)base;
++            setProperty("XeGfxK3RefreshMHz", (unsigned long long)fMeasuredModes[base].refreshMHz, 32);
++            changed = true;
++        }
++        if (fScalerOk && (dw != fDeskW || dh != fDeskH)) {
++            if (setDesktop(dw, dh) != kIOReturnSuccess)
++                return kIOReturnError;
++            changed = true;
++        }
++        fBootDeskPending = false;
++        k4SaveMode(fMeasuredModes[base].refreshMHz, fDeskW, fDeskH);
++        if (changed) {
++            fCurrentId  = mode;
++            fCurrentIdx = 0;
++            return kIOReturnSuccess;
+         }
+         fCurrentId  = mode;
+         fCurrentIdx = 0;
+@@ -1300,6 +1637,93 @@
+     return kIOReturnSuccess;
+ }
+ 
++/*
++ * K4: what the core's boot commit ran.  The pipe starts there, so the refresh and the desktop start there too: the
++ * scanout describes the desktop on the plane (the accel refuses a frame whose pitch is not the plane's), and the base
++ * mode is current until setDetailedTimings names the scaled desktop.  An older core, or a boot that fell back to the
++ * panel's preferred mode, leaves everything as before.
++ */
++void
++XeGfxFramebuffer::k4ApplyBootState()
++{
++    if (IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane)) {
++        OSData *d = OSDynamicCast(OSData, o->getProperty(XEGFX_NVRAM_BOOT_MODE));
++        if (d && d->getLength() == 16) {
++            uint32_t v[4];
++            memcpy(v, d->getBytesNoCopy(), sizeof v);
++            if (v[0] == XEGFX_BOOT_MODE_MAGIC) { fBootSavedMHz = v[1]; fBootSavedW = v[2]; fBootSavedH = v[3]; }
++        }
++        o->release();
++    }
++    if (!fK3 || !fKapi || fMeasuredModeCount == 0)
++        return;
++    struct XeGfxKmsPanelTiming pt;
++    bzero(&pt, sizeof pt);
++    const uint32_t rc = fKapi->getTiming(fCtx, XEGFX_KMS_BOOT_STATE_INDEX, &pt);
++    uint32_t w[XEGFX_NVK5_TIMING_WORDS];
++    memcpy(w, &pt, sizeof w);
++    if (rc != XEGFX_OK || w[0] != XEGFX_KMS_BOOT_STATE_TAG) {
++        XLOG("K4: no boot state from the core (rc 0x%x); it booted the panel's preferred mode", rc);
++        return;
++    }
++    const uint32_t n = w[1], dw = w[2], dh = w[3], pitch = w[4];
++    int base = -1;
++    for (uint32_t i = 0; i < 2 + fK3Count && i < fMeasuredModeCount; i++)
++        if (i != 1 && fKmsIdx[i] == n) { base = (int)i; break; }
++    if (base < 0) {
++        XLOG("K4: the core booted fixed mode %u, which is not in this mode table", n);
++        return;
++    }
++    const uint32_t rw = fMeasuredModes[0].t.hdisplay, rh = fMeasuredModes[0].t.vdisplay;
++    fS3Cur = (uint32_t)base;
++    fCurrentId = fMeasuredModes[base].modeId;
++    fCurrentIdx = 0;
++    setProperty("XeGfxK3RefreshMHz", (unsigned long long)fMeasuredModes[base].refreshMHz, 32);
++    if (dw != rw || dh != rh) {
++        if (fScalerOk && pitch == dw * 4u && (uint64_t)pitch * dh <= fScanoutCapBytes) {
++            fDeskW = dw;
++            fDeskH = dh;
++            fScanout[0].width  = dw;
++            fScanout[0].height = dh;
++            fScanout[0].pitch  = pitch;
++            m3dPublishScanoutProps();
++            setProperty("XeGfxDesktop", (unsigned long long)(((uint64_t)dw << 32) | dh), 64);
++            fBootDeskPending = true;
++        } else {
++            /* this framebuffer cannot describe that desktop: put the raster back on the plane */
++            XeGfxKmsSetPlaneFn setPlane = (XeGfxKmsSetPlaneFn)(uintptr_t)fKapi->reserved[3];
++            const uint32_t prc = setPlane ? setPlane(fCtx, rw, rh, rw * 4u) : XEGFX_ERR_UNSUPPORTED;
++            XLOG("K4: boot desktop %ux%u pitch %u does not fit this scanout; plane back to %ux%u (rc 0x%x)",
++                 dw, dh, pitch, rw, rh, prc);
++        }
++    }
++    setProperty("XeGfxBootMode", w[6] ? "saved" : "preferred");
++    XLOG("K4: core booted fixed mode %u (%u.%03u Hz, %s), desktop %ux%u, joined %u -> current mode %u%s", n,
++         fMeasuredModes[base].refreshMHz / 1000u, fMeasuredModes[base].refreshMHz % 1000u, w[6] ? "saved" : "preferred",
++         fDeskW, fDeskH, w[5], (unsigned)fCurrentId, fBootDeskPending ? ", scaled desktop pending" : "");
++}
++
++/* K4: the mode WindowServer set last, for the core's next boot commit; written only when it changes */
++void
++XeGfxFramebuffer::k4SaveMode(uint32_t mhz, uint32_t w, uint32_t h)
++{
++    if (mhz == 0 || (mhz == fBootSavedMHz && w == fBootSavedW && h == fBootSavedH))
++        return;
++    IORegistryEntry *o = IORegistryEntry::fromPath("/options", gIODTPlane);
++    if (!o)
++        return;
++    const uint32_t v[4] = { XEGFX_BOOT_MODE_MAGIC, mhz, w, h };
++    bool ok = false;
++    if (OSData *d = OSData::withBytes(v, sizeof v)) {
++        ok = o->setProperty(XEGFX_NVRAM_BOOT_MODE, d);
++        d->release();
++    }
++    o->release();
++    if (ok) { fBootSavedMHz = mhz; fBootSavedW = w; fBootSavedH = h; }
++    XLOG("K4: boot mode %u.%03u Hz desktop %ux%u %s NVRAM %s", mhz / 1000u, mhz % 1000u, w, h, ok ? "saved to" : "NOT saved to",
++         XEGFX_NVRAM_BOOT_MODE);
++}
++
+ IOReturn
+ XeGfxFramebuffer::getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth)
+ {
+@@ -1321,8 +1745,8 @@
+ 
+     uint64_t periodNs = 16666666ull;
+     if (fM3d && fMeasuredModeCount > 0 &&
+-        fMeasuredModes[0].refreshMHz >= 1000u)
+-        periodNs = 1000000000000ull / fMeasuredModes[0].refreshMHz;
++        fMeasuredModes[fS3Cur].refreshMHz >= 1000u)
++        periodNs = 1000000000000ull / fMeasuredModes[fS3Cur].refreshMHz;
+     else if (fRefreshHz)
+         periodNs = 1000000000ull / fRefreshHz;
+ 
+@@ -1343,11 +1767,23 @@
+      * only meaningful to the KAPI source, not to IOGraphicsFamily. */
+     (void)count;
+     (void)deltaUs;
++    if (fVblLock) IOLockLock(fVblLock);
+     if (fVblProc && fVblTarget)
+         fVblProc(fVblTarget, fVblRef);
++    if (fVblLock) IOLockUnlock(fVblLock);
+ }
+ 
++/* E3: XeGfxVblankCount is a diagnostic; publishing it was a registry write on every tick (240 a second) */
+ void
++XeGfxFramebuffer::vblankPublishCount(uint64_t now)
++{
++    if (now - fVblPropUs < 1000000ull)
++        return;
++    fVblPropUs = now;
++    setProperty("XeGfxVblankCount", (unsigned long long)fVblCount, 64);
++}
++
++void
+ XeGfxFramebuffer::vblankBridge(void *arg, uint64_t count, uint32_t deltaUs)
+ {
+     XeGfxFramebuffer *self = (XeGfxFramebuffer *)arg;
+@@ -1364,8 +1800,8 @@
+ 
+     uint64_t periodUs = 16666;
+     if (self->fM3d && self->fMeasuredModeCount > 0 &&
+-        self->fMeasuredModes[0].refreshMHz >= 1000u)
+-        periodUs = 1000000000ull / self->fMeasuredModes[0].refreshMHz;
++        self->fMeasuredModes[self->fS3Cur].refreshMHz >= 1000u)
++        periodUs = 1000000000ull / self->fMeasuredModes[self->fS3Cur].refreshMHz;
+     else if (self->fRefreshHz)
+         periodUs = 1000000ull / self->fRefreshHz;
+     if (periodUs < 1000)
+@@ -1390,8 +1826,7 @@
+             self->fVblCount++;
+             self->fVblNs = now * 1000ull;
+         }
+-        self->setProperty("XeGfxVblankCount",
+-                          (unsigned long long)self->fVblCount, 64);
++        self->vblankPublishCount(now);
+     } else if (!self->fVblHW) {
+         self->fVblCount++;
+         self->fVblNs = now * 1000ull;
+@@ -1406,8 +1841,8 @@
+ XeGfxFramebuffer::startVblankFallback()
+ {
+     uint64_t periodUs = 16666;
+-    if (fM3d && fMeasuredModeCount > 0 && fMeasuredModes[0].refreshMHz >= 1000u)
+-        periodUs = 1000000000ull / fMeasuredModes[0].refreshMHz;
++    if (fM3d && fMeasuredModeCount > 0 && fMeasuredModes[fS3Cur].refreshMHz >= 1000u)
++        periodUs = 1000000000ull / fMeasuredModes[fS3Cur].refreshMHz;
+     else if (fRefreshHz)
+         periodUs = 1000000ull / fRefreshHz;
+     if (periodUs < 1000)
+@@ -1440,6 +1875,98 @@
+         fVblTimer->cancelTimeout();
+ }
+ 
++/*
++ * E3 (native-display docs/32-FRAME-RATE.md): the hardware vblank.  The thread sleeps in the core's waitVblank, which
++ * i915's vblank interrupt wakes, and hands each vblank to IOFramebuffer at once (its VBL handler is made for interrupt
++ * context) with i915's timestamp, so CoreDisplay's vsync is the panel's and not a timer's in an arbitrary phase.  When
++ * the pipe is off -- a modeset, sleep -- or no vblank comes within 50 ms, it ticks synthetically at the mode's period,
++ * as the timer did, so WindowServer is never left without vblanks.
++ */
++void
++XeGfxFramebuffer::vblankThreadMain(void *arg, wait_result_t wr)
++{
++    (void)wr;
++    XeGfxFramebuffer *self = (XeGfxFramebuffer *)arg;
++    XeGfxKmsWaitVblankFn wait = (XeGfxKmsWaitVblankFn)(uintptr_t)self->fKapi->reserved[5];
++    uint64_t last = 0, lastUs = self->nowUs();
++    uint32_t logged = 0;
++
++    while (self->fVblThreadRun) {
++        uint64_t periodUs = 16666;
++        if (self->fMeasuredModeCount > 0 && self->fMeasuredModes[self->fS3Cur].refreshMHz >= 1000u)
++            periodUs = 1000000000ull / self->fMeasuredModes[self->fS3Cur].refreshMHz;
++        if (!self->fVblThreadOn) {
++            IOSleep((unsigned)(periodUs / 1000 + 1));
++            continue;
++        }
++        uint64_t count = 0, ageNs = 0, absNs = 0;
++        const uint64_t before = self->nowUs();
++        const uint32_t rc = wait(self->fCtx, last, 50000, &count, &ageNs);
++        uint64_t now = self->nowUs();
++        if (rc != XEGFX_OK && now - before < periodUs) {
++            /* the pipe is off (sleep, a modeset): BUSY comes back at once -- tick at the mode's period, never spin */
++            IOSleep((unsigned)((periodUs - (now - before)) / 1000 + 1));
++            now = self->nowUs();
++        }
++        absolutetime_to_nanoseconds(mach_absolute_time(), &absNs);
++        if (rc == XEGFX_OK) {
++            last = count;
++            self->fVblHwWaits++;
++            self->fVblSource = 3;
++            self->fVblCount = count;
++            self->fVblNs = absNs > ageNs ? absNs - ageNs : absNs;
++        } else {
++            if (self->fVblHwMisses++ < 4 || (++logged & 0x3ff) == 0)
++                XLOG("E3: waitVblank 0x%x after %llu vblanks -- synthetic tick (%llu so far)", rc,
++                     (unsigned long long)self->fVblHwWaits, (unsigned long long)self->fVblHwMisses);
++            self->fVblCount++;
++            self->fVblNs = absNs;
++        }
++        const uint32_t delta = (uint32_t)(now - lastUs);
++        lastUs = now;
++        self->vblankDeliver(self->fVblCount, delta ? delta : (uint32_t)periodUs);
++        self->vblankPublishCount(now);
++    }
++    __atomic_store_n(&self->fVblThreadLive, false, __ATOMIC_RELEASE);
++    (void)thread_terminate(current_thread());
++}
++
++bool
++XeGfxFramebuffer::startVblankThread()
++{
++    if (!fKapi || !(fKapi->flags & XEGFX_KMS_KAPI_FLAG_VBLANK) || !fKapi->reserved[5] || !fVblLock)
++        return false;
++    fVblThreadOn = true;
++    if (fVblThreadLive)
++        return true;
++    thread_t t = nullptr;
++    fVblThreadRun = true;
++    fVblThreadLive = true;
++    if (kernel_thread_start(&XeGfxFramebuffer::vblankThreadMain, this, &t) != KERN_SUCCESS) {
++        fVblThreadRun = false;
++        fVblThreadLive = false;
++        fVblThreadOn = false;
++        XLOG("E3: no vblank thread -- timer");
++        return false;
++    }
++    thread_deallocate(t);
++    XLOG("E3: vblank from i915's interrupt (core waitVblank)");
++    return true;
++}
++
++void
++XeGfxFramebuffer::stopVblankThread()
++{
++    fVblThreadOn = false;
++    if (!fVblThreadLive)
++        return;
++    fVblThreadRun = false;
++    for (int i = 0; i < 200 && __atomic_load_n(&fVblThreadLive, __ATOMIC_ACQUIRE); i++)
++        IOSleep(1);	/* a wait returns within 50 ms */
++    if (fVblThreadLive)
++        XLOG("E3: vblank thread still running after 200 ms");
++}
++
+ IOReturn
+ XeGfxFramebuffer::registerForInterruptType(IOSelect type, IOFBInterruptProc proc,
+                                            OSObject *target, void *ref,
+@@ -1452,9 +1979,13 @@
+     if (fVblProc && (fVblProc != proc || fVblTarget != target || fVblRef != ref))
+         return kIOReturnNoResources;
+ 
++    if (!fVblLock)
++        fVblLock = IOLockAlloc();
++    if (fVblLock) IOLockLock(fVblLock);
+     fVblProc      = proc;
+     fVblTarget    = target;
+     fVblRef       = ref;
++    if (fVblLock) IOLockUnlock(fVblLock);
+     *interruptRef = this;
+ 
+     /* No hardware interrupt is requested from the core KAPI in M3d (v1 has no
+@@ -1477,9 +2008,11 @@
+         m3dStopVblankSource();
+     else
+         stopVblankFallback();
++    if (fVblLock) IOLockLock(fVblLock);
+     fVblProc    = nullptr;
+     fVblTarget  = nullptr;
+     fVblRef     = nullptr;
++    if (fVblLock) IOLockUnlock(fVblLock);
+     fVblCookie  = nullptr;
+     fVblHW      = false;
+     return kIOReturnSuccess;
+@@ -1802,9 +2335,27 @@
+     /* This is called only by startS3, before registration readiness. Core
+      * serializes its allocator internally. Holding the counter/cursor lock
+      * over a sleepable KAPI allocation can also block the watchdog. */
++    /* A1: one allocation for the largest scaled desktop; the plane shows a w x h view of it (pitch w*4) */
++    const uint32_t rasterW = w, rasterH = h;
++    if (fScalerOk) {
++        w = XEGFX_KMS_PLANE_MAX_W;
++        h = XEGFX_KMS_PLANE_MAX_H;
++    }
+     XLOG("M3d: allocScanout BEGIN %ux%u (core call, no FB lock held)", w, h);
+     uint32_t rc = alloc(fCtx, w, h, 4, XEGFX_KMS_SCANOUT_FLAG_ZERO, &desc);
+     XLOG("M3d: allocScanout END rc=0x%x", rc);
++    if (rc != XEGFX_OK && fScalerOk) {
++        /* A1: no contiguous room for the largest desktop -- keep the raster-sized scanout, offer no scaled modes */
++        XLOG("A1: %ux%u scanout failed (0x%x); retrying %ux%u without scaled desktops", w, h, rc, rasterW, rasterH);
++        fScalerOk = false;
++        removeProperty(kIOFBScalerInfoKey);
++        removeProperty(kIOFBTimingRangeKey);
++        w = rasterW;
++        h = rasterH;
++        bzero(&desc, sizeof desc);
++        rc = alloc(fCtx, w, h, 4, XEGFX_KMS_SCANOUT_FLAG_ZERO, &desc);
++        XLOG("M3d: allocScanout END rc=0x%x", rc);
++    }
+ 
+     if (rc != XEGFX_OK) {
+         strlcpy(fM3dWhy, "alloc-failed", sizeof fM3dWhy);
+@@ -1854,6 +2405,14 @@
+         desc.reserved = 0;
+     }
+ 
++    fScanoutCapBytes = (uint64_t)desc.pitch * h;
++    if (fScalerOk) {
++        desc.width  = rasterW;
++        desc.height = rasterH;
++        desc.pitch  = rasterW * 4u;
++    }
++    fDeskW = desc.width;
++    fDeskH = desc.height;
+     fScanout[0]      = desc;
+     fScanoutCount    = 1;
+     fActiveScanout   = 0;
+@@ -2103,6 +2662,11 @@
+         return;
+     if (!fAccelObj)
+         (void)m3dFindAccel(false);
++    if (startVblankThread()) {
++        stopVblankFallback();
++        fVblSource = 3u;
++        return;
++    }
+     fVblSource = fAccelObj ? 2u : 1u;
+     startVblankFallback();
+     XLOG("M3d: vblank source armed (%s)", fAccelObj ? "accel frame counter"
+@@ -2114,6 +2678,7 @@
+ {
+     if (!fM3d)
+         return;
++    fVblThreadOn = false;	/* E3: the thread idles; stop() ends it */
+     stopVblankFallback();
+     fVblSource = 0;
+ }
+@@ -2138,18 +2703,62 @@
+ /* ======================================================================= */
+ /* cursor                                                                  */
+ /* ======================================================================= */
++
++bool
++XeGfxFramebuffer::hwCursorOn()
++{
++    if (fSwCursor < 0) {
++        uint32_t sw = 0;
++        xgNvramU32("xegfx-disp-swcursor", &sw);
++        fSwCursor = sw != 0;
++    }
++    return !fSwCursor && fKapi && fKapi->reserved[6] != 0 && fKapi->reserved[7] != 0;
++}
+ 
+ IOReturn
+ XeGfxFramebuffer::setCursorImage(void *cursorImage)
+ {
+     /*
+-     * WindowServer hands us a converted cursor here.  Keep it cheap: record
+-     * the surface, let cursorApplyLocked() commit it.  i915's cursor plane is
+-     * an ordinary atomic plane; the core side copies the image into it.
++     * C1 (native-display docs/32-FRAME-RATE.md §32.18): IOFramebuffer converts WindowServer's cursor to 32-bit ARGB
++     * here (convertCursorImage, at most 192x192 desktop pixels: the core scales it onto a 128x128 plane, 2/3 for the
++     * HiDPI desktop on the 2560x1600 raster) and the core puts it on i915's cursor plane.  A refused image (too large,
++     * or IOFramebuffer's discovery calls) is drawn by WindowServer itself.  Without the core's cursor this only
++     * records, as before.
+      */
+     IOLockLock(fCursorLock);
+     fCurSurface = 0;                 /* 0 = "re-upload needed" */
+     IOLockUnlock(fCursorLock);
++    if (!hwCursorOn()) return kIOReturnSuccess;
++    const uint32_t dim = 192;
++    const size_t bytes = (size_t)dim * dim * 4;
++    uint32_t *staging = (uint32_t *)IOMalloc(bytes);
++    if (!staging) return kIOReturnNoMemory;
++    bzero(staging, bytes);
++    IOHardwareCursorDescriptor d; bzero(&d, sizeof d);
++    d.majorVersion = kHardwareCursorDescriptorMajorVersion;
++    d.minorVersion = kHardwareCursorDescriptorMinorVersion;
++    d.width = dim; d.height = dim;
++    d.bitDepth = 32;
++    d.supportedSpecialEncodings = kTransparentEncodedPixel;
++    IOHardwareCursorInfo ci; bzero(&ci, sizeof ci);
++    ci.majorVersion = kHardwareCursorInfoMajorVersion;
++    ci.minorVersion = kHardwareCursorInfoMinorVersion;
++    ci.hardwareCursorData = (UInt8 *)staging;
++    const bool converted = convertCursorImage(cursorImage, &d, &ci);
++    uint32_t rc = XEGFX_ERR_UNSUPPORTED;
++    if (converted && ci.cursorWidth && ci.cursorHeight) {
++        XeGfxKmsCursorImageFn img = (XeGfxKmsCursorImageFn)(uintptr_t)fKapi->reserved[6];
++        rc = img(fCtx, staging, ci.cursorWidth, ci.cursorHeight, ci.cursorWidth * 4u);
++    }
++    IOFree(staging, bytes);
++    if (rc != XEGFX_OK) {
++        if (++fCurRefused <= 6) XLOG("C1: cursor image %ux%u %s (rc 0x%x) -- WindowServer draws it", (unsigned)ci.cursorWidth,
++                                     (unsigned)ci.cursorHeight, converted ? "refused by the core" : "not converted", rc);
++        return kIOReturnUnsupported;
++    }
++    if (++fCurImages <= 6 || (fCurImages % 500) == 0)
++        XLOG("C1: hardware cursor image %u: %ux%u hot %u,%u", fCurImages, (unsigned)ci.cursorWidth, (unsigned)ci.cursorHeight,
++             (unsigned)ci.cursorHotSpotX, (unsigned)ci.cursorHotSpotY);
+     return kIOReturnSuccess;
+ }
+ 
+@@ -2167,6 +2776,11 @@
+     fCurY = y;
+     fCurVisible = visible;
+     IOLockUnlock(fCursorLock);
++    // C1: the core only writes CUR_POS/CUR_CTL/CUR_BASE (no commit), cheap enough for every mouse event
++    if (hwCursorOn()) {
++        XeGfxKmsCursorMoveFn move = (XeGfxKmsCursorMoveFn)(uintptr_t)fKapi->reserved[7];
++        if (move(fCtx, x, y, visible ? 1u : 0u) != XEGFX_OK) return kIOReturnNotReady;
++    }
+     return kIOReturnSuccess;
+ }
+ 
+@@ -2240,12 +2854,10 @@
+     }
+     if (attribute == kIOHardwareCursorAttribute) {
+         /*
+-         * P1-6: the cursor is recorded, not programmed (M3).  Reporting 1 here
+-         * makes WindowServer skip its software cursor and leaves the pointer
+-         * invisible, so M2b advertises a software cursor.
+-         * TODO(M3): return 1 when the i915 cursor plane is actually live.
++         * P1-6: without a cursor plane, reporting 1 would make WindowServer skip its software cursor and leave the
++         * pointer invisible.  C1: with the core's cursor (KAPI reserved[6]/[7]) it is 1.
+          */
+-        if (value) *value = 0;
++        if (value) *value = hwCursorOn() ? 1 : 0;
+         return kIOReturnSuccess;
+     }
+     return IOFramebuffer::getAttribute(attribute, value);
+@@ -2326,6 +2938,130 @@
+     }
+ }
+ 
++/*
++ * B1: laptop panel brightness, as NVRMFB does it (docs/31 §31.4).  macOS hands the brightness keys and the slider to
++ * an AppleBacklightDisplay, which IOGraphics creates for a built-in LCD connection when a service named "backlight"
++ * exists below the framebuffer before it is first opened.  This handler is that service: IODisplay offers
++ * "brightness" and "linear-brightness" through it, and a change goes to the core's KAPI backlight entry (i915's own
++ * backlight) on a thread call, because IODisplay calls doIntegerSet() with the framebuffer lock held.
++ */
++static const SInt32 kXeGfxMinBacklight = 5;   /* never 0: some panels switch the backlight off completely */
++
++class XeGfxBacklightHandler : public IODisplayParameterHandler {
++    OSDeclareDefaultStructors(XeGfxBacklightHandler)
++    XeGfxKmsBacklightFn fFn = nullptr;
++    void *fCtx = nullptr;
++    thread_call_t fApply = nullptr;
++    volatile SInt32 fPending = -1;
++    SInt32 fLevel = 100;
++    static void applyFire(thread_call_param_t me, thread_call_param_t);
++public:
++    static XeGfxBacklightHandler *with(XeGfxKmsBacklightFn fn, void *ctx, uint32_t level);
++    bool setDisplay(IODisplay *display) APPLE_KEXT_OVERRIDE;
++    bool doIntegerSet(OSDictionary *params, const OSSymbol *paramName, UInt32 value) APPLE_KEXT_OVERRIDE;
++    bool doDataSet(const OSSymbol *, OSData *) APPLE_KEXT_OVERRIDE { return false; }
++    bool doUpdate() APPLE_KEXT_OVERRIDE { return true; }
++    void free() APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(XeGfxBacklightHandler, IODisplayParameterHandler)
++
++XeGfxBacklightHandler *
++XeGfxBacklightHandler::with(XeGfxKmsBacklightFn fn, void *ctx, uint32_t level)
++{
++    XeGfxBacklightHandler *h = OSTypeAlloc(XeGfxBacklightHandler);
++    if (!h || !h->init()) { OSSafeReleaseNULL(h); return nullptr; }
++    h->fFn = fn;
++    h->fCtx = ctx;
++    h->fApply = thread_call_allocate(applyFire, h);
++    h->fLevel = level <= 100 ? (SInt32)level : 100;
++    if (!h->fApply) { h->release(); return nullptr; }
++    return h;
++}
++
++void
++XeGfxBacklightHandler::free()
++{
++    if (fApply) {
++        thread_call_cancel(fApply);
++        while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); }
++        fApply = nullptr;
++    }
++    IODisplayParameterHandler::free();
++}
++
++/* the display may have no IODisplayParameters yet; IODisplay::setProperties() only accepts parameters listed there */
++bool
++XeGfxBacklightHandler::setDisplay(IODisplay *display)
++{
++    if (!display) return false;
++    OSObject *old = display->copyProperty(gIODisplayParametersKey);
++    OSDictionary *cur = OSDynamicCast(OSDictionary, old);
++    OSDictionary *params = cur ? OSDictionary::withDictionary(cur) : OSDictionary::withCapacity(2);
++    OSSafeReleaseNULL(old);
++    if (!params) return false;
++    IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, 100);
++    IODisplay::setParameter(params, gIODisplayBrightnessKey, fLevel);
++    IODisplay::addParameter(params, gIODisplayLinearBrightnessKey, 0, 100);
++    IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, fLevel);
++    display->setProperty(gIODisplayParametersKey, params);
++    params->release();
++    XLOG("B1: brightness parameters on %s, panel at %d%%", display->getName(), (int)fLevel);
++    return true;
++}
++
++bool
++XeGfxBacklightHandler::doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value)
++{
++    if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey) return false;
++    fPending = value > 100 ? 100 : (SInt32)value;
++    thread_call_enter(fApply);
++    return true;
++}
++
++void
++XeGfxBacklightHandler::applyFire(thread_call_param_t p, thread_call_param_t)
++{
++    XeGfxBacklightHandler *me = (XeGfxBacklightHandler *)p;
++    SInt32 v;
++    do { v = me->fPending; } while (!OSCompareAndSwap((UInt32)v, (UInt32)-1, (volatile UInt32 *)&me->fPending));
++    if (v < 0) return;
++    int32_t percent = v < kXeGfxMinBacklight ? kXeGfxMinBacklight : v;
++    uint32_t now = 0;
++    uint32_t rc = me->fFn(me->fCtx, percent, &now);
++    if (rc == XEGFX_OK) me->fLevel = v;
++    else XLOG("B1: setting %d%% failed (0x%x)", (int)percent, rc);
++}
++
++/* B1: before IOFramebuffer::start(), because IOFramebuffer::open looks for "backlight" (gIOFBHaveBacklight) */
++void
++XeGfxFramebuffer::publishBacklight()
++{
++    if (!fKapi || !(fConn.caps & XEGFX_CONN_CAP_INTERNAL) || !(fKapi->flags & XEGFX_KMS_KAPI_FLAG_BACKLIGHT) ||
++        !fKapi->reserved[4]) {
++        XLOG("B1: no backlight control (internal %d, core flag %d)", (fConn.caps & XEGFX_CONN_CAP_INTERNAL) ? 1 : 0,
++             (fKapi && (fKapi->flags & XEGFX_KMS_KAPI_FLAG_BACKLIGHT)) ? 1 : 0);
++        return;
++    }
++    XeGfxKmsBacklightFn fn = (XeGfxKmsBacklightFn)(uintptr_t)fKapi->reserved[4];
++    uint32_t level = 0;
++    uint32_t rc = fn(fCtx, -1, &level);
++    if (rc != XEGFX_OK) {
++        XLOG("B1: core has no panel backlight (0x%x) -- no brightness control", rc);
++        return;
++    }
++    fBacklight = XeGfxBacklightHandler::with(fn, fCtx, level);
++    if (!fBacklight) { XLOG("B1: backlight handler allocation failed"); return; }
++    fBacklight->setName("backlight");
++    if (!fBacklight->attach(this)) {
++        OSSafeReleaseNULL(fBacklight);
++        XLOG("B1: backlight handler attach failed");
++        return;
++    }
++    fBacklight->registerService(kIOServiceSynchronous);
++    setProperty("XeGfxBacklight", (unsigned long long)level, 32);
++    XLOG("B1: panel backlight at %u%% -- brightness keys and slider through AppleBacklightDisplay", level);
++}
++
+ IOReturn
+ XeGfxFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseType,
+                                 UInt32 *primary, UInt32 *extended,
+@@ -2338,7 +3074,9 @@
+     if (senseType)   *senseType   = 0;
+     if (primary)     *primary     = 0;
+     if (extended)    *extended    = 0;
+-    if (displayType) *displayType = 0;   /* kGenericLCD lives in IONDRVSupport */
++    /* B1: an LCD when there is a backlight handler -- AppleBacklightDisplay::probe takes only an LCD connection
++     * (kGenericLCD = 20 in IOMacOSVideo.h); without one, 0 as before */
++    if (displayType) *displayType = fBacklight ? 20 : 0;
+     return kIOReturnSuccess;
+ }
+ 
+@@ -2895,12 +3633,25 @@
+  * CoreDisplay may round it through kHz.  The V2 struct carries no mode id, so
+  * there is nothing caller-specific to ignore.
+  */
++static bool xgDtMatches(const IODetailedTimingInformationV2 &a, const IODetailedTimingInformationV2 *dt);
++
+ bool
+ XeGfxFramebuffer::timingMatchesAccepted(const IODetailedTimingInformationV2 *dt) const
+ {
+     if (!dt)
+         return false;
+-    const IODetailedTimingInformationV2 &a = fAcceptedDt;
++    if (xgDtMatches(fAcceptedDt, dt))
++        return true;
++    for (uint32_t i = 0; fK3 && i < fK3Count; i++)
++        if (xgDtMatches(fMeasuredModes[2 + i].dt, dt))
++            return true;
++    return false;
++}
++
++/* the accepted-timing comparison, against one reference: exact raster and sync, clock within 0.5% */
++static bool
++xgDtMatches(const IODetailedTimingInformationV2 &a, const IODetailedTimingInformationV2 *dt)
++{
+     if (!a.pixelClock || !a.horizontalActive || !a.verticalActive)
+         return false;
+ 
+@@ -3019,8 +3770,16 @@
+      * unless the M3d expose arm is chosen and the preflight is green.
+      */
+     bool kapiOk = readKapi(provider) && kapiInit();
+-    if (kapiOk)
++    if (kapiOk) {
+         loadNubEdid(provider);
++        buildK3Modes();
++        fScalerOk = fK3 && (fKapi->flags & XEGFX_KMS_KAPI_FLAG_PLANE) && fKapi->reserved[3] != 0;
++        if (fScalerOk)
++            publishScalerCaps();
++        else
++            XLOG("A1: no scaled desktops (K3 %d, core setPlane %d)", fK3 ? 1 : 0,
++                 (fKapi->flags & XEGFX_KMS_KAPI_FLAG_PLANE) ? 1 : 0);
++    }
+     if (!kapiOk) {
+         XLOG("S3: check (a) FAILED during preflight; registering an INERT "
+              "framebuffer -- open denied, no mode, no property, no NVRAM write "
+@@ -3071,6 +3830,7 @@
+         setProperty("IOFBDependentID", 0x5845474600000001ull, 64);
+         setProperty("IOFBDependentIndex", (unsigned long long)fIndex, 32);
+     }
++    publishBacklight();
+     XLOG("S3: IOFramebuffer::start BEGIN (dependent identity configured)");
+     if (!IOFramebuffer::start(provider))
+         return false;
+@@ -3089,8 +3849,10 @@
+     if (fM3d) {
+         /* The KAPI scanout is mapped after the IOFramebuffer is registered:
+          * it is pure memory/GGTT work, no display register is touched. */
+-        if (fM3dChecks == XEGFX_M3D_CHECKS_ALL && m3dAllocScanout())
++        if (fM3dChecks == XEGFX_M3D_CHECKS_ALL && m3dAllocScanout()) {
+             fM3dCandidate = true;
++            k4ApplyBootState();
++        }
+         fWorkLoop = getWorkLoop();
+         setProperty("XeGfxControllerReady", fWorkLoop ? kOSBooleanTrue : kOSBooleanFalse);
+         XLOG("M3d: controller workloop %s before accel pairing", fWorkLoop ? "READY" : "MISSING");
+@@ -3259,6 +4021,11 @@
+ {
+     XLOG("stopping");
+ 
++    if (fBacklight) {
++        fBacklight->detach(this);
++        OSSafeReleaseNULL(fBacklight);
++    }
++
+     /* Disarm the S3 watchdog first: after this point the object may go away
+      * and the callback must not touch fOpenCount or NVRAM any more. */
+     stopS3Watchdog();
+@@ -3282,6 +4049,7 @@
+     m3dStopPresentRetry();
+     if (fM3d)
+         m3dStopVblankSource();
++    stopVblankThread();
+     if (fAccelObj) {
+         fAccelObj->release();
+         fAccelObj = nullptr;
+@@ -3469,6 +4237,7 @@
+     /* stop() normally freed it; free() can be reached without stop() when
+      * start() failed half-way, so be defensive. */
+     stopS3Watchdog();
++    OSSafeReleaseNULL(fBacklight);
+ 
+     if (fL0Timer) {
+         thread_call_cancel(fL0Timer);
+@@ -3495,6 +4264,8 @@
+     if (fGamma)        { IOFree(fGamma, fGammaLen); fGamma = nullptr; fGammaLen = 0; }
+     if (fGate)         { IOLockFree(fGate); fGate = nullptr; }
+     if (fCursorLock)   { IOLockFree(fCursorLock); fCursorLock = nullptr; }
++    stopVblankThread();
++    if (fVblLock)      { IOLockFree(fVblLock); fVblLock = nullptr; }
+     IOFramebuffer::free();
+ }
+ 
+--- a/kexts/XeGfxDisplay/src/xegfx_kms_kapi.h
++++ b/kexts/XeGfxDisplay/src/xegfx_kms_kapi.h
+@@ -436,11 +436,72 @@
+     return 1;
+ }
+ 
++/*
++ * K3 additive modeset extension (same table, version 1; core docs/03-PLAN §30.17):
++ * getTiming(fbIndex = XEGFX_KMS_FIXED_MODE_BASE + n) returns the panel's fixed mode n in the 13-word format, and the
++ * v1 setMode slot (ctx, 0, n) commits it through i915 -- a full modeset, ~1 s, with DSC above 60 Hz.  Both answer
++ * NOT_READY unless the core committed a mode of its own at boot (NVRAM xegfx-disp-kms >= 3).
++ */
++#define XEGFX_KMS_KAPI_FLAG_MODESET       (1U << 2)
++#define XEGFX_KMS_FIXED_MODE_BASE         0x100U
++#define XEGFX_KMS_MAX_FIXED_MODES         4U
++/*
++ * K4 boot mode (native-display docs/32-FRAME-RATE.md §32.20): the core's boot commit runs the mode last set (NVRAM
++ * xegfx-disp-bootmode, written by this adapter).  getTiming(fbIndex = XEGFX_KMS_BOOT_STATE_INDEX) says what it ran:
++ * word 0 the tag, 1 the fixed mode index, 2/3 the desktop on the plane, 4 its pitch, 5 joined, 6 1 = the saved mode.
++ * An older core answers NOT_FOUND.
++ */
++#define XEGFX_KMS_BOOT_STATE_INDEX        0x200U
++#define XEGFX_KMS_BOOT_STATE_TAG          0x4b340001U
++#define XEGFX_NVRAM_BOOT_MODE             "xegfx-disp-bootmode"   /* 16 B LE: 'XBM1', refresh mHz, width, height */
++#define XEGFX_BOOT_MODE_MAGIC             0x314d4258U
++
++/*
++ * A1 additive scaled-desktop extension (same table, version 1): reserved[3] is setPlane(ctx, width, height, pitch),
++ * putting a width x height desktop (linear XRGB8888, pitch a multiple of 64) on the primary plane scaled onto the
++ * current raster.  NOT_READY unless the core committed a mode of its own at boot.
++ */
++#define XEGFX_KMS_KAPI_FLAG_PLANE         (1U << 3)
++#define XEGFX_KMS_PLANE_MAX_W             3840U   /* the 1920x1200 HiDPI backing */
++#define XEGFX_KMS_PLANE_MAX_H             2400U
++typedef uint32_t (*XeGfxKmsSetPlaneFn)(void *ctx, uint32_t width, uint32_t height, uint32_t pitch);
++
++/*
++ * B1 additive backlight extension (same table, version 1): reserved[4] is backlight(ctx, set, &percent).  set >= 0
++ * sets the panel brightness to that percent (0..100) through i915's backlight; set < 0 only reads it back.
++ */
++#define XEGFX_KMS_KAPI_FLAG_BACKLIGHT     (1U << 4)
++typedef uint32_t (*XeGfxKmsBacklightFn)(void *ctx, int32_t setPercent, uint32_t *percentOut);
++
++/*
++ * E3 additive vblank extension (same table, version 1): reserved[5] is waitVblank(ctx, last, timeoutUs, &count,
++ * &ageNs).  It blocks (thread context only) until pipe A's i915 vblank count is no longer `last` or timeoutUs passed,
++ * and returns the count and the age of that vblank by i915's own timestamp.  BUSY: the pipe is off (a modeset) or no
++ * vblank came in time.
++ */
++#define XEGFX_KMS_KAPI_FLAG_VBLANK        (1U << 5)
++typedef uint32_t (*XeGfxKmsWaitVblankFn)(void *ctx, uint64_t last, uint32_t timeoutUs, uint64_t *countOut,
++                                         uint64_t *ageNsOut);
++
++/*
++ * C1 hardware cursor (same table, no flag bit -- an older adapter must keep accepting the table): reserved[6] is
++ * cursorImage(ctx, argb, width, height, pitch) -- straight-alpha ARGB in desktop pixels; width 0 hides it; UNSUPPORTED
++ * for one the 128x128 plane cannot hold after scaling (WindowServer then draws it).  reserved[7] is
++ * cursorMove(ctx, x, y, visible) -- the image's top-left corner in desktop pixels; it only writes registers.  Both 0 on
++ * an older core: the adapter then keeps the software cursor.
++ */
++typedef uint32_t (*XeGfxKmsCursorImageFn)(void *ctx, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch);
++typedef uint32_t (*XeGfxKmsCursorMoveFn)(void *ctx, int32_t x, int32_t y, uint32_t visible);
++
+ /* Unknown flag bits mean a newer core; the adapter must not guess. */
+ static inline int xegfxKmsFlagsKnown(uint32_t flags)
+ {
+     return (flags & ~(XEGFX_KMS_KAPI_FLAG_READ_ONLY |
+-                      XEGFX_KMS_KAPI_FLAG_SCANOUT)) == 0;
++                      XEGFX_KMS_KAPI_FLAG_SCANOUT |
++                      XEGFX_KMS_KAPI_FLAG_MODESET |
++                      XEGFX_KMS_KAPI_FLAG_PLANE |
++                      XEGFX_KMS_KAPI_FLAG_BACKLIGHT |
++                      XEGFX_KMS_KAPI_FLAG_VBLANK)) == 0;
+ }
+ 
+ static inline XeGfxKmsAllocScanoutFn
