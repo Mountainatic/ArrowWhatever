@@ -1,0 +1,1149 @@
+# 0033 Mesa ANV: XeMTL explicit residency, push of read-only SSBO data and of constants behind the address table
+#
+# Base:  Mesa bffd91947efc1932da99aca69fc540d6d4201b0c (26.3.0-devel) + NvGfx 5a19a73f gpu/userland/patches/
+#        mesa-macos.patch + mesa-xegfx.patch (as gpu/userland/scripts/build_mesa.sh applies them)
+# Files: src/intel/compiler/brw/brw_shader.cpp,
+#        src/intel/vulkan/{anv_batch_chain.c, anv_device.c, anv_nir.h, anv_nir_apply_pipeline_layout.c,
+#        anv_nir_compute_push_layout.c, anv_nir_push_constants_analysis.c, anv_nir_push_descriptor_analysis.c,
+#        anv_physical_device.c, anv_private.h, anv_shader_compile.c, anv_types.h, genX_cmd_draw.c,
+#        i915/anv_batch_chain.c}
+# Apply: in the Mesa tree after the two NvGfx patches: patch -p1 < patches/0033-mesa-anv-xemtl-residency-pointer-push.patch
+# Build: libvulkan_intel.dylib be2e76920ce3 (install_name_tool: libdrm from @loader_path, no rpath; ad-hoc signed),
+#        installed as /Library/GPUBundles/xemtl/libvulkan_intel.dylib
+#
+# Generated-by: LLM
+# Mesa's AGENTS.md asks that AI-written Mesa code be labelled and that AI-written prose about it carry this word:
+# biblioklept.  The code below adds no comments to Mesa sources.  This is not a Mesa merge request.
+#
+# Explicit residency for the XeMTL plugin (i915/anv_batch_chain.c, anv_batch_chain.c, anv_device.c):
+#   - every execbuffer carries every VkDeviceMemory, and WindowServer keeps ~100 imported IOSurfaces alive, each a GEM
+#     object the kernel looks up, pins and fences on every submit.  Four exported entry points let the plugin narrow
+#     that: anv_xemtl_memory_explicit(memory, on) marks a memory, anv_xemtl_cmd_use_memory(cmd, memory) declares that a
+#     command buffer uses it (it then rides in that command buffer's surface_relocs), anv_xemtl_cmd_exclusive(cmd)
+#     promises its declarations are complete, anv_xemtl_stats(out[3]) reports marked memories, declared uses and
+#     memories left out of submits.
+#   - a marked memory is left out only of an execbuffer whose command buffers all made that promise: a softpinned
+#     memory that no execbuffer ever carried is not bound on the GPU, so a missed declaration would read or write
+#     nothing.  Uploads, readbacks and everything else still carry it.  Declarations and the promise last until the
+#     command buffer is reset or freed; freeing a memory forgets it.
+#
+# Push of read-only SSBO data (anv_nir_apply_pipeline_layout.c, anv_nir_push_constants_analysis.c,
+# anv_nir_compute_push_layout.c, genX_cmd_draw.c, anv_types.h):
+#   - SSBO bindings are pushable; a load_ssbo that is non-writeable, not volatile or coherent, at a constant offset,
+#     becomes a candidate push range (block type SSBO) like a UBO range.
+#   - SSBO offsets are only 4-byte aligned while 3DSTATE_CONSTANT takes 32-byte aligned addresses, so a range is pushed
+#     from address & ~31 with one extra 32-byte register of slack, and the shader reads it at a dynamic offset: the
+#     driver constant ssbo_push_shift[stage][slot] (8 bits per pushed range, anv_types.h) holds address & 31, set when
+#     the descriptors are flushed, and push constants are marked dirty when a shift changes.  The robustness bound for
+#     a pushed SSBO is its bound range plus that shift.
+#
+# Push of constants behind the plugin's address table (the same files):
+#   - the plugin turns every Metal buffer argument into a 64-bit pointer kept in a dynamic UBO table (binding 640), so
+#     shader constants arrive as load_global_constant(iadd(pack_64_2x32_split(load_ubo(table, k)), c)).  A load of
+#     that shape (readonly and reorderable access, constant table offset k, constant c below 2048) becomes a candidate
+#     push range of block type UBO_POINTER keyed by (table binding, k).  The NIR pass that rewrites those loads into
+#     shifted push-data loads runs before the UBO lowering.
+#   - at draw time the range's address is read from the table through the BO's CPU mapping (or the host-pointer
+#     import's own mapping, recorded on the BO at import and map time), including the binding's dynamic offset; an
+#     unmapped table falls back to the workaround address with a one-time warning.  The same shift mechanism as SSBO
+#     push applies.
+#   - limits keep it from making shaders worse: XEMTL_PTR_PUSH_MIN (default 16, minimum benefit), XEMTL_PTR_PUSH_MAXLEN
+#     (64 registers), XEMTL_PTR_PUSH_MAXSSA (16000, skip very large shaders), XEMTL_PTR_PUSH_LOOPS (default off: loads
+#     inside loops are not pushed).
+#   - range matching: a pointer range carries the table's set and index, so the UBO lowering and the push-descriptor
+#     analysis now skip pointer and SSBO ranges when they look for the range of an ordinary UBO load.  Before, a plain
+#     load from the table (bytes 48-55, a pointer) matched the pointer range at those offsets and read pushed data
+#     instead of the pointer, and every load through that pointer read garbage: Core Animation's glass and colour
+#     shaders composited app Metal layers black.
+#
+# Compiler (brw_shader.cpp, assign_curb_setup): registers read by an indirect MOV with an immediate length count as
+# used push registers for that whole length, so the shifted reads above are not dropped from the push layout.
+#
+# Switches: XEMTL_SSBO_PUSH=0/1 overrides; otherwise both pushes are on unless /Library/GPUBundles/.xemtl-no-ssbo-push
+# exists.  The setting is part of the pipeline cache key (anv_shader_compile.c).
+#
+# Verified offline with WindowServer's own 280 fragment shaders (taken from its SPIR-V cache and lowered the way the
+# plugin lowers them; scripts/tools/anv/): every shader rendered with deterministic inputs both with the pushes on and
+# off, compared byte for byte: 278 identical, the other 2 differ only in channels the shader never writes.  Pointer
+# push changes 25 of them: SENDs 1224 -> 167, estimated cycles -32.9%, one shader slower (3744 -> 4630).  In
+# WindowServer: Metal layers correct again, Genie about 79 fps with the GPU clock at its minimum.
+#
+--- a/src/intel/compiler/brw/brw_shader.cpp
++++ b/src/intel/compiler/brw/brw_shader.cpp
+@@ -338,6 +338,16 @@
+          } else {
+             assert(inst->src[i].nr < 64);
+             used |= BITFIELD64_BIT(inst->src[i].nr);
++
++            if (inst->opcode == SHADER_OPCODE_MOV_INDIRECT && i == 0 &&
++                inst->src[2].file == IMM) {
++               const unsigned last =
++                  MIN2(inst->src[i].nr +
++                       (inst->src[i].offset + inst->src[2].ud - 1) / REG_SIZE,
++                       63);
++               used |= BITFIELD64_RANGE(inst->src[i].nr,
++                                        last - inst->src[i].nr + 1);
++            }
+ 
+             assert(inst->src[i].nr < this->push_data_size);
+ 
+--- a/src/intel/vulkan/anv_batch_chain.c
++++ b/src/intel/vulkan/anv_batch_chain.c
+@@ -934,6 +934,10 @@
+    u_vector_finish(&cmd_buffer->bt_block_states);
+ 
+    anv_reloc_list_finish(&cmd_buffer->surface_relocs);
++   {
++      extern void anv_xemtl_cmd_forget(const struct anv_cmd_buffer *cmd_buffer);
++      anv_xemtl_cmd_forget(cmd_buffer);
++   }
+ 
+    u_vector_finish(&cmd_buffer->seen_bbos);
+ 
+@@ -967,6 +971,10 @@
+    cmd_buffer->bt_next = ANV_STATE_NULL;
+ 
+    anv_reloc_list_clear(&cmd_buffer->surface_relocs);
++   {
++      extern void anv_xemtl_cmd_forget(const struct anv_cmd_buffer *cmd_buffer);
++      anv_xemtl_cmd_forget(cmd_buffer);
++   }
+ 
+    /* Reset the list of seen buffers */
+    cmd_buffer->seen_bbos.head = 0;
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -2016,6 +2016,10 @@
+                                                   &mem->bo);
+       if (result != VK_SUCCESS)
+          goto fail;
++
++      mem->bo->xemtl_host_map = mem->vk.host_ptr;
++      mem->bo->xemtl_host_offset = 0;
++      mem->bo->xemtl_host_size = mem->vk.size;
+ 
+       goto success;
+    }
+@@ -2169,6 +2173,10 @@
+    simple_mtx_lock(&device->mutex);
+    list_del(&mem->link);
+    simple_mtx_unlock(&device->mutex);
++   {
++      extern void anv_xemtl_memory_forget(const struct anv_device_memory *mem);
++      anv_xemtl_memory_forget(mem);
++   }
+ 
+    if (mem->map) {
+       const VkMemoryUnmapInfo unmap = {
+@@ -2260,6 +2268,10 @@
+    mem->map = map;
+    mem->map_size = map_size;
+    mem->map_delta = (offset - map_offset);
++
++   mem->bo->xemtl_host_map = map;
++   mem->bo->xemtl_host_offset = map_offset;
++   mem->bo->xemtl_host_size = map_size;
+    *ppData = mem->map + mem->map_delta;
+ 
+    return VK_SUCCESS;
+@@ -2281,6 +2293,9 @@
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   if (mem->bo->xemtl_host_map == mem->map)
++      mem->bo->xemtl_host_map = NULL;
++
+    mem->map = NULL;
+    mem->map_size = 0;
+    mem->map_delta = 0;
+--- a/src/intel/vulkan/anv_nir.h
++++ b/src/intel/vulkan/anv_nir.h
+@@ -211,13 +211,29 @@
+    return nir_intrinsic_resource_block_intel(intrin);
+ }
+ 
++static inline bool
++anv_nir_is_pushable_ssbo_load(const nir_intrinsic_instr *intrin)
++{
++   return intrin->intrinsic == nir_intrinsic_load_ssbo &&
++      anv_nir_is_promotable_ubo_binding(intrin->src[0]) &&
++      nir_src_is_const(intrin->src[1]) &&
++      (nir_intrinsic_access(intrin) & ACCESS_NON_WRITEABLE) &&
++      !(nir_intrinsic_access(intrin) & (ACCESS_VOLATILE | ACCESS_COHERENT));
++}
++
+ bool anv_nir_is_pushable_pointer(nir_intrinsic_instr *intrin,
+                                  uint32_t *out_push_offset,
+                                  uint32_t *out_load_offset);
+ 
++bool anv_nir_is_pushable_ubo_pointer(nir_intrinsic_instr *intrin,
++                                     uint32_t *out_block,
++                                     uint32_t *out_ptr_offset,
++                                     uint32_t *out_load_offset);
++
+ void anv_nir_analyze_push_constants_ranges(nir_shader *nir,
+                                            const struct intel_device_info *devinfo,
+                                            const struct anv_pipeline_push_map *push_map,
++                                           bool ubo_ptr,
+                                            struct anv_push_range out_ranges[4]);
+ 
+ enum anv_pipeline_behavior anv_nir_clear_shader_analysis(nir_shader *shader);
+--- a/src/intel/vulkan/anv_nir_apply_pipeline_layout.c
++++ b/src/intel/vulkan/anv_nir_apply_pipeline_layout.c
+@@ -212,6 +212,12 @@
+         set_layout->binding[binding].type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ||
+         set_layout->binding[binding].type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) &&
+        type == nir_descriptor_type_uniform_buffer)
++      state->set[set].binding[binding].properties |= BINDING_PROPERTY_PUSHABLE;
++
++   if (state->pdevice->xemtl_ssbo_push &&
++       is_set_pushable && is_binding_pushable &&
++       set_layout->binding[binding].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
++       type == nir_descriptor_type_storage_buffer)
+       state->set[set].binding[binding].properties |= BINDING_PROPERTY_PUSHABLE;
+ }
+ 
+--- a/src/intel/vulkan/anv_nir_compute_push_layout.c
++++ b/src/intel/vulkan/anv_nir_compute_push_layout.c
+@@ -32,6 +32,7 @@
+ struct push_data {
+    bool push_ubo_ranges;
+    bool push_pointer_ranges;
++   bool push_ssbo_ranges;
+    bool needs_wa_18019110168;
+    bool needs_dyn_tess_config;
+    BITSET_DECLARE(push_dwords, PUSH_CONSTANTS_DWORDS);
+@@ -58,6 +59,18 @@
+       BITSET_SET(data->push_dwords, push_reg_mask_start / 4);
+    }
+ 
++   if (data->push_ssbo_ranges) {
++      const uint32_t shift_start =
++         anv_drv_const_offset(drv_data.gfx.ssbo_push_shift[nir->info.stage]);
++      BITSET_SET(data->push_dwords, shift_start / 4);
++
++      if (robust_flags & BRW_ROBUSTNESS_SSBO) {
++         const uint32_t push_reg_mask_start =
++            anv_drv_const_offset(drv_data.gfx.push_reg_mask[nir->info.stage]);
++         BITSET_SET(data->push_dwords, push_reg_mask_start / 4);
++      }
++   }
++
+    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       if (push_info->fragment_dynamic) {
+          const uint32_t fs_config_start =
+@@ -118,9 +131,12 @@
+                  struct brw_base_prog_key *prog_key,
+                  struct anv_pipeline_bind_map *map,
+                  struct set *lowered_ubo_instrs,
+-                 struct set *lowered_pointer_instrs)
++                 struct set *lowered_pointer_instrs,
++                 struct set *lowered_ssbo_instrs,
++                 bool ubo_ptr)
+ {
+    bool has_const_ubo = false;
++   bool has_const_ssbo = false;
+    bool has_const_ptr_ubo = false;
+    struct push_data data = { 0, };
+    BITSET_ZERO(data.push_dwords);
+@@ -139,6 +155,11 @@
+                   has_const_ubo = true;
+                break;
+ 
++            case nir_intrinsic_load_ssbo:
++               if (nir->info.stage <= MESA_SHADER_FRAGMENT &&
++                   anv_nir_is_pushable_ssbo_load(intrin))
++                  has_const_ssbo = true;
++               break;
+ 
+             case nir_intrinsic_load_push_constant: {
+                unsigned base = nir_intrinsic_base(intrin);
+@@ -161,6 +182,11 @@
+             }
+ 
+             case nir_intrinsic_load_push_data_intel: {
++               if (lowered_ssbo_instrs &&
++                   _mesa_set_search(lowered_ssbo_instrs, intrin)) {
++                  has_const_ssbo = true;
++                  break;
++               }
+                if (lowered_ubo_instrs &&
+                    _mesa_set_search(lowered_ubo_instrs, intrin)) {
+                   has_const_ubo = true;
+@@ -180,9 +206,14 @@
+             }
+ 
+             case nir_intrinsic_load_global_constant: {
+-               uint32_t push_offset, load_offset;
++               uint32_t push_offset, load_offset, block;
+                if (anv_nir_is_pushable_pointer(intrin, &push_offset, &load_offset))
+                   has_const_ptr_ubo = true;
++               else if (ubo_ptr && nir->info.stage <= MESA_SHADER_FRAGMENT &&
++                        anv_nir_is_pushable_ubo_pointer(intrin, &block,
++                                                        &push_offset,
++                                                        &load_offset))
++                  has_const_ssbo = true;
+                break;
+             }
+ 
+@@ -201,6 +232,10 @@
+       has_const_ubo && nir->info.stage != MESA_SHADER_COMPUTE &&
+       !brw_shader_stage_requires_bindless_resources(nir->info.stage);
+ 
++   data.push_ssbo_ranges =
++      has_const_ssbo && nir->info.stage <= MESA_SHADER_FRAGMENT &&
++      !brw_shader_stage_requires_bindless_resources(nir->info.stage);
++
+    data.needs_wa_18019110168 =
+       nir->info.stage == MESA_SHADER_FRAGMENT &&
+       brw_nir_fragment_shader_needs_wa_18019110168(
+@@ -219,6 +254,7 @@
+ 
+    struct set *lowered_ubo_instrs;
+    struct set *lowered_pointer_instrs;
++   struct set *lowered_ssbo_instrs;
+ 
+    /* Amount that should be subtracted to UBOs loads converted to
+     * push_data_intel (in lowered_ubo_or_pointer_instrs)
+@@ -246,7 +282,85 @@
+     */
+    nir_src_rewrite(&intrin->src[1],
+                    nir_iadd(b, resource->src[2].ssa, intrin->src[1].ssa));
++
++   return true;
++}
++
++static nir_def *
++load_shifted_push_data(nir_builder *b,
++                       const struct lower_to_push_data_intel_state *state,
++                       nir_intrinsic_instr *intrin,
++                       const struct anv_push_range *push_range,
++                       uint32_t range_offset,
++                       uint32_t slot,
++                       uint32_t byte_offset)
++{
++   const unsigned num_components =
++      nir_def_last_component_read(&intrin->def) + 1;
++   const int bytes = num_components * (intrin->def.bit_size / 8);
++
++   b->cursor = nir_before_instr(&intrin->instr);
++   nir_def *shift = nir_load_push_data_intel(
++      b, 1, 32, nir_imm_int(b, 0),
++      .base = anv_drv_const_offset(
++         drv_data.gfx.ssbo_push_shift[b->shader->info.stage]),
++      .range = 4);
++   shift = nir_iand_imm(b, nir_ushr_imm(b, shift, slot * 8), 0xff);
++
++   nir_def *data = nir_load_push_data_intel(
++      b, num_components, intrin->def.bit_size, shift,
++      .base = range_offset + byte_offset - push_range->start * 32,
++      .range = bytes + 32);
++   nir_def_replace(&intrin->def, data);
++
++   _mesa_set_add(state->lowered_ubo_instrs, nir_def_as_intrinsic(data));
++   _mesa_set_add(state->lowered_ssbo_instrs, nir_def_as_intrinsic(data));
++   return data;
++}
++
++static bool
++lower_ubo_pointer_to_push_data_intel(nir_builder *b,
++                                     nir_intrinsic_instr *intrin,
++                                     void *_data)
++{
++   uint32_t block, ptr_offset, load_offset;
++   if (intrin->intrinsic != nir_intrinsic_load_global_constant ||
++       b->shader->info.stage > MESA_SHADER_FRAGMENT ||
++       brw_shader_stage_requires_bindless_resources(b->shader->info.stage) ||
++       !anv_nir_is_pushable_ubo_pointer(intrin, &block, &ptr_offset,
++                                        &load_offset))
++      return false;
++
++   const struct lower_to_push_data_intel_state *state = _data;
++   assert(block < state->push_map->block_count);
++   const struct anv_pipeline_binding *binding =
++      &state->push_map->block_to_descriptor[block];
++
++   const unsigned num_components =
++      nir_def_last_component_read(&intrin->def) + 1;
++   const int bytes = num_components * (intrin->def.bit_size / 8);
+ 
++   uint32_t range_offset = 0, slot = 0;
++   const struct anv_push_range *push_range = NULL;
++   for (uint32_t i = 0; i < 4; i++) {
++      const struct anv_push_range *r = &state->bind_map->push_ranges[i];
++      if (r->ubo_ptr && r->set == binding->set &&
++          r->index == binding->index && r->ubo_ptr_offset == ptr_offset &&
++          load_offset >= r->start * 32 &&
++          (load_offset + bytes + 32) <= (r->start + r->length) * 32) {
++         push_range = r;
++         break;
++      }
++      if (r->ssbo || r->ubo_ptr)
++         slot++;
++      range_offset += r->length * 32;
++   }
++
++   if (push_range == NULL)
++      return false;
++
++   load_shifted_push_data(b, state, intrin, push_range, range_offset, slot,
++                          load_offset);
+    return true;
+ }
+ 
+@@ -276,7 +390,9 @@
+       uint32_t range_offset = 0;
+       const struct anv_push_range *push_range = NULL;
+       for (uint32_t i = 0; i < 4; i++) {
+-         if (state->bind_map->push_ranges[i].set == binding->set &&
++         if (!state->bind_map->push_ranges[i].ubo_ptr &&
++             !state->bind_map->push_ranges[i].ssbo &&
++             state->bind_map->push_ranges[i].set == binding->set &&
+              state->bind_map->push_ranges[i].index == binding->index &&
+              byte_offset >= state->bind_map->push_ranges[i].start * 32 &&
+              (byte_offset + bytes) <= (state->bind_map->push_ranges[i].start +
+@@ -303,7 +419,47 @@
+ 
+       _mesa_set_add(state->lowered_ubo_instrs,
+                     nir_def_as_intrinsic(data));
++
++      return true;
++   }
++
++   case nir_intrinsic_load_ssbo: {
++      if (!anv_nir_is_pushable_ssbo_load(intrin) ||
++          b->shader->info.stage > MESA_SHADER_FRAGMENT ||
++          brw_shader_stage_requires_bindless_resources(b->shader->info.stage))
++         return false;
++
++      const struct lower_to_push_data_intel_state *state = _data;
++      const int block = anv_nir_get_ubo_binding_push_block(intrin->src[0]);
++      assert(block < state->push_map->block_count);
++      const struct anv_pipeline_binding *binding =
++         &state->push_map->block_to_descriptor[block];
++      const unsigned byte_offset = nir_src_as_uint(intrin->src[1]);
++
++      const unsigned num_components =
++         nir_def_last_component_read(&intrin->def) + 1;
++      const int bytes = num_components * (intrin->def.bit_size / 8);
++
++      uint32_t range_offset = 0, slot = 0;
++      const struct anv_push_range *push_range = NULL;
++      for (uint32_t i = 0; i < 4; i++) {
++         const struct anv_push_range *r = &state->bind_map->push_ranges[i];
++         if (r->ssbo && r->set == binding->set && r->index == binding->index &&
++             byte_offset >= r->start * 32 &&
++             (byte_offset + bytes + 32) <= (r->start + r->length) * 32) {
++            push_range = r;
++            break;
++         }
++         if (r->ssbo || r->ubo_ptr)
++            slot++;
++         range_offset += r->length * 32;
++      }
+ 
++      if (push_range == NULL)
++         return false;
++
++      load_shifted_push_data(b, state, intrin, push_range, range_offset, slot,
++                             byte_offset);
+       return true;
+    }
+ 
+@@ -666,7 +822,8 @@
+ 
+    struct push_data data =
+       gather_push_data(nir, robust_flags, devinfo, push_info,
+-                       prog_key, map, NULL, NULL);
++                       prog_key, map, NULL, NULL, NULL,
++                       pdevice->xemtl_ssbo_push);
+ 
+    struct anv_push_range push_constant_range =
+       compute_final_push_range(nir, devinfo, &data, map);
+@@ -709,8 +866,10 @@
+    }
+ 
+    struct anv_push_range analysis_ranges[4] = {};
+-   if (data.push_ubo_ranges || data.push_pointer_ranges) {
++   if (data.push_ubo_ranges || data.push_pointer_ranges ||
++       data.push_ssbo_ranges) {
+       anv_nir_analyze_push_constants_ranges(nir, devinfo, push_map,
++                                            pdevice->xemtl_ssbo_push,
+                                             analysis_ranges);
+    }
+ 
+@@ -776,9 +935,17 @@
+       .push_map = push_map,
+       .lowered_ubo_instrs = _mesa_pointer_set_create(NULL),
+       .lowered_pointer_instrs = _mesa_pointer_set_create(NULL),
++      .lowered_ssbo_instrs = _mesa_pointer_set_create(NULL),
+    };
+ 
+-   bool progress = nir_shader_intrinsics_pass(
++   bool progress = false;
++   if (pdevice->xemtl_ssbo_push) {
++      progress |= nir_shader_intrinsics_pass(
++         nir, lower_ubo_pointer_to_push_data_intel,
++         nir_metadata_control_flow, &lower_state);
++   }
++
++   progress |= nir_shader_intrinsics_pass(
+          nir, lower_ubo_or_pointer_to_push_data_intel,
+          nir_metadata_control_flow, &lower_state);
+ 
+@@ -787,7 +954,9 @@
+       data = gather_push_data(nir, robust_flags, devinfo, push_info, prog_key,
+                               map,
+                               lower_state.lowered_ubo_instrs,
+-                              lower_state.lowered_pointer_instrs);
++                              lower_state.lowered_pointer_instrs,
++                              lower_state.lowered_ssbo_instrs,
++                              pdevice->xemtl_ssbo_push);
+ 
+       /* Update the ranges */
+       struct anv_push_range shrinked_push_constant_range =
+@@ -813,6 +982,7 @@
+ 
+    ralloc_free(lower_state.lowered_ubo_instrs);
+    ralloc_free(lower_state.lowered_pointer_instrs);
++   ralloc_free(lower_state.lowered_ssbo_instrs);
+ 
+    /* Do this before calling brw_cs_fill_push_const_info(), it uses the data
+     * in prog_data->push_sizes[].
+@@ -824,7 +994,9 @@
+       /* We only bother to shader-zero pushed client UBOs */
+       if (map->push_ranges[i].length > 0 &&
+           map->push_ranges[i].set < MAX_SETS &&
+-          (robust_flags & BRW_ROBUSTNESS_UBO))
++          !map->push_ranges[i].ubo_ptr &&
++          (robust_flags & (map->push_ranges[i].ssbo ? BRW_ROBUSTNESS_SSBO :
++                                                       BRW_ROBUSTNESS_UBO)))
+          prog_data->robust_ubo_ranges |= (uint8_t) (1 << i);
+ 
+       prog_data->push_sizes[i] = map->push_ranges[i].length * 32;
+--- a/src/intel/vulkan/anv_nir_push_constants_analysis.c
++++ b/src/intel/vulkan/anv_nir_push_constants_analysis.c
+@@ -71,6 +71,8 @@
+ enum push_block_type {
+    PUSH_BLOCK_TYPE_UBO = 1,
+    PUSH_BLOCK_TYPE_POINTER = 2,
++   PUSH_BLOCK_TYPE_SSBO = 3,
++   PUSH_BLOCK_TYPE_UBO_POINTER = 4,
+ };
+ 
+ struct push_block_key
+@@ -95,8 +97,23 @@
+ {
+    const struct intel_device_info *devinfo;
+    struct hash_table *blocks;
++   bool ssbo;
++   bool ubo_ptr;
++   int shifted_min_benefit;
++   int shifted_max_length;
++   bool shifted_skip_loops;
+ };
+ 
++static bool
++block_in_loop(nir_block *block)
++{
++   for (nir_cf_node *n = block->cf_node.parent; n; n = n->parent) {
++      if (n->type == nir_cf_node_loop)
++         return true;
++   }
++   return false;
++}
++
+ static uint32_t
+ push_block_key_hash(const void *key)
+ {
+@@ -129,7 +146,8 @@
+ 
+ static void
+ maybe_add_pushable_ubo(struct push_analysis_state *state,
+-                       nir_intrinsic_instr *intrin)
++                       nir_intrinsic_instr *intrin,
++                       enum push_block_type type)
+ {
+    const int block = anv_nir_get_ubo_binding_push_block(intrin->src[0]);
+    const unsigned byte_offset = nir_src_as_uint(intrin->src[1]);
+@@ -150,13 +168,15 @@
+    const int bytes = num_components * (intrin->def.bit_size / 8);
+    const int start = ROUND_DOWN_TO(byte_offset, state->devinfo->grf_size);
+    const int end = align(byte_offset + bytes, state->devinfo->grf_size);
+-   const int chunks = (end - start) / state->devinfo->grf_size;
++   int chunks = (end - start) / state->devinfo->grf_size;
++   if (type == PUSH_BLOCK_TYPE_SSBO)
++      chunks = MIN2(chunks + 1, 64 - offset);
+ 
+    /* TODO: should we count uses in loops as higher benefit? */
+ 
+    struct push_block_info *info =
+-      get_block_info(state, PUSH_BLOCK_TYPE_UBO, block);
+-   info->offsets |= ((1ull << chunks) - 1) << offset;
++      get_block_info(state, type, block);
++   info->offsets |= (chunks >= 64 ? ~0ull : ((1ull << chunks) - 1)) << offset;
+    info->uses[offset]++;
+ }
+ 
+@@ -230,8 +250,97 @@
+                       nir_src_as_uint(push_intrin->src[0]);
+     return true;
+ }
++
++bool
++anv_nir_is_pushable_ubo_pointer(nir_intrinsic_instr *intrin,
++                                uint32_t *out_block,
++                                uint32_t *out_ptr_offset,
++                                uint32_t *out_load_offset)
++{
++   if (intrin->intrinsic != nir_intrinsic_load_global_constant)
++      return false;
++
++   const enum gl_access_qualifier access = nir_intrinsic_access(intrin);
++   if (!(access & ACCESS_NON_WRITEABLE) ||
++       (access & (ACCESS_VOLATILE | ACCESS_COHERENT)))
++      return false;
++
++   nir_scalar val = { intrin->src[0].ssa, 0 };
++   uint64_t load_offset = 0;
++   if (nir_scalar_is_alu(val) && nir_scalar_alu_op(val) == nir_op_iadd) {
++      nir_scalar a = nir_scalar_chase_alu_src(val, 0);
++      nir_scalar b = nir_scalar_chase_alu_src(val, 1);
++      if (nir_scalar_is_const(b)) {
++         load_offset = nir_scalar_as_uint(b);
++         val = a;
++      } else if (nir_scalar_is_const(a)) {
++         load_offset = nir_scalar_as_uint(a);
++         val = b;
++      } else {
++         return false;
++      }
++   }
++   if (load_offset >= 2048)
++      return false;
+ 
++   nir_intrinsic_instr *ubo;
++   uint32_t comp_offset;
++   if (nir_scalar_is_alu(val) &&
++       nir_scalar_alu_op(val) == nir_op_pack_64_2x32_split) {
++      nir_scalar lo = nir_scalar_chase_alu_src(val, 0);
++      nir_scalar hi = nir_scalar_chase_alu_src(val, 1);
++      if (!nir_scalar_is_intrinsic(lo) || lo.def != hi.def ||
++          hi.comp != lo.comp + 1 || lo.def->bit_size != 32)
++         return false;
++      ubo = nir_def_as_intrinsic(lo.def);
++      comp_offset = lo.comp * 4;
++   } else if (nir_scalar_is_intrinsic(val) && val.def->bit_size == 64) {
++      ubo = nir_def_as_intrinsic(val.def);
++      comp_offset = val.comp * 8;
++   } else {
++      return false;
++   }
++
++   if (ubo->intrinsic != nir_intrinsic_load_ubo ||
++       !anv_nir_is_promotable_ubo_binding(ubo->src[0]) ||
++       !nir_src_is_const(ubo->src[1]))
++      return false;
++
++   const uint64_t ptr_offset = nir_src_as_uint(ubo->src[1]) + comp_offset;
++   const uint32_t block = anv_nir_get_ubo_binding_push_block(ubo->src[0]);
++   if (ptr_offset >= 65536 || block >= 65536)
++      return false;
++
++   *out_block = block;
++   *out_ptr_offset = ptr_offset;
++   *out_load_offset = load_offset;
++   return true;
++}
++
+ static void
++add_pushable_ubo_pointer(struct push_analysis_state *state,
++                         nir_intrinsic_instr *intrin,
++                         uint32_t block,
++                         uint32_t ptr_offset,
++                         uint32_t load_offset)
++{
++   const unsigned grf = state->devinfo->grf_size;
++   const int offset = load_offset / grf;
++   const unsigned num_components =
++      nir_def_last_component_read(&intrin->def) + 1;
++   const int bytes = num_components * (intrin->def.bit_size / 8);
++   const int start = ROUND_DOWN_TO(load_offset, grf);
++   const int end = align(load_offset + bytes, grf);
++   const int chunks = MIN2((end - start) / grf + 1, 64 - offset);
++
++   struct push_block_info *info =
++      get_block_info(state, PUSH_BLOCK_TYPE_UBO_POINTER,
++                     (block << 16) | ptr_offset);
++   info->offsets |= (chunks >= 64 ? ~0ull : ((1ull << chunks) - 1)) << offset;
++   info->uses[offset]++;
++}
++
++static void
+ add_pushable_pointer(struct push_analysis_state *state,
+                      nir_intrinsic_instr *intrin,
+                      uint32_t push_byte_offset,
+@@ -264,6 +373,8 @@
+ static void
+ analyze_pushable_block(struct push_analysis_state *state, nir_block *block)
+ {
++   const bool shifted_ok = !(state->shifted_skip_loops && block_in_loop(block));
++
+    nir_foreach_instr(instr, block) {
+       if (instr->type != nir_instr_type_intrinsic)
+          continue;
+@@ -273,13 +384,23 @@
+       case nir_intrinsic_load_ubo:
+          if (anv_nir_is_promotable_ubo_binding(intrin->src[0]) &&
+              nir_src_is_const(intrin->src[1]))
+-            maybe_add_pushable_ubo(state, intrin);
++            maybe_add_pushable_ubo(state, intrin, PUSH_BLOCK_TYPE_UBO);
+          break;
+ 
++      case nir_intrinsic_load_ssbo:
++         if (state->ssbo && shifted_ok && anv_nir_is_pushable_ssbo_load(intrin))
++            maybe_add_pushable_ubo(state, intrin, PUSH_BLOCK_TYPE_SSBO);
++         break;
++
+      case nir_intrinsic_load_global_constant: {
+-        uint32_t push_offset, load_offset;
++        uint32_t push_offset, load_offset, block;
+         if (anv_nir_is_pushable_pointer(intrin, &push_offset, &load_offset))
+            add_pushable_pointer(state, intrin, push_offset, load_offset);
++        else if (state->ubo_ptr && shifted_ok &&
++                 anv_nir_is_pushable_ubo_pointer(intrin, &block, &push_offset,
++                                                 &load_offset))
++           add_pushable_ubo_pointer(state, intrin, block, push_offset,
++                                    load_offset);
+         break;
+      }
+ 
+@@ -307,6 +428,7 @@
+ anv_nir_analyze_push_constants_ranges(nir_shader *nir,
+                                       const struct intel_device_info *devinfo,
+                                       const struct anv_pipeline_push_map *push_map,
++                                      bool ubo_ptr,
+                                       struct anv_push_range out_ranges[4])
+ {
+    void *mem_ctx = ralloc_context(NULL);
+@@ -316,6 +438,17 @@
+       .blocks = _mesa_hash_table_create(mem_ctx,
+                                         push_block_key_hash,
+                                         push_block_key_compare),
++      .ssbo = nir->info.stage <= MESA_SHADER_FRAGMENT,
++      .ubo_ptr = ubo_ptr && nir->info.stage <= MESA_SHADER_FRAGMENT &&
++                 nir_shader_get_entrypoint(nir)->ssa_alloc <=
++                 (getenv("XEMTL_PTR_PUSH_MAXSSA") ?
++                  (unsigned)atoi(getenv("XEMTL_PTR_PUSH_MAXSSA")) : 16000u),
++      .shifted_min_benefit = getenv("XEMTL_PTR_PUSH_MIN") ?
++                             atoi(getenv("XEMTL_PTR_PUSH_MIN")) : 16,
++      .shifted_max_length = getenv("XEMTL_PTR_PUSH_MAXLEN") ?
++                            atoi(getenv("XEMTL_PTR_PUSH_MAXLEN")) : 64,
++      .shifted_skip_loops = getenv("XEMTL_PTR_PUSH_LOOPS") ?
++                            atoi(getenv("XEMTL_PTR_PUSH_LOOPS")) == 0 : false,
+    };
+ 
+    /* Walk the IR, recording how many times each UBO block/offset is used. */
+@@ -369,13 +502,24 @@
+          struct push_range_entry *entry =
+             util_dynarray_grow(&ranges, struct push_range_entry, 1);
+ 
+-         if (info->key.type == PUSH_BLOCK_TYPE_UBO) {
++         if (info->key.type == PUSH_BLOCK_TYPE_UBO ||
++             info->key.type == PUSH_BLOCK_TYPE_SSBO) {
+             assert(info->key.index < push_map->block_count);
+             const struct anv_pipeline_binding *binding =
+                &push_map->block_to_descriptor[info->key.index];
+             entry->range.set = binding->set;
+             entry->range.index = binding->index;
+             entry->range.dynamic_offset_index = binding->dynamic_offset_index;
++            entry->range.ssbo = info->key.type == PUSH_BLOCK_TYPE_SSBO;
++         } else if (info->key.type == PUSH_BLOCK_TYPE_UBO_POINTER) {
++            assert((info->key.index >> 16) < push_map->block_count);
++            const struct anv_pipeline_binding *binding =
++               &push_map->block_to_descriptor[info->key.index >> 16];
++            entry->range.set = binding->set;
++            entry->range.index = binding->index;
++            entry->range.dynamic_offset_index = binding->dynamic_offset_index;
++            entry->range.ubo_ptr = 1;
++            entry->range.ubo_ptr_offset = info->key.index & 0xffff;
+          } else {
+             entry->range.set = ANV_DESCRIPTOR_SET_PUSH_POINTER;
+             entry->range.index = info->key.index;
+@@ -388,6 +532,17 @@
+          for (int i = 0; i < entry->range.length; i++)
+             entry->benefit += info->uses[first_bit + i];
+ 
++         if ((info->key.type == PUSH_BLOCK_TYPE_UBO_POINTER ||
++              info->key.type == PUSH_BLOCK_TYPE_SSBO) &&
++             entry->benefit < state.shifted_min_benefit) {
++            entry->range.length = 0;
++            entry->benefit = -1000;
++         } else if (info->key.type == PUSH_BLOCK_TYPE_UBO_POINTER ||
++                    info->key.type == PUSH_BLOCK_TYPE_SSBO) {
++            entry->range.length = MIN2(entry->range.length,
++                                       state.shifted_max_length);
++         }
++
+          if (false)
+             print_push_entry(stderr, info, entry, &state);
+       }
+--- a/src/intel/vulkan/anv_nir_push_descriptor_analysis.c
++++ b/src/intel/vulkan/anv_nir_push_descriptor_analysis.c
+@@ -247,7 +247,9 @@
+ 
+             bool promoted = false;
+             for (unsigned i = 0; i < ARRAY_SIZE(bind_map->push_ranges); i++) {
+-               if (bind_map->push_ranges[i].set == pipe_bind->set &&
++               if (!bind_map->push_ranges[i].ubo_ptr &&
++                   !bind_map->push_ranges[i].ssbo &&
++                   bind_map->push_ranges[i].set == pipe_bind->set &&
+                    bind_map->push_ranges[i].index == desc_idx &&
+                    bind_map->push_ranges[i].start * 32 <= load_offset &&
+                    (bind_map->push_ranges[i].start +
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include "anv_private.h"
++#include <unistd.h>
+ #include "anv_api_version.h"
+ #include "anv_measure.h"
+ 
+@@ -3219,6 +3220,12 @@
+       device->info.verx10 >= 350 &&
+       device->drirc.debug.enable_efficient_64bit;
+ 
++   {
++      const char *e = getenv("XEMTL_SSBO_PUSH");
++      device->xemtl_ssbo_push = e ? e[0] == '1' :
++         access("/Library/GPUBundles/.xemtl-no-ssbo-push", F_OK) != 0;
++   }
++
+    device->alloc_aux_tt_mem =
+       device->info.has_aux_map && device->info.verx10 >= 125;
+ 
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -459,6 +459,10 @@
+     * BO.
+     */
+    void *map;
++
++   void *xemtl_host_map;
++   uint64_t xemtl_host_offset;
++   uint64_t xemtl_host_size;
+ 
+    /* The actual size of bo allocated by kmd, basically:
+     * align(size, mem_alignment)
+@@ -1066,6 +1070,12 @@
+ 
+    /** Range in units of 32B */
+    uint8_t length;
++
++   uint8_t ssbo;
++
++   uint8_t ubo_ptr;
++
++   uint16_t ubo_ptr_offset;
+ };
+ 
+ enum anv_pipeline_bind_mask {
+@@ -1566,6 +1576,8 @@
+      */
+     bool                                        uses_efficient_64bit;
+ 
++    bool                                        xemtl_ssbo_push;
++
+     bool                                        uses_relocs;
+ 
+     /** Can the platform support cooperative matrices and is it enabled? */
+--- a/src/intel/vulkan/anv_shader_compile.c
++++ b/src/intel/vulkan/anv_shader_compile.c
+@@ -257,6 +257,9 @@
+    const bool efficient_64bit = device->uses_efficient_64bit;
+    _mesa_blake3_update(&ctx, &efficient_64bit, sizeof(efficient_64bit));
+ 
++   const bool ssbo_push = device->xemtl_ssbo_push;
++   _mesa_blake3_update(&ctx, &ssbo_push, sizeof(ssbo_push));
++
+    const int spilling_rate = device->compiler->spilling_rate;
+    _mesa_blake3_update(&ctx, &spilling_rate, sizeof(spilling_rate));
+ 
+--- a/src/intel/vulkan/anv_types.h
++++ b/src/intel/vulkan/anv_types.h
+@@ -148,6 +148,8 @@
+ 
+          /** Robust access pushed registers. */
+          uint8_t push_reg_mask[MESA_SHADER_FRAGMENT + 1][4];
++
++         uint8_t ssbo_push_shift[MESA_SHADER_FRAGMENT + 1][4];
+ 
+          /** Wa_18019110168
+           * bits  4:0 : provoking vertex value
+--- a/src/intel/vulkan/genX_cmd_draw.c
++++ b/src/intel/vulkan/genX_cmd_draw.c
+@@ -175,6 +175,51 @@
+    }
+ }
+ 
++static uint64_t
++get_push_range_ubo_pointer(const struct anv_bind_point_state *bind_state,
++                           const struct anv_push_range *range)
++{
++   const struct anv_descriptor_set *set = bind_state->descriptors[range->set];
++   if (set == NULL)
++      return 0;
++
++   const struct anv_descriptor *desc = &set->descriptors[range->index];
++   if (desc->buffer == NULL)
++      return 0;
++
++   uint64_t offset = desc->offset + range->ubo_ptr_offset;
++   if (desc->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
++      offset += bind_state->dynamic_offsets[
++         range->set].offsets[range->dynamic_offset_index];
++   } else if (desc->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
++      return 0;
++   }
++
++   if (offset + 8 > desc->buffer->vk.size)
++      return 0;
++
++   const struct anv_bo *bo = desc->buffer->address.bo;
++   if (bo == NULL)
++      return 0;
++
++   const uint64_t bo_offset = desc->buffer->address.offset + offset;
++   const char *map;
++   if (bo->map) {
++      map = (const char *)bo->map + bo_offset;
++   } else if (bo->xemtl_host_map && bo_offset >= bo->xemtl_host_offset &&
++              bo_offset + 8 <= bo->xemtl_host_offset + bo->xemtl_host_size) {
++      map = (const char *)bo->xemtl_host_map +
++            (bo_offset - bo->xemtl_host_offset);
++   } else {
++      mesa_logw_once("xemtl: pushed pointer table is not host mapped");
++      return 0;
++   }
++
++   uint64_t ptr;
++   memcpy(&ptr, map, sizeof(ptr));
++   return intel_canonical_address(ptr);
++}
++
+ static struct anv_address
+ get_push_range_address(struct anv_cmd_buffer *cmd_buffer,
+                        const struct anv_shader *shader,
+@@ -221,6 +266,15 @@
+ 
+    default: {
+       assert(range->set < MAX_SETS);
++      if (range->ubo_ptr) {
++         const uint64_t ptr = get_push_range_ubo_pointer(bind_state, range);
++         if (ptr != 0)
++            return anv_address_from_u64(ptr & ~31ull);
++
++         assert((range->start + range->length) * 32 <= 2048);
++         return cmd_buffer->device->workaround_address;
++      }
++
+       struct anv_descriptor_set *set = bind_state->descriptors[range->set];
+       const struct anv_descriptor *desc = &set->descriptors[range->index];
+ 
+@@ -229,6 +283,14 @@
+             return anv_address_add(desc->buffer->address,
+                                    desc->offset);
+          }
++      } else if (desc->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
++         assert(range->ssbo);
++         if (desc->buffer) {
++            struct anv_address addr =
++               anv_address_add(desc->buffer->address, desc->offset);
++            addr.offset -= anv_address_physical(addr) & 31;
++            return addr;
++         }
+       } else {
+          assert(desc->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC);
+          if (desc->buffer) {
+@@ -306,6 +368,16 @@
+             return 0;
+ 
+          return desc->bind_range;
++      } else if (desc->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
++         if (!desc->buffer)
++            return 0;
++
++         const uint64_t shift = anv_address_physical(
++            anv_address_add(desc->buffer->address, desc->offset)) & 31;
++         if (range->start * 32 > desc->bind_range + shift)
++            return 0;
++
++         return desc->bind_range + shift;
+       } else {
+          if (!desc->buffer)
+             return 0;
+@@ -494,6 +566,41 @@
+       }
+    }
+ 
++   anv_foreach_stage(stage, dirty_stages) {
++      if (!anv_gfx_has_stage(gfx, stage) || stage > MESA_SHADER_FRAGMENT)
++         continue;
++
++      const struct anv_shader *shader = gfx->shaders[stage];
++      const struct anv_pipeline_bind_map *bind_map = &shader->bind_map;
++      struct anv_push_constants *push = &bind_state->push_constants;
++      unsigned slot = 0;
++      for (unsigned r = 0; r < 4; r++) {
++         const struct anv_push_range *range = &bind_map->push_ranges[r];
++         if (!range->ssbo && !range->ubo_ptr)
++            continue;
++
++         uint8_t shift = 0;
++         if (range->ubo_ptr) {
++            shift = get_push_range_ubo_pointer(bind_state, range) & 31;
++         } else {
++            struct anv_descriptor_set *set = bind_state->descriptors[range->set];
++            const struct anv_descriptor *desc = &set->descriptors[range->index];
++            if (desc->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && desc->buffer) {
++               shift = anv_address_physical(
++                  anv_address_add(desc->buffer->address, desc->offset)) & 31;
++            }
++         }
++
++         if (shift != push->drv_data.gfx.ssbo_push_shift[stage][slot]) {
++            push->drv_data.gfx.ssbo_push_shift[stage][slot] = shift;
++            cmd_buffer->state.push_constants_dirty |=
++               mesa_to_vk_shader_stage(stage);
++            bind_state->push_constants_state = ANV_STATE_NULL;
++         }
++         slot++;
++      }
++   }
++
+    /* Setting NULL resets the push constant state so that we allocate a new one
+     * if needed. If push constant data not dirty, get_push_range_address can
+     * re-use existing allocation.
+--- a/src/intel/vulkan/i915/anv_batch_chain.c
++++ b/src/intel/vulkan/i915/anv_batch_chain.c
+@@ -30,7 +30,93 @@
+ #include "util/u_debug.h"
+ 
+ #include "drm-uapi/i915_drm.h"
++#include "util/set.h"
++#include "util/simple_mtx.h"
+ 
++static simple_mtx_t anv_xemtl_mtx = SIMPLE_MTX_INITIALIZER;
++static struct set *anv_xemtl_set;
++static struct set *anv_xemtl_excl;
++static uint64_t anv_xemtl_stat[3];
++
++void anv_xemtl_memory_explicit(VkDeviceMemory _mem, int on);
++void anv_xemtl_cmd_use_memory(VkCommandBuffer _cmd, VkDeviceMemory _mem);
++void anv_xemtl_stats(uint64_t out[3]);
++void anv_xemtl_cmd_exclusive(VkCommandBuffer _cmd);
++void anv_xemtl_cmd_forget(const struct anv_cmd_buffer *cmd_buffer);
++
++__attribute__((visibility("default"))) void
++anv_xemtl_memory_explicit(VkDeviceMemory _mem, int on)
++{
++   ANV_FROM_HANDLE(anv_device_memory, mem, _mem);
++   if (mem == NULL)
++      return;
++   simple_mtx_lock(&anv_xemtl_mtx);
++   if (anv_xemtl_set == NULL)
++      anv_xemtl_set = _mesa_pointer_set_create(NULL);
++   if (on) {
++      _mesa_set_add(anv_xemtl_set, mem);
++      anv_xemtl_stat[0]++;
++   } else if (anv_xemtl_set != NULL) {
++      _mesa_set_remove_key(anv_xemtl_set, mem);
++   }
++   simple_mtx_unlock(&anv_xemtl_mtx);
++}
++
++void anv_xemtl_memory_forget(const struct anv_device_memory *mem);
++void
++anv_xemtl_memory_forget(const struct anv_device_memory *mem)
++{
++   simple_mtx_lock(&anv_xemtl_mtx);
++   if (anv_xemtl_set != NULL)
++      _mesa_set_remove_key(anv_xemtl_set, mem);
++   simple_mtx_unlock(&anv_xemtl_mtx);
++}
++
++__attribute__((visibility("default"))) void
++anv_xemtl_cmd_use_memory(VkCommandBuffer _cmd, VkDeviceMemory _mem)
++{
++   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, _cmd);
++   ANV_FROM_HANDLE(anv_device_memory, mem, _mem);
++   if (cmd_buffer == NULL || mem == NULL || mem->bo == NULL)
++      return;
++   VkResult result = anv_reloc_list_add_bo(&cmd_buffer->surface_relocs, mem->bo);
++   if (result != VK_SUCCESS)
++      anv_batch_set_error(&cmd_buffer->batch, result);
++   p_atomic_inc(&anv_xemtl_stat[1]);
++}
++
++__attribute__((visibility("default"))) void
++anv_xemtl_cmd_exclusive(VkCommandBuffer _cmd)
++{
++   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, _cmd);
++   if (cmd_buffer == NULL)
++      return;
++   simple_mtx_lock(&anv_xemtl_mtx);
++   if (anv_xemtl_excl == NULL)
++      anv_xemtl_excl = _mesa_pointer_set_create(NULL);
++   _mesa_set_add(anv_xemtl_excl, cmd_buffer);
++   simple_mtx_unlock(&anv_xemtl_mtx);
++}
++
++void
++anv_xemtl_cmd_forget(const struct anv_cmd_buffer *cmd_buffer)
++{
++   simple_mtx_lock(&anv_xemtl_mtx);
++   if (anv_xemtl_excl != NULL)
++      _mesa_set_remove_key(anv_xemtl_excl, cmd_buffer);
++   simple_mtx_unlock(&anv_xemtl_mtx);
++}
++
++__attribute__((visibility("default"))) void
++anv_xemtl_stats(uint64_t out[3])
++{
++   simple_mtx_lock(&anv_xemtl_mtx);
++   out[0] = anv_xemtl_set != NULL ? anv_xemtl_set->entries : 0;
++   out[1] = anv_xemtl_stat[1];
++   out[2] = anv_xemtl_stat[2];
++   simple_mtx_unlock(&anv_xemtl_mtx);
++}
++
+ struct anv_execbuf {
+    struct drm_i915_gem_execbuffer2           execbuf;
+ 
+@@ -455,12 +541,23 @@
+     * track after binding updates of VK_EXT_descriptor_indexing and due to how
+     * sparse resources work.
+     */
++   simple_mtx_lock(&anv_xemtl_mtx);
++   bool xemtl_skip = anv_xemtl_set != NULL && anv_xemtl_set->entries && anv_xemtl_excl != NULL && num_cmd_buffers > 0;
++   for (uint32_t i = 0; xemtl_skip && i < num_cmd_buffers; i++)
++      xemtl_skip = _mesa_set_search(anv_xemtl_excl, cmd_buffers[i]) != NULL;
+    list_for_each_entry(struct anv_device_memory, mem,
+                        &device->memory_objects, link) {
++      if (xemtl_skip && _mesa_set_search(anv_xemtl_set, mem) != NULL) {
++         anv_xemtl_stat[2]++;
++         continue;
++      }
+       result = anv_execbuf_add_bo(device, execbuf, mem->bo, NULL, 0);
+-      if (result != VK_SUCCESS)
++      if (result != VK_SUCCESS) {
++         simple_mtx_unlock(&anv_xemtl_mtx);
+          return result;
++      }
+    }
++   simple_mtx_unlock(&anv_xemtl_mtx);
+ 
+    result = anv_execbuf_add_trtt_bos(device, execbuf);
+    if (result != VK_SUCCESS)
