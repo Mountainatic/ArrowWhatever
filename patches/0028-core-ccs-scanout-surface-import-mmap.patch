@@ -1,0 +1,1531 @@
+# 0028 XeGfx core: compressed scanout BOs, IOSurface import by surface, GEM mmap ceiling fix, hang diagnostics
+#
+# Base:  gpu/ after 0001 + 0008 + 0011 + 0020 + 0022 + 0023
+# Files: gpu/xegfx/shim/include/{xg_fd.h, xg_i915.h, xg_vm_xnu.h, xg_xnu.h},
+#        gpu/xegfx/shim/src/fbsd/{xg_fd.c, xg_kern.c, xg_lock.c, xg_mem.c, xg_misc.c, xg_vm.c},
+#        gpu/xegfx/shim/src/xnu/{xg_fd.cpp, xg_kext.cpp, xg_vm.cpp},
+#        gpu/xkpi/src/i915/{xg_display_hook.c, xg_i915_flip.c, xg_i915_map.c}; new: gpu/xkpi/include/linux/io.h
+# Apply: patch -p1 < patches/0028-core-ccs-scanout-surface-import-mmap.patch
+# Build: core 7f4f344c9e19 (link / kpi / shadow checks pass; installed with tools/install-m3d.py --core, reboot)
+#
+# Compressed scanout (docs/render-compression.md):
+#   - XG_DRM_IOCTL_BO_SCANOUT / BO_UNSCANOUT ('N' 0x48 / 0x49, xg_i915_map.c): the XeMTL plugin names one of its own
+#     GEM objects (a Tile4 + MTL RC CCS image: pixels, then the CCS at 1/256) on its DRM file; the core pins its pages
+#     and hands back a token.  The pages stay pinned until the plugin lets go or the file closes.  The token, not the
+#     handle, crosses into the accel, so a stale one finds nothing instead of another process's object.
+#   - resident call "xgScanoutPhys" (token, phys[], cap, {pages, bytes}): every 4 KiB page of that object, the way
+#     xgFlipMap takes them, so the accel can point a flip slot at the compressed image itself.
+#   - resident call "xgPlaneLayout2" / xg_display_kms_plane_layout2(): a third plane layout, 2 = Tile4 with render
+#     compression (I915_FORMAT_MOD_4_TILED_MTL_RC_CCS), plane 1 = the packed CCS at the given offset and pitch from
+#     each frame's start.  The CCS pitch must be main pitch / 512 * 64 and the offset 4 KiB aligned past the main
+#     surface, or the commit is refused.  The boot placeholder has no room for a CCS, so this layout commits its own
+#     shmem placeholder (zero CCS = uncompressed), made on first use and grown when a larger one is asked for, so the
+#     PLANE_AUX_DIST i915 programs holds for every image the accel then flips to.  The old two-layout entry
+#     (xg_display_kms_plane_layout, 0 linear / 1 Tile4) stays and calls the new one.
+#
+# Import by surface:
+#   - an IOSurface WindowServer imports is made from the surface's own kernel memory instead of a userptr that pins
+#     its user mapping page by page (~2 us a page on the first execbuffer, most of it the shim's vm_page records).
+#     ANV cannot import a GEM handle through our fds (it sizes a dma-buf with lseek, and the libdrm stand-in's fds are
+#     pipes), so the plugin keeps its host-pointer import and announces it:
+#       1. the accel looks the surface up in the caller's task and calls "xgSurfTicket" (descriptor, task): the core
+#          retains the IOMemoryDescriptor and returns a one-shot ticket bound to that task;
+#       2. the plugin names the ticket with the pointer and size it is about to import, XG_DRM_IOCTL_SURF_EXPECT
+#          ('N' 0x4A) on ANV's own DRM file;
+#       3. the matching DRM_IOCTL_I915_GEM_USERPTR on that file (now routed through the map hook: xg_fd.c) gets an
+#          object whose pages are the descriptor's physical ranges, wired once with prepare().  Like a stolen object
+#          it has no struct pages, only DMA addresses: no CPU write domain, the LLC-coherent caching a userptr gets.
+#          The descriptor is completed and released with the object.  A plain userptr goes on to i915 as before.
+#     Tickets and announcements nobody matched expire after 2 s or go with their file.
+#   - xg_vm.cpp: xg_md_retain / xg_md_drop / xg_md_length / xg_md_prepare_ranges (wire, merged physical ranges) and
+#     xg_current_task for the above.
+#   - debug.xegfx_uhold: userptr page holds (count, pages, prepare / physseg / per-page run time, unwire) and the
+#     imports by surface (imports, pages, ranges, ns per page, freed, live, failed).
+#
+# GEM mmap ceiling (the plugin's second descriptor pool failed with VK_ERROR_MEMORY_MAP_FAILED, ~1 s stall each):
+#   - xg_map_ranges() and the surface import kept two arrays of one entry per page from kcalloc().  LinuxKPI's kmalloc
+#     above a page is contigmalloc, which is IOMallocContiguous here and fails once XNU's free memory fragments: a
+#     64 MB map needed two 128 KB physically contiguous blocks, so the largest mmap fell from 152 MB after boot to
+#     48-64 MB after some hours.  Both now use kvcalloc / kvfree (virtually contiguous).
+#   - xg_mem.c: contigmalloc failures are counted (debug.xegfx_mem: "contig fails N (largest S)"), the first eight
+#     logged with their size, to find any other kmalloc above a page that still depends on contiguous memory.
+#
+# Hang diagnostics (an occasional hang where one CPU no longer answers the debugger's NMI):
+#   - each CPU's irq-off watchdog slot also records its thread and three callers (frame-pointer walk limited to the
+#     current 4 KiB stack page), the spin mutex it waits for and that lock's owner (xg_lock.c), and a register read
+#     still in flight: the overlay gpu/xkpi/include/linux/io.h wraps readl / readq in xg_mmio_begin / xg_mmio_end, and
+#     resident call "xgMmioHooks" lets the accel record its own display register reads (who = 2).
+#   - the watchdog's panic string lists every CPU with interrupts off, a spin mutex, or an MMIO read older than 1 ms,
+#     the owner's CPU, and the read as an offset into i915's MMIO window (xg_mmio_regs_base).
+#
+# Smaller changes:
+#   - xg_fd.c: WindowServer may raise its GPU context priority (PRIV_SCHED_SETPRIORITY is granted to the compositor
+#     only), so the GuC runs composites ahead of the apps' batches.
+#   - xg_misc.c: firmware requests time out after 2 s instead of 30 s; a DMC image that is not embedded held the GuC
+#     load behind it for 3 x 30 s at boot.
+#   - xg_fd.cpp: the whole execbuffer (nr 0x69) is timed at the ioctl entry for the existing execbuffer statistics.
+#
+# Verified: after the reboot WindowServer opened its second descriptor pool without a single "mmap failed" or
+# vkCreateDescriptorPool error, debug.xegfx_mem showed "contig fails 0", and compressed scanout and surface imports ran
+# as before (debug.xegfxaccel_iop_xe_ccs_frames, debug.xegfx_uhold).
+#
+--- a/gpu/xegfx/shim/include/xg_fd.h
++++ b/gpu/xegfx/shim/include/xg_fd.h
+@@ -52,6 +52,7 @@
+ unsigned int xg_fd_xnu_udev(int slot);
+ int	xg_fd_xnu_pid(void);
+ int	xg_fd_xnu_issuser(void);
++int	xg_fd_xnu_is_compositor(void);
+ void	xg_fd_xnu_selwakeup_all(void);
+ void	xg_fd_xnu_fini(void);
+ 
+--- a/gpu/xegfx/shim/include/xg_i915.h
++++ b/gpu/xegfx/shim/include/xg_i915.h
+@@ -60,6 +60,9 @@
+ /* zero-copy scanout: reserve GGTT slots, then point one slot's PTEs at a frame's physical pages; 0 or -errno */
+ int xg_flip_init(unsigned long long surface_bytes, unsigned int slots, unsigned long long *ggtt_out,
+     unsigned int *count_out);
++/* §37.14: every 4 KiB page of a GEM object the plugin pinned for scanout (XG_DRM_IOCTL_BO_SCANOUT), by its token */
++int xg_scanout_bo_phys(unsigned int token, unsigned long long *phys, unsigned int cap, unsigned int *npages,
++    unsigned long long *bytes);
+ int xg_flip_map(unsigned int slot, unsigned long long surface_bytes, const unsigned long long *phys,
+     unsigned int npages);
+ int xg_flip_unmap(unsigned int slot, unsigned long long surface_bytes);
+--- a/gpu/xegfx/shim/include/xg_vm_xnu.h
++++ b/gpu/xegfx/shim/include/xg_vm_xnu.h
+@@ -45,6 +45,18 @@
+ /* write back and invalidate CPU caches for a kernel range */
+ void xg_vm_x_flush(void *va, unsigned long long len);
+ 
++/*
++ * §37.17 (native-display docs/37-RENDER-COMPRESSION.md): an IOSurface's IOMemoryDescriptor, handed over by the
++ * accelerator for an import by surface (xg_i915_map.c).  retain/drop keep it alive (drop completes it when it was
++ * prepared); prepare_ranges wires it and returns its physical ranges, neighbours merged (at most cap of them).
++ */
++void xg_md_retain(void *md);
++void xg_md_drop(void *md, int prepared);
++unsigned long long xg_md_length(void *md);
++int xg_md_prepare_ranges(void *md, unsigned long long size, unsigned long long *pa, unsigned long long *len,
++    unsigned int cap, unsigned int *n);
++void *xg_current_task(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/gpu/xegfx/shim/include/xg_xnu.h
++++ b/gpu/xegfx/shim/include/xg_xnu.h
+@@ -35,10 +35,21 @@
+ 
+ /* interrupts-off watchdog slots (xg_kern.c); the kext's checker panics on one held too long (I-116) */
+ #define XG_IRQOFF_CPUS	64
+-struct xg_irqoff { volatile unsigned long long t0; volatile unsigned long pc; volatile int what; };
++struct xg_irqoff {
++	volatile unsigned long long t0; volatile unsigned long pc; volatile int what;
++	/* §37.15: the 11-03 13:46 hang named a CPU in a spin section that never answered the NMI after it.  The rest
++	 * names what each CPU waits on: its thread and callers, the spin mutex it is waiting for and that lock's owner,
++	 * and an MMIO read still in flight (a read the GPU never completes stalls the CPU even for an NMI). */
++	volatile void *td; volatile unsigned long caller[3];
++	volatile const char *lock; volatile unsigned long owner;
++	volatile unsigned long long mmio_t0; volatile unsigned long mmio_addr; volatile int mmio_who;	/* 1 i915 readl/readq, 2 accel */
++};
+ extern struct xg_irqoff xg_irqoff[XG_IRQOFF_CPUS];
+ void xg_irqoff_mark(int what, const void *pc);
+ void xg_irqoff_clear(void);
++void xg_mmio_begin(const volatile void *addr);
++void xg_mmio_begin_who(const volatile void *addr, int who);
++void xg_mmio_end(void);
+ extern void IODelay(unsigned int microseconds);
+ extern void IOSleep(unsigned int milliseconds);
+ extern void *IOMalloc(unsigned long size);
+--- a/gpu/xegfx/shim/src/fbsd/xg_fd.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_fd.c
+@@ -459,7 +459,13 @@
+ int
+ priv_check(struct thread *td, int priv)
+ {
+-	/* every privilege is the superuser's; XNU decides who that is */
++	/*
++	 * every privilege is the superuser's; XNU decides who that is.  One exception: WindowServer may raise its GPU
++	 * context priority (i915 asks CAP_SYS_NICE above the default), so the GuC runs its composites ahead of the apps'
++	 * work.  At the default priority any app's long batch starved the compositor past the flip's 100 ms bound (§32.16).
++	 */
++	if (priv == PRIV_SCHED_SETPRIORITY && xg_fd_xnu_is_compositor())
++		return (0);
+ 	return (xg_fd_xnu_issuser() ? 0 : EPERM);
+ }
+ 
+@@ -1181,8 +1187,11 @@
+ 
+ 	if (xg_fd_inst_fget(inst, &fp) != 0)
+ 		return (ENXIO);
+-	/* group 'N', plus DRM_IOCTL_GET_PCIINFO ('d' 0x15), which drm-kmod declares but does not implement */
+-	if ((IOCGROUP(cmd) == 'N' || (IOCGROUP(cmd) == 'd' && (cmd & 0xff) == 0x15)) && xg_fd_map_ioctl != NULL &&
++	/* group 'N', plus DRM_IOCTL_GET_PCIINFO ('d' 0x15), which drm-kmod declares but does not implement, and
++	 * DRM_IOCTL_I915_GEM_USERPTR ('d' 0x73, 24 bytes): §37.17, a userptr the plugin announced as an IOSurface is made of
++	 * the surface's own memory (xg_i915_map.c); any other goes on to i915 */
++	if ((IOCGROUP(cmd) == 'N' || (IOCGROUP(cmd) == 'd' && (cmd & 0xff) == 0x15) ||
++	    (IOCGROUP(cmd) == 'd' && (cmd & 0xff) == 0x73 && IOCPARM_LEN(cmd) == 24)) && xg_fd_map_ioctl != NULL &&
+ 	    fp->f_ops == &linuxfileops) {
+ 		error = xg_fd_map_ioctl(fp->f_data, fp, cmd, data);
+ 		if (error != ENOTTY) {
+--- a/gpu/xegfx/shim/src/fbsd/xg_kern.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_kern.c
+@@ -189,8 +189,38 @@
+ 	if (c < XG_IRQOFF_CPUS) {
+ 		xg_irqoff[c].pc = (uintptr_t)pc;
+ 		xg_irqoff[c].what = what;
++		xg_irqoff[c].td = curthread;
++		xg_irqoff[c].lock = NULL;
+ 		xg_irqoff[c].t0 = mach_absolute_time();
+ 	}
++}
++
++/* §37.15: an MMIO read in flight on this CPU (the overlay's linux/io.h wraps readl/readq in these) */
++void
++xg_mmio_begin_who(const volatile void *addr, int who)
++{
++	int c = cpu_number();
++
++	if (c < XG_IRQOFF_CPUS) {
++		xg_irqoff[c].mmio_addr = (uintptr_t)addr;
++		xg_irqoff[c].mmio_who = who;
++		xg_irqoff[c].mmio_t0 = mach_absolute_time();
++	}
++}
++
++void
++xg_mmio_begin(const volatile void *addr)
++{
++	xg_mmio_begin_who(addr, 1);
++}
++
++void
++xg_mmio_end(void)
++{
++	int c = cpu_number();
++
++	if (c < XG_IRQOFF_CPUS)
++		xg_irqoff[c].mmio_t0 = 0;
+ }
+ 
+ void
+@@ -210,6 +240,24 @@
+ 	if (td->td_md.md_spinlock_count++ == 0) {
+ 		td->td_md.md_saved_flags = ml_set_interrupts_enabled(0);
+ 		xg_irqoff_mark(1, __builtin_return_address(0));
++		{	/* §37.15: who took it -- the return addresses out of the three frames above this one, walked only while
++			 * each frame pointer is aligned, further up and on the same 4 KiB stack page as this frame (that page is
++			 * mapped; a chain that leaves it, or a thread's first frame, ends the walk -- zeros in the report) */
++			int c = cpu_number();
++			if (c < XG_IRQOFF_CPUS) {
++				uintptr_t *fp = (uintptr_t *)__builtin_frame_address(0);
++				const uintptr_t pg = (uintptr_t)fp & ~(uintptr_t)4095;
++				for (int i = 0; i < 3; i++) {
++					uintptr_t *up = fp ? (uintptr_t *)fp[0] : NULL;
++					if (!up || ((uintptr_t)up & 7) || up <= fp || (uintptr_t)(up + 2) > pg + 4096) {
++						for (int k = i; k < 3; k++) xg_irqoff[c].caller[k] = 0;
++						break;
++					}
++					xg_irqoff[c].caller[i] = up[1];	/* the return address out of that frame's function */
++					fp = up;
++				}
++			}
++		}
+ 	}
+ 	critical_enter_KBI();
+ }
+--- a/gpu/xegfx/shim/src/fbsd/xg_lock.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_lock.c
+@@ -260,11 +260,18 @@
+ 		return;
+ 	}
+ 	struct xg_spin s = { 0, 0, 0 };
++	const int cpu = cpu_number();
++	if (cpu < XG_IRQOFF_CPUS) {	/* §37.15: the watchdog names the lock and its owner */
++		xg_irqoff[cpu].owner = *c & ~MTX_FLAGMASK;
++		xg_irqoff[cpu].lock = m->lock_object.lo_name ? m->lock_object.lo_name : "?";
++	}
+ 	while (!atomic_cmpset_acq_ptr(c, MTX_UNOWNED, tid))
+ 		while (*c != MTX_UNOWNED) {
+ 			cpu_spinwait();
+ 			xg_spin_note(&s, "spin mtx", m->lock_object.lo_name, file, line, *c & ~MTX_FLAGMASK);
+ 		}
++	if (cpu < XG_IRQOFF_CPUS)
++		xg_irqoff[cpu].lock = NULL;
+ }
+ 
+ int
+--- a/gpu/xegfx/shim/src/fbsd/xg_mem.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_mem.c
+@@ -40,6 +40,8 @@
+ static xg_call_t xg_nw_call;
+ static volatile u_int xg_nw_state;	/* 0 cold, 1 starting, 2 up */
+ static volatile u_int xg_nw_pending, xg_nw_misses;
++static volatile u_int xg_contig_fails;	/* contigmalloc (so kmalloc above a page) found no contiguous block */
++static volatile u_long xg_contig_fail_max;
+ 
+ static size_t
+ xg_nw_size(int c)
+@@ -301,7 +303,8 @@
+ 	for (int c = 0; c < XG_NW_CLASSES && n > 0 && (unsigned long)n < len; c++)
+ 		n += snprintf(buf + n, len - n, " %zu:%d", xg_nw_size(c), xg_nw[c].count);
+ 	if (n > 0 && (unsigned long)n < len)
+-		snprintf(buf + n, len - n, ", misses %u", xg_nw_misses);
++		snprintf(buf + n, len - n, ", misses %u; contig fails %u (largest %lu)", xg_nw_misses, xg_contig_fails,
++		    xg_contig_fail_max);
+ }
+ 
+ void
+@@ -379,8 +382,15 @@
+ 
+ 	size = round_page(size);
+ 	p = IOMallocContiguous(size, MAX(alignment, PAGE_SIZE), &pa);
+-	if (p == NULL)
++	if (p == NULL) {
++		u_long max;
++
++		if (atomic_fetchadd_int(&xg_contig_fails, 1) < 8)
++			printf("xegfx: contigmalloc(%lu) found no contiguous block\n", size);
++		while ((max = xg_contig_fail_max) < size && !atomic_cmpset_long(&xg_contig_fail_max, max, size))
++			;
+ 		return (NULL);
++	}
+ 	if (pa < low || pa + size - 1 > high ||
+ 	    (boundary != 0 && (pa & ~(boundary - 1)) != ((pa + size - 1) & ~(boundary - 1)))) {
+ 		printf("xegfx: contigmalloc(%lu) got 0x%llx, outside [0x%lx, 0x%lx] or boundary 0x%lx\n",
+--- a/gpu/xegfx/shim/src/fbsd/xg_misc.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_misc.c
+@@ -1367,7 +1367,12 @@
+ 
+ /* ---- firmware(9): images from the kext's Contents/Resources, cached until the last firmware_put ---- */
+ 
+-#define	XG_FW_TIMEOUT_MS	30000
++/*
++ * A daemon that answers at all answers in milliseconds.  At boot it never does (N-228), and xg_fw_lock is held
++ * across the wait: K1's DMC request (three name variants, an image that is not embedded) held the GuC load behind
++ * it for 3 x 30 s and stage 4 ran out of its budget.  A missing image now costs 3 x 2 s.
++ */
++#define	XG_FW_TIMEOUT_MS	2000
+ 
+ struct xg_fw {
+ 	struct firmware		fw;		/* first, so a firmware pointer is an xg_fw pointer */
+--- a/gpu/xegfx/shim/src/fbsd/xg_vm.c
++++ b/gpu/xegfx/shim/src/fbsd/xg_vm.c
+@@ -22,6 +22,17 @@
+ #define	_SYS_SMR_H_
+ #include <sys/_smr.h>
+ #include <sys/smr_types.h>
++
++extern unsigned long long mach_absolute_time(void);
++/*
++ * §37.17 (native-display docs/37-RENDER-COMPRESSION.md): where a userptr hold's time goes, read as debug.xegfx_uhold.
++ * During WindowServer's genie, first pins of new imports (i915_gem_object_userptr_submit_init inside execbuffer)
++ * took 60 % of the execbuffer time, ~7.6 us a page.  mach_absolute_time units; prepare and physseg come from the
++ * IOKit side (xg_vm.cpp), runs is the per-page USER run loop below, unwire the per-page release.
++ */
++volatile unsigned long long xg_uhold_n, xg_uhold_pages, xg_uhold_t_total, xg_uhold_t_runs, xg_uhold_t_prepare,
++    xg_uhold_t_physseg, xg_uhold_t_max, xg_uhold_new_runs, xg_uhold_shared, xg_unwire_pages, xg_unwire_t;
++
+ void xg_unimpl(const char *name) __dead2;
+ static inline void smr_enter(smr_t smr) { xg_unimpl("smr_enter (lock-free pctrie lookup)"); }
+ static inline void smr_exit(smr_t smr) { }
+@@ -517,6 +528,7 @@
+ 				    (u_long)pa);
+ 			atomic_add_int(&r->pages[0].ref_count, 1);
+ 			mtx_unlock(&xg_vm_mtx);
++			atomic_add_64(&xg_uhold_shared, 1);	/* §37.17 */
+ 			return (&r->pages[0]);
+ 		}
+ 		mtx_unlock(&xg_vm_mtx);
+@@ -528,8 +540,10 @@
+ 		r->pages[0].oflags |= XG_VPO_USERHOLD;
+ 		r->pages[0].ref_count = 1;
+ 		atomic_add_int(&h->refs, 1);
+-		if (xg_vm_run_insert(r) == 0)
++		if (xg_vm_run_insert(r) == 0) {
++			atomic_add_64(&xg_uhold_new_runs, 1);	/* §37.17 */
+ 			return (&r->pages[0]);
++		}
+ 		atomic_subtract_int(&h->refs, 1);	/* another hold inserted this page first: wire that one */
+ 		free(r, M_XGVM);
+ 	}
+@@ -553,6 +567,7 @@
+ 
+ 	if ((m->oflags & XG_VPO_USERHOLD) == 0)
+ 		return (false);
++	const unsigned long long xg_t0 = mach_absolute_time();	/* §37.17 */
+ 	xg_vm_init();
+ 	mtx_lock(&xg_vm_mtx);
+ 	r = xg_vm_run_lookup_locked(m->phys_addr);
+@@ -590,6 +605,7 @@
+ 			xg_vm_hold_put(h);
+ 		free(dead, M_XGVM);
+ 	}
++	atomic_add_64(&xg_unwire_pages, 1); atomic_add_64(&xg_unwire_t, mach_absolute_time() - xg_t0);	/* §37.17 */
+ 	return (true);
+ }
+ 
+@@ -1905,6 +1921,8 @@
+ vm_fault_quick_hold_pages(vm_map_t map, vm_offset_t addr, vm_size_t len, vm_prot_t prot, vm_page_t *ma,
+     int max_count)
+ {
++	const unsigned long long xg_t0 = mach_absolute_time();
++	unsigned long long xg_t1;
+ 	vm_offset_t start = trunc_page(addr), end = round_page(addr + len);
+ 	int n = (int)atop(end - start), i;
+ 	unsigned long long *pa;
+@@ -1928,6 +1946,7 @@
+ 		free(pa, M_XGVM);
+ 		return (-1);
+ 	}
++	xg_t1 = mach_absolute_time();
+ 	for (i = 0; i < n; i++) {
+ 		vm_page_t m = xg_vm_user_page_hold(pa[i], h, i, start, n);
+ 
+@@ -1937,6 +1956,12 @@
+ 	}
+ 	free(pa, M_XGVM);
+ 	xg_vm_hold_put(h);
++	{	/* §37.17 */
++		const unsigned long long t2 = mach_absolute_time(), tot = t2 - xg_t0;
++		atomic_add_64(&xg_uhold_n, 1); atomic_add_64(&xg_uhold_pages, (uint64_t)n);
++		atomic_add_64(&xg_uhold_t_total, tot); atomic_add_64(&xg_uhold_t_runs, t2 - xg_t1);
++		if (tot > xg_uhold_t_max) xg_uhold_t_max = tot;
++	}
+ 	return (n);
+ fail:
+ 	while (--i >= 0)
+--- a/gpu/xegfx/shim/src/xnu/xg_fd.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_fd.cpp
+@@ -268,6 +268,9 @@
+ 	return (error);
+ }
+ 
++/* §32.10: the whole execbuffer (nr 0x69) as this entry sees it -- drm dispatch included (i915_gem_execbuffer.c) */
++extern "C" void xg_eb_outer(unsigned long long ns);
++
+ /* what d_ioctl would get, with the copies ioctl(2) makes around it; only the opener may use an instance */
+ extern "C" int
+ xg_fd_remote_ioctl(int minor, unsigned long cmd, unsigned long long uarg)
+@@ -291,10 +294,17 @@
+ 		*(user_addr_t *)buf = (user_addr_t)uarg;
+ 	if (error == 0) {
+ 		xg_fd_wait_save sv;
++
++		const uint64_t t0 = mach_absolute_time();
++		uint64_t ns;
+ 
+ 		xg_fd_rebase_wait(cmd, buf, &sv);
+ 		error = xg_fd_ioctl_note(inst, cmd, xg_fd_ioctl_errno(xg_fd_dev_ioctl(inst, cmd, buf, 0)));
+ 		xg_fd_restore_wait(&sv);
++		if ((cmd & 0xff) == 0x69) {
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			xg_eb_outer(ns);
++		}
+ 	}
+ 	if (error == 0 && (cmd & IOC_OUT) && len != 0)
+ 		error = copyout(buf, (user_addr_t)uarg, len);
+@@ -412,6 +422,16 @@
+ 	return (kauth_cred_issuser(kauth_cred_get()));
+ }
+ 
++/* the caller is WindowServer (it runs as _windowserver, not root) */
++extern "C" int
++xg_fd_xnu_is_compositor(void)
++{
++	char nm[32] = { 0 };
++
++	proc_selfname(nm, sizeof(nm));
++	return (strcmp(nm, "WindowServer") == 0);
++}
++
+ extern "C" void
+ xg_fd_xnu_selwakeup_all(void)
+ {
+--- a/gpu/xegfx/shim/src/xnu/xg_kext.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_kext.cpp
+@@ -57,8 +57,19 @@
+ extern unsigned int xg_pci_irqs;
+ extern "C" unsigned int xg_pci_handled;
+ extern "C" {
+-struct xg_irqoff { volatile unsigned long long t0; volatile unsigned long pc; volatile int what; };
++struct xg_irqoff {
++	volatile unsigned long long t0; volatile unsigned long pc; volatile int what;
++	/* §37.15: the 11-03 13:46 hang named a CPU in a spin section that never answered the NMI after it.  The rest
++	 * names what each CPU waits on: its thread and callers, the spin mutex it is waiting for and that lock's owner,
++	 * and an MMIO read still in flight (a read the GPU never completes stalls the CPU even for an NMI). */
++	volatile void *td; volatile unsigned long caller[3];
++	volatile const char *lock; volatile unsigned long owner;
++	volatile unsigned long long mmio_t0; volatile unsigned long mmio_addr; volatile int mmio_who;	/* 1 i915 readl/readq, 2 accel */
++};
+ extern struct xg_irqoff xg_irqoff[64];
++unsigned long xg_mmio_regs_base(void);
++void xg_mmio_begin_who(const volatile void *addr, int who);
++void xg_mmio_end(void);
+ extern int xg_spin_panic;
+ }
+ static thread_call_t gIrqoffCall;
+@@ -69,7 +80,47 @@
+  * N-287..N-289 died in XNU's rendezvous timeout: one CPU kept interrupts off for half a second and the report never
+  * says which. This runs on a CPU that still answers, every 20 ms, and names the slot first (100 ms).
+  */
++/* §37.15: every CPU with interrupts off, a spin mutex it waits for, or an MMIO read in flight for over 1 ms -- with
++ * the owner's CPU when another slot holds that thread, and callers as XeGfx offsets (kernel addresses as they are) */
+ static void
++xg_irqoff_report(char *out, size_t len, uint64_t now)
++{
++	size_t n = 0;
++	const unsigned long base = (unsigned long)gKextBase, regs = xg_mmio_regs_base();
++	out[0] = 0;
++#define XG_REP(...) do { if (n < len) { int w = snprintf(out + n, len - n, __VA_ARGS__); if (w > 0) n += (size_t)w; } } while (0)
++#define XG_OFF(a) ((a) >= base && (a) < base + 0x400000ul ? (a) - base : (a))
++	XG_REP("\nxegfx cpus (regs %#lx):", regs);
++	for (int c = 0; c < 64; c++) {
++		const uint64_t t0 = xg_irqoff[c].t0, m0 = xg_irqoff[c].mmio_t0;
++		uint64_t ns = 0, mns = 0;
++		if (t0 && t0 <= now) absolutetime_to_nanoseconds(now - t0, &ns);
++		if (m0 && m0 <= now) absolutetime_to_nanoseconds(now - m0, &mns);
++		if (!ns && mns < 1000000ull) continue;
++		XG_REP("\n cpu %d:", c);
++		if (ns) {
++			XG_REP(" irqoff %llums %s pc+%#lx td %p by %#lx<%#lx<%#lx", ns / 1000000, xg_irqoff[c].what == 2 ? "filter" : "spin",
++			    XG_OFF(xg_irqoff[c].pc), (void *)xg_irqoff[c].td, XG_OFF(xg_irqoff[c].caller[0]),
++			    XG_OFF(xg_irqoff[c].caller[1]), XG_OFF(xg_irqoff[c].caller[2]));
++			const char *lk = (const char *)xg_irqoff[c].lock;
++			const unsigned long ow = xg_irqoff[c].owner;
++			if (lk) {
++				int oc = -1;
++				for (int d = 0; d < 64; d++) if (ow && (unsigned long)xg_irqoff[d].td == ow) { oc = d; break; }
++				XG_REP(" waits '%s' owner %#lx (cpu %d)", lk, ow, oc);
++			}
++		}
++		if (mns >= 1000000ull) {
++			const unsigned long a = xg_irqoff[c].mmio_addr;
++			XG_REP(" mmio %s %#lx (+%#lx) %llums", xg_irqoff[c].mmio_who == 2 ? "accel" : "i915", a,
++			    regs && a >= regs && a < regs + 0x1000000ul ? a - regs : 0ul, mns / 1000000);
++		}
++	}
++#undef XG_OFF
++#undef XG_REP
++}
++
++static void
+ xg_irqoff_check(thread_call_param_t, thread_call_param_t)
+ {
+ 	uint64_t now = mach_absolute_time(), ns;
+@@ -79,10 +130,13 @@
+ 		if (t0 == 0 || t0 > now)
+ 			continue;
+ 		absolutetime_to_nanoseconds(now - t0, &ns);
+-		if (ns > 100000000ull && xg_spin_panic)
+-			panic("xegfx: cpu %d has had interrupts off for %llu ms in %s, pc %#lx (XeGfx base %#lx, offset %#lx)",
++		if (ns > 100000000ull && xg_spin_panic) {
++			static char rep[1400];
++			xg_irqoff_report(rep, sizeof rep, now);
++			panic("xegfx: cpu %d has had interrupts off for %llu ms in %s, pc %#lx (XeGfx base %#lx, offset %#lx)%s",
+ 			    c, ns / 1000000, xg_irqoff[c].what == 2 ? "the interrupt filter" : "a spin section",
+-			    xg_irqoff[c].pc, (unsigned long)gKextBase, xg_irqoff[c].pc - (unsigned long)gKextBase);
++			    xg_irqoff[c].pc, (unsigned long)gKextBase, xg_irqoff[c].pc - (unsigned long)gKextBase, rep);
++		}
+ 	}
+ 	uint64_t dl;
+ 	clock_interval_to_deadline(20, NSEC_PER_MSEC, &dl);
+@@ -168,6 +222,8 @@
+ /* "xgDrmIoctl" (minor, cmd, user arg, int *errno): DRM for WindowServer, through XeGfxAccel's user client */
+ extern "C" int xg_display_kms_joiner_info(unsigned int *active, unsigned int *delta, unsigned int *gen);
+ extern "C" int xg_display_kms_plane_layout(int want, int *cur);
++extern "C" int xg_display_kms_plane_layout2(int want, int *cur, unsigned int ccs_off, unsigned int ccs_pitch);
++extern "C" int xg_surf_ticket(void *md, void *task, unsigned int *ticket, unsigned long long *size);	/* §37.17 */
+ 
+ IOReturn
+ XeGfxResident::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4)
+@@ -193,6 +249,31 @@
+ 		int err = xg_flip_unmap((unsigned int)(uintptr_t)p1, (unsigned long long)(uintptr_t)p2);
+ 		return (err == 0 ? kIOReturnSuccess : kIOReturnError);
+ 	}
++	/* "xgScanoutPhys" (token, u64 *phys out, capacity, u64 out[2] = { pages, bytes }): §37.14 -- the pages of a GEM object
++	 * the plugin pinned for scanout, one per 4 KiB as xgFlipMap takes them; kIOReturnNoSpace (with out set) if too few. */
++	if (name && name->isEqualTo("xgScanoutPhys") && p4) {
++		unsigned int n = 0;
++		unsigned long long bytes = 0;
++		int err = xg_scanout_bo_phys((unsigned int)(uintptr_t)p1, (unsigned long long *)p2, (unsigned int)(uintptr_t)p3,
++		    &n, &bytes);
++		((unsigned long long *)p4)[0] = n;
++		((unsigned long long *)p4)[1] = bytes;
++		return (err == 0 ? kIOReturnSuccess : err == -ENOSPC ? kIOReturnNoSpace : kIOReturnNotFound);
++	}
++	/* "xgSurfTicket" (IOMemoryDescriptor *md, task_t task, unsigned *ticket out, u64 *size out): §37.17 -- the accelerator
++	 * hands over an IOSurface's descriptor; the plugin announces the ticket with the userptr import it makes next
++	 * (SURF_EXPECT, xg_i915_map.c), which then gets the surface's memory.  kIOReturnBadArgument / NoMemory on failure. */
++	if (name && name->isEqualTo("xgSurfTicket") && p1 && p2 && p3 && p4) {
++		int err = xg_surf_ticket(p1, p2, (unsigned int *)p3, (unsigned long long *)p4);
++		return (err == 0 ? kIOReturnSuccess : err == -ENOMEM ? kIOReturnNoMemory : kIOReturnBadArgument);
++	}
++	/* "xgMmioHooks" (void **begin out, void **end out): §37.15 -- begin (addr, who) / end () record a register read in
++	 * flight on this CPU's watchdog slot; the accelerator wraps its own display register reads in them (who 2). */
++	if (name && name->isEqualTo("xgMmioHooks") && p1 && p2) {
++		*(void **)p1 = (void *)xg_mmio_begin_who;
++		*(void **)p2 = (void *)xg_mmio_end;
++		return (kIOReturnSuccess);
++	}
+ 	/* "xgJoinerInfo" (unsigned *active, unsigned *pipe-B PLANE_SURF delta, unsigned *gen): J1 -- while pipe A is joined
+ 	 * with pipe B, every PLANE_SURF_1_A write needs PLANE_SURF_1_B = the same frame + delta (xg_display_hook.c). */
+ 	if (name && name->isEqualTo("xgJoinerInfo") && p1 && p2) {
+@@ -205,6 +286,13 @@
+ 		int err = xg_display_kms_plane_layout((int)(intptr_t)p1, (int *)p2);
+ 		return (err == 0 ? kIOReturnSuccess : err == -EAGAIN ? kIOReturnNotReady : kIOReturnError);
+ 	}
++	/* "xgPlaneLayout2" (int want, int *cur out, u32 ccs offset, u32 ccs pitch): §37.14 -- as xgPlaneLayout, plus 2 =
++	 * Tile4 with render compression (MTL RC CCS), the CCS at that offset and pitch from each frame's start. */
++	if (name && name->isEqualTo("xgPlaneLayout2") && p2) {
++		int err = xg_display_kms_plane_layout2((int)(intptr_t)p1, (int *)p2, (unsigned int)(uintptr_t)p3,
++		    (unsigned int)(uintptr_t)p4);
++		return (err == 0 ? kIOReturnSuccess : err == -EAGAIN ? kIOReturnNotReady : kIOReturnError);
++	}
+ 	/* "xgFlipQuery" (int *idle out): 1 when the GPU finished everything it was given (0 busy, -ENODEV only when
+ 	 * no i915 device is bound); the accelerator's deferred flip worker polls this before it arms a frame. */
+ 	if (name && name->isEqualTo("xgFlipQuery") && p1) {
+@@ -1407,7 +1495,7 @@
+ 	return SYSCTL_OUT(req, b, strlen(b) + 1);
+ }
+ SYSCTL_PROC(_debug, OID_AUTO, xegfx_mem, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_mem_sysctl, "A",
+-    "XeGfx M_NOWAIT reserve per size class and its misses");
++    "XeGfx M_NOWAIT reserve per size class and its misses, contigmalloc failures");
+ SYSCTL_PROC(_debug, OID_AUTO, xegfx_fd, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, xegfx_fd_sysctl, "A",
+     "XeGfx node instances by state and the fd lock holder");
+ SYSCTL_INT(_debug, OID_AUTO, xegfx_running, CTLFLAG_RD | CTLFLAG_LOCKED, &gRunning, 0, "stage in progress");
+@@ -1511,6 +1599,36 @@
+ SYSCTL_PROC(_debug, OID_AUTO, xegfx_eb, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+     xegfx_eb_sysctl, "A", "i915 execbuffer time per stage (sum/max us; maxes restart at every read)");
+ 
++/* §37.17: userptr holds (first pins of imported pages): count, pages, and where the time goes (fbsd/xg_vm.c) */
++extern "C" volatile unsigned long long xg_uhold_n, xg_uhold_pages, xg_uhold_t_total, xg_uhold_t_runs, xg_uhold_t_prepare,
++    xg_uhold_t_physseg, xg_uhold_t_max, xg_uhold_new_runs, xg_uhold_shared, xg_unwire_pages, xg_unwire_t;
++extern "C" unsigned long long xg_surf_imports, xg_surf_pages, xg_surf_ns, xg_surf_ranges, xg_surf_frees, xg_surf_live,
++    xg_surf_fail;
++static int
++xegfx_uhold_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++	char buf[900];
++	uint64_t tot = 0, runs = 0, prep = 0, phys = 0, mx = 0, unw = 0;
++	absolutetime_to_nanoseconds(xg_uhold_t_total, &tot); absolutetime_to_nanoseconds(xg_uhold_t_runs, &runs);
++	absolutetime_to_nanoseconds(xg_uhold_t_prepare, &prep); absolutetime_to_nanoseconds(xg_uhold_t_physseg, &phys);
++	absolutetime_to_nanoseconds(xg_uhold_t_max, &mx); absolutetime_to_nanoseconds(xg_unwire_t, &unw);
++	const unsigned long long pg = xg_uhold_pages ? xg_uhold_pages : 1;
++	int n = snprintf(buf, sizeof buf,
++	    "holds %llu pages %llu (new runs %llu, shared %llu); total %llu us (%llu ns/page, max %llu us): prepare %llu us "
++	    "(%llu ns/page), physseg %llu us (%llu ns/page), runs %llu us (%llu ns/page); unwire pages %llu, %llu us (%llu ns/page)",
++	    xg_uhold_n, xg_uhold_pages, xg_uhold_new_runs, xg_uhold_shared, tot / 1000, tot / pg, mx / 1000, prep / 1000,
++	    prep / pg, phys / 1000, phys / pg, runs / 1000, runs / pg, xg_unwire_pages, unw / 1000,
++	    xg_unwire_pages ? unw / xg_unwire_pages : 0ull);
++	if (n > 0 && n < (int)sizeof buf)	/* §37.17: imports by surface, in whole ns-per-page units (no %f in the kernel) */
++		n += snprintf(buf + n, sizeof buf - (size_t)n,
++		    "\nsurface imports %llu (%llu pages, %llu ranges, %llu ns/page), freed %llu, live %llu, failed %llu",
++		    xg_surf_imports, xg_surf_pages, xg_surf_ranges, xg_surf_pages ? xg_surf_ns / xg_surf_pages : 0ull,
++		    xg_surf_frees, xg_surf_live, xg_surf_fail);
++	return SYSCTL_OUT(req, buf, (size_t)n + 1);
++}
++SYSCTL_PROC(_debug, OID_AUTO, xegfx_uhold, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
++    xegfx_uhold_sysctl, "A", "userptr page holds: count, pages and time per phase (prepare, physseg, runs, unwire)");
++
+ /* §32.16: per-request queued->ready->done time, WindowServer vs the rest (i915_gem_execbuffer.c overlay) */
+ extern "C" int xg_rq_stats_text(char *out, int max);
+ static int
+@@ -1603,6 +1721,7 @@
+ 	&sysctl__debug_xegfx_timing,
+ 	&sysctl__debug_xegfx_eb,
+ 	&sysctl__debug_xegfx_rq,
++	&sysctl__debug_xegfx_uhold,
+ 	&sysctl__debug_xegfx_gt,
+ 	&sysctl__debug_xegfx_gt_act,
+ 	&sysctl__debug_xegfx_gt_min,
+--- a/gpu/xegfx/shim/src/xnu/xg_vm.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_vm.cpp
+@@ -12,6 +12,7 @@
+ #include <sys/proc.h>
+ extern "C" int xg_printf(const char *, ...) __attribute__((__format__(__printf__, 1, 2)));
+ static SInt32 xg_vm_hold_logs;
++extern "C" volatile unsigned long long xg_uhold_t_prepare, xg_uhold_t_physseg;	/* §37.17, xg_vm.c */
+ 
+ /* osfmk/i386/pmap.h: the bounds of XNU's direct map; exported by the kernel but not declared in the SDK */
+ 
+@@ -258,11 +259,15 @@
+ 
+ 	if (task == kernel_task || npages == 0 || (uaddr & PAGE_MASK) != 0)
+ 		return nullptr;
++	const uint64_t t0 = mach_absolute_time();	/* §37.17: debug.xegfx_uhold */
+ 	md = IOMemoryDescriptor::withAddressRange(uaddr, (mach_vm_size_t)npages * PAGE_SIZE,
+ 	    writable ? kIODirectionInOut : kIODirectionOut, task);
+ 	if (md == nullptr)
+ 		return nullptr;
+-	if ((ret = md->prepare()) != kIOReturnSuccess) {
++	ret = md->prepare();
++	const uint64_t t1 = mach_absolute_time();
++	OSAddAtomic64((SInt64)(t1 - t0), (volatile SInt64 *)&xg_uhold_t_prepare);
++	if (ret != kIOReturnSuccess) {
+ 		/* N-283: WindowServer's execbuffer gets EFAULT; this says whether wiring the range is what fails */
+ 		if (OSIncrementAtomic(&xg_vm_hold_logs) < 8)
+ 			xg_printf("xegfx: userptr hold: prepare 0x%x for 0x%llx + %u pages (pid %d)\n", ret, uaddr, npages,
+@@ -280,6 +285,7 @@
+ 			return nullptr;
+ 		}
+ 	}
++	OSAddAtomic64((SInt64)(mach_absolute_time() - t1), (volatile SInt64 *)&xg_uhold_t_physseg);
+ 	if ((xm = (xg_vm_xmem_t)IOMallocZero(sizeof(*xm))) == nullptr) {
+ 		md->complete();
+ 		md->release();
+@@ -319,4 +325,73 @@
+ xg_vm_x_flush(void *va, unsigned long long len)
+ {
+ 	IOFlushProcessorCache(kernel_task, (IOVirtualAddress)va, (IOByteCount)len);
++}
++
++/* §37.17: IOSurface memory descriptors for an import by surface (xg_i915_map.c); see xg_vm_xnu.h */
++extern "C" void
++xg_md_retain(void *md)
++{
++	if (md != nullptr)
++		((IOMemoryDescriptor *)md)->retain();
++}
++
++extern "C" void
++xg_md_drop(void *md, int prepared)
++{
++	IOMemoryDescriptor *m = (IOMemoryDescriptor *)md;
++
++	if (m == nullptr)
++		return;
++	if (prepared)
++		m->complete();
++	m->release();
+ }
++
++extern "C" unsigned long long
++xg_md_length(void *md)
++{
++	return md != nullptr ? (unsigned long long)((IOMemoryDescriptor *)md)->getLength() : 0;
++}
++
++extern "C" int
++xg_md_prepare_ranges(void *md, unsigned long long size, unsigned long long *pa, unsigned long long *len,
++    unsigned int cap, unsigned int *np)
++{
++	IOMemoryDescriptor *m = (IOMemoryDescriptor *)md;
++	unsigned long long off = 0;
++	unsigned int n = 0;
++
++	*np = 0;
++	if (m == nullptr || size == 0 || cap == 0 || m->prepare() != kIOReturnSuccess)
++		return -1;
++	while (off < size) {
++		IOByteCount seg = 0;
++		addr64_t p = m->getPhysicalSegment((IOByteCount)off, &seg, kIOMemoryMapperNone);
++
++		if (p == 0 || seg == 0)
++			break;
++		if (seg > size - off)
++			seg = (IOByteCount)(size - off);
++		if (n > 0 && pa[n - 1] + len[n - 1] == p)
++			len[n - 1] += seg;
++		else {
++			if (n == cap)
++				break;
++			pa[n] = p;
++			len[n++] = seg;
++		}
++		off += seg;
++	}
++	if (off < size) {
++		m->complete();
++		return -1;
++	}
++	*np = n;
++	return 0;
++}
++
++extern "C" void *
++xg_current_task(void)
++{
++	return (void *)current_task();
++}
+--- /dev/null
++++ b/gpu/xkpi/include/linux/io.h
+@@ -0,0 +1,42 @@
++/*
++ * §37.15 diagnostics (native-display docs/37-RENDER-COMPRESSION.md): LinuxKPI's linux/io.h, with readl and readq
++ * recorded per CPU while they are in flight.  A register read the GPU never completes stalls the CPU so that it does
++ * not even take the debugger's NMI (the 11-03 hangs: one CPU never answered); the irq-off watchdog (xg_kext.cpp)
++ * prints every CPU's read still in flight, as an offset into i915's MMIO window.
++ */
++#include_next <linux/io.h>
++
++#ifndef XG_OVERLAY_LINUX_IO_H
++#define XG_OVERLAY_LINUX_IO_H
++
++void xg_mmio_begin(const volatile void *addr);
++void xg_mmio_end(void);
++
++static inline uint32_t
++xg_readl(const volatile void *addr)
++{
++	uint32_t v;
++
++	xg_mmio_begin(addr);
++	v = (readl)(addr);
++	xg_mmio_end();
++	return (v);
++}
++
++static inline uint64_t
++xg_readq(const volatile void *addr)
++{
++	uint64_t v;
++
++	xg_mmio_begin(addr);
++	v = (readq)(addr);
++	xg_mmio_end();
++	return (v);
++}
++
++#undef readl
++#define	readl(addr)	xg_readl(addr)
++#undef readq
++#define	readq(addr)	xg_readq(addr)
++
++#endif
+--- a/gpu/xkpi/src/i915/xg_display_hook.c
++++ b/gpu/xkpi/src/i915/xg_display_hook.c
+@@ -1812,13 +1812,33 @@
+  * a Tile4 plane reads the GGTT directly, as the accel's slots need.  want < 0 only reports; *cur gets the layout.
+  * Called by the accel's flip worker (thread context, sleeps) when a frame's layout differs from the plane's.
+  */
+-int xg_display_kms_plane_layout(int want, int *cur);
++/*
++ * §37.14 (docs/37-RENDER-COMPRESSION.md): a third layout, 2 = Tile4 with render compression
++ * (I915_FORMAT_MOD_4_TILED_MTL_RC_CCS: plane 0 the Tile4 main surface, plane 1 the packed CCS at ccs_off with
++ * ccs_pitch bytes per row -- main pitch / 8, one 64-byte block per four tiles across and 32 rows down).  The accel's
++ * flips then point PLANE_SURF at the plugin's compressed images, which have the CCS at the same offset, so the
++ * PLANE_AUX_DIST i915 programs here holds for every one of them.  The boot placeholder has no room for a CCS, so this
++ * layout commits its own, made on first use (zero CCS = uncompressed) and grown if a larger one is asked for.
++ */
++static struct drm_i915_gem_object *gXgKmsCcsObj;	/* our reference; the committed fb holds its own */
++static u64 gXgKmsCcsObjBytes;
++
++static int
++xg_kms_layout_of(const struct drm_framebuffer *fb)
++{
++	if (fb->modifier == I915_FORMAT_MOD_4_TILED_MTL_RC_CCS)
++		return (2);
++	return (fb->modifier == I915_FORMAT_MOD_4_TILED ? 1 : 0);
++}
++
++int xg_display_kms_plane_layout2(int want, int *cur, unsigned int ccs_off, unsigned int ccs_pitch);
+ int
+-xg_display_kms_plane_layout(int want, int *cur)
++xg_display_kms_plane_layout2(int want, int *cur, unsigned int ccs_off, unsigned int ccs_pitch)
+ {
+ 	struct drm_mode_fb_cmd2 cmd = {};
+ 	struct drm_framebuffer *fb, *old;
+-	char line[160];
++	struct drm_i915_gem_object *obj;
++	char line[200];
+ 	u64 t0, mod;
+ 	int ret;
+ 
+@@ -1826,13 +1846,14 @@
+ 		return (-EAGAIN);
+ 	mutex_lock(&gXgKmsModeLock);
+ 	old = gXgKmsFb;
+-	if (want < 0 || (want != 0) == (old->modifier == I915_FORMAT_MOD_4_TILED)) {
++	if (want < 0 || (want == xg_kms_layout_of(old) &&
++	    (want != 2 || (old->offsets[1] == ccs_off && old->pitches[1] == ccs_pitch)))) {
+ 		if (cur != NULL)
+-			*cur = old->modifier == I915_FORMAT_MOD_4_TILED;
++			*cur = xg_kms_layout_of(old);
+ 		mutex_unlock(&gXgKmsModeLock);
+ 		return (0);
+ 	}
+-	mod = want ? I915_FORMAT_MOD_4_TILED : DRM_FORMAT_MOD_LINEAR;
++	mod = want == 2 ? I915_FORMAT_MOD_4_TILED_MTL_RC_CCS : want ? I915_FORMAT_MOD_4_TILED : DRM_FORMAT_MOD_LINEAR;
+ 	if (want && (old->pitches[0] % 128U) != 0) {	/* Tile4 rows are 128 bytes wide */
+ 		mutex_unlock(&gXgKmsModeLock);
+ 		return (-EINVAL);
+@@ -1843,10 +1864,41 @@
+ 	cmd.pitches[0] = old->pitches[0];
+ 	cmd.flags = DRM_MODE_FB_MODIFIERS;
+ 	cmd.modifier[0] = mod;
+-	fb = intel_framebuffer_create(intel_bo_to_drm_bo(gXgKmsObj), &cmd);
++	obj = gXgKmsObj;
++	if (want == 2) {
++		const u64 need = PAGE_ALIGN((u64)ccs_off + (u64)ccs_pitch * DIV_ROUND_UP(cmd.height, 32U));
++
++		if (ccs_pitch != DIV_ROUND_UP(cmd.pitches[0], 4U * 128U) * 64U || (ccs_off % 4096U) != 0 ||
++		    ccs_off < (u64)cmd.pitches[0] * cmd.height) {
++			mutex_unlock(&gXgKmsModeLock);
++			snprintf(line, sizeof(line), "kms: RC CCS layout refused: ccs at %u pitch %u for %ux%u pitch %u",
++			    ccs_off, ccs_pitch, cmd.width, cmd.height, cmd.pitches[0]);
++			xg_disp_line(gXgKmsDisplay, line);
++			return (-EINVAL);
++		}
++		if (gXgKmsCcsObj == NULL || gXgKmsCcsObjBytes < need) {
++			struct drm_i915_gem_object *n = i915_gem_object_create_shmem(to_i915(gXgKmsFb->dev), need);
++
++			if (IS_ERR(n)) {
++				mutex_unlock(&gXgKmsModeLock);
++				xg_disp_line(gXgKmsDisplay, "kms: RC CCS layout: placeholder object failed");
++				return ((int)PTR_ERR(n));
++			}
++			if (gXgKmsCcsObj != NULL)
++				i915_gem_object_put(gXgKmsCcsObj);	/* a committed fb over it keeps its own reference */
++			gXgKmsCcsObj = n;
++			gXgKmsCcsObjBytes = need;
++		}
++		obj = gXgKmsCcsObj;
++		cmd.offsets[1] = ccs_off;
++		cmd.pitches[1] = ccs_pitch;
++		cmd.modifier[1] = mod;
++		cmd.handles[1] = cmd.handles[0];
++	}
++	fb = intel_framebuffer_create(intel_bo_to_drm_bo(obj), &cmd);
+ 	if (IS_ERR(fb)) {
+ 		mutex_unlock(&gXgKmsModeLock);
+-		snprintf(line, sizeof(line), "kms: Tile4 layout %d: framebuffer create failed (%ld)", want, PTR_ERR(fb));
++		snprintf(line, sizeof(line), "kms: layout %d: framebuffer create failed (%ld)", want, PTR_ERR(fb));
+ 		xg_disp_line(gXgKmsDisplay, line);
+ 		return ((int)PTR_ERR(fb));
+ 	}
+@@ -1854,16 +1906,25 @@
+ 	ret = xg_kms_plane_commit(fb);
+ 	if (ret == 0)
+ 		xg_kms_update_joiner();
+-	snprintf(line, sizeof(line), "kms: Tile4 layout %s %ux%u pitch %u: %d in %llu us", want ? "Tile4" : "linear",
+-	    cmd.width, cmd.height, cmd.pitches[0], ret, (unsigned long long)((ktime_get_ns() - t0) / 1000));
++	snprintf(line, sizeof(line), "kms: layout %s %ux%u pitch %u%s: %d in %llu us",
++	    want == 2 ? "Tile4 RC CCS" : want ? "Tile4" : "linear", cmd.width, cmd.height, cmd.pitches[0],
++	    want == 2 ? " (ccs offset/pitch set)" : "", ret, (unsigned long long)((ktime_get_ns() - t0) / 1000));
+ 	xg_disp_line(gXgKmsDisplay, line);
+ 	drm_framebuffer_put(fb);	/* on success the committed plane state holds its own reference */
+ 	if (ret == 0)
+ 		gXgKmsFb = fb;
+ 	if (cur != NULL)
+-		*cur = gXgKmsFb->modifier == I915_FORMAT_MOD_4_TILED;
++		*cur = xg_kms_layout_of(gXgKmsFb);
+ 	mutex_unlock(&gXgKmsModeLock);
+ 	return (ret);
++}
++
++/* §32.16: the two-layout entry point the accel has always called (1 = Tile4, 0 = linear) */
++int xg_display_kms_plane_layout(int want, int *cur);
++int
++xg_display_kms_plane_layout(int want, int *cur)
++{
++	return (xg_display_kms_plane_layout2(want < 0 ? -1 : want != 0, cur, 0, 0));
+ }
+ 
+ /*
+--- a/gpu/xkpi/src/i915/xg_i915_flip.c
++++ b/gpu/xkpi/src/i915/xg_i915_flip.c
+@@ -227,3 +227,12 @@
+ 	mutex_unlock(&ggtt->vm.mutex);
+ 	return (0);
+ }
++
++/* §37.15: where i915's MMIO window starts, so the irq-off watchdog can print a stuck read as a register offset */
++unsigned long
++xg_mmio_regs_base(void)
++{
++	struct drm_i915_private *i915 = xg_i915_dev();
++
++	return (i915 != NULL ? (unsigned long)i915->uncore.regs : 0ul);
++}
+--- a/gpu/xkpi/src/i915/xg_i915_map.c
++++ b/gpu/xkpi/src/i915/xg_i915_map.c
+@@ -51,6 +51,32 @@
+ static LIST_HEAD(xg_maps);
+ static DEFINE_MUTEX(xg_maps_lock);
+ 
++/*
++ * §37.14 (native-display docs/37-RENDER-COMPRESSION.md): a GEM object the display scans directly -- WindowServer's
++ * compressed (I915_FORMAT_MOD_4_TILED_MTL_RC_CCS) scanout images, made by the Metal plugin.  The plugin names the
++ * object on its own DRM file; its pages are pinned until it lets go (or the file closes) and handed to the accel by
++ * token ("xgScanoutPhys"), which points a flip slot at them.  The token, not the handle, crosses into the accel, so a
++ * stale one finds nothing instead of another process's object.
++ */
++struct xg_drm_bo_scanout {
++	u32	handle;	/* in: GEM handle on the caller's file (SCANOUT) */
++	u32	token;	/* out (SCANOUT) / in (UNSCANOUT) */
++	u64	size;	/* out: the object's size in bytes */
++};
++#define XG_DRM_IOCTL_BO_SCANOUT		_IOWR('N', 0x48, struct xg_drm_bo_scanout)
++#define XG_DRM_IOCTL_BO_UNSCANOUT	_IOW('N', 0x49, struct xg_drm_bo_scanout)
++
++struct xg_scan {
++	struct list_head		link;
++	void				*key;
++	u32				token;
++	struct drm_i915_gem_object	*obj;
++};
++
++static LIST_HEAD(xg_scans);
++static DEFINE_MUTEX(xg_scans_lock);
++static u32 xg_scan_next;
++
+ extern int (*xg_fd_map_ioctl)(void *lfile, void *key, unsigned long cmd, void *data);
+ extern void (*xg_fd_map_close)(void *key);
+ 
+@@ -63,7 +89,11 @@
+ 	kfree(m);
+ }
+ 
+-/* physical ranges for [skip, skip + size) of the object's pages, neighbours merged */
++/*
++ * physical ranges for [skip, skip + size) of the object's pages, neighbours merged. The arrays scale with the page
++ * count and LinuxKPI's kmalloc above a page is contigmalloc, which fails once XNU's free memory fragments (a 64 MB
++ * map needed two 128 KB contiguous blocks), so they come from kvcalloc.
++ */
+ static int
+ xg_map_ranges(struct sg_table *sgt, u64 skip, u64 size, u64 **pap, u64 **lenp, unsigned int *np)
+ {
+@@ -71,19 +101,19 @@
+ 	unsigned int i, n = 0;
+ 	u64 *pa, *len;
+ 
+-	pa = kcalloc(sgt->orig_nents, sizeof(*pa), GFP_KERNEL);
+-	len = kcalloc(sgt->orig_nents, sizeof(*len), GFP_KERNEL);
++	pa = kvcalloc(sgt->orig_nents, sizeof(*pa), GFP_KERNEL);
++	len = kvcalloc(sgt->orig_nents, sizeof(*len), GFP_KERNEL);
+ 	if (pa == NULL || len == NULL) {
+-		kfree(pa);
+-		kfree(len);
++		kvfree(pa);
++		kvfree(len);
+ 		return -ENOMEM;
+ 	}
+ 	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
+ 		u64 p, l = sg->length;
+ 
+ 		if (sg_page(sg) == NULL) {
+-			kfree(pa);
+-			kfree(len);
++			kvfree(pa);
++			kvfree(len);
+ 			return -ENODEV;	/* stolen memory has no pages to hand out */
+ 		}
+ 		p = page_to_phys(sg_page(sg)) + sg->offset;
+@@ -106,8 +136,8 @@
+ 			break;
+ 	}
+ 	if (size != 0) {
+-		kfree(pa);
+-		kfree(len);
++		kvfree(pa);
++		kvfree(len);
+ 		return -EINVAL;
+ 	}
+ 	*pap = pa;
+@@ -189,8 +219,8 @@
+ 		err = -ENOMEM;
+ 		goto ranges;
+ 	}
+-	kfree(pa);
+-	kfree(len);
++	kvfree(pa);
++	kvfree(len);
+ 	m->key = key;
+ 	m->size = a->size;
+ 	m->obj = obj;	/* keeps the reference and the page pin */
+@@ -200,8 +230,8 @@
+ 	a->addr = m->addr;
+ 	return 0;
+ ranges:
+-	kfree(pa);
+-	kfree(len);
++	kvfree(pa);
++	kvfree(len);
+ unpin:
+ 	i915_gem_object_unpin_pages(obj);
+ put:
+@@ -225,9 +255,443 @@
+ 	if (found == NULL)
+ 		return -EINVAL;
+ 	xg_map_free(found);
++	return 0;
++}
++
++static void
++xg_scan_free(struct xg_scan *e)
++{
++	i915_gem_object_unpin_pages(e->obj);
++	i915_gem_object_put(e->obj);
++	kfree(e);
++}
++
++static int
++xg_scan_add(struct file *filp, void *key, struct xg_drm_bo_scanout *a)
++{
++	struct drm_file *priv = filp->private_data;
++	struct drm_i915_gem_object *obj;
++	struct xg_scan *e;
++	int err;
++
++	if ((obj = i915_gem_object_lookup(priv, a->handle)) == NULL)
++		return -ENOENT;
++	if ((err = i915_gem_object_pin_pages_unlocked(obj)) != 0) {
++		i915_gem_object_put(obj);
++		return err;
++	}
++	if ((e = kzalloc(sizeof(*e), GFP_KERNEL)) == NULL) {
++		i915_gem_object_unpin_pages(obj);
++		i915_gem_object_put(obj);
++		return -ENOMEM;
++	}
++	e->key = key;
++	e->obj = obj;	/* keeps the reference and the page pin */
++	mutex_lock(&xg_scans_lock);
++	if (++xg_scan_next == 0)
++		xg_scan_next = 1;
++	e->token = xg_scan_next;
++	list_add(&e->link, &xg_scans);
++	mutex_unlock(&xg_scans_lock);
++	a->token = e->token;
++	a->size = obj->base.size;
++	return 0;
++}
++
++static int
++xg_scan_del(void *key, struct xg_drm_bo_scanout *a)
++{
++	struct xg_scan *e, *found = NULL;
++
++	mutex_lock(&xg_scans_lock);
++	list_for_each_entry(e, &xg_scans, link)
++		if (e->key == key && e->token == a->token) {
++			list_del(&e->link);
++			found = e;
++			break;
++		}
++	mutex_unlock(&xg_scans_lock);
++	if (found == NULL)
++		return -EINVAL;
++	xg_scan_free(found);
++	return 0;
++}
++
++/*
++ * "xgScanoutPhys" (xg_kext.cpp): the physical address of every 4 KiB page of token's object, as xg_flip_map takes
++ * them; *npages and *bytes say how many there are.  -ENOSPC (with both set) when cap is too small.
++ */
++int
++xg_scanout_bo_phys(unsigned int token, unsigned long long *phys, unsigned int cap, unsigned int *npages,
++    unsigned long long *bytes)
++{
++	struct sg_table *sgt;
++	struct scatterlist *sg;
++	struct xg_scan *e, *found = NULL;
++	unsigned int i, n = 0, need;
++	int err = 0;
++
++	if (token == 0 || npages == NULL || bytes == NULL)
++		return -EINVAL;
++	mutex_lock(&xg_scans_lock);
++	list_for_each_entry(e, &xg_scans, link)
++		if (e->token == token) {
++			found = e;
++			break;
++		}
++	if (found == NULL) {
++		mutex_unlock(&xg_scans_lock);
++		return -ENOENT;
++	}
++	*bytes = found->obj->base.size;
++	need = (unsigned int)(found->obj->base.size >> 12);
++	*npages = need;
++	if (phys == NULL || cap < need) {
++		mutex_unlock(&xg_scans_lock);
++		return -ENOSPC;
++	}
++	sgt = found->obj->mm.pages;
++	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
++		u64 p, off;
++
++		if (sg_page(sg) == NULL) {
++			err = -ENODEV;
++			break;
++		}
++		p = page_to_phys(sg_page(sg)) + sg->offset;
++		for (off = 0; off < sg->length && n < need; off += 4096)
++			phys[n++] = p + off;
++		if (n == need)
++			break;
++	}
++	mutex_unlock(&xg_scans_lock);
++	if (err == 0 && n != need)
++		err = -EINVAL;
++	return err;
++}
++
++/*
++ * §37.17 (native-display docs/37-RENDER-COMPRESSION.md): import an IOSurface by its kernel memory, as Apple's
++ * IOAcceleratorFamily2 (IOAccelResource2::newResourceWithIOSurface) and NullMoth's surface imports by ID do, instead of
++ * pinning the user mapping of it (a userptr object: ~2 us a page on its first execbuffer, half of it the shim's
++ * per-page vm_page records, a third building the page list).  ANV cannot import a GEM handle through our fds (it sizes
++ * an imported dma-buf with lseek, and the libdrm stand-in's fds are pipes), so the plugin keeps its host-pointer
++ * import and announces it instead: the accelerator looks the surface up in the caller's task and hands its
++ * IOMemoryDescriptor over ("xgSurfTicket": retained, a one-shot ticket bound to that task); the plugin names the
++ * ticket with the pointer and size it is about to import (SURF_EXPECT, on ANV's own DRM file); the matching
++ * DRM_IOCTL_I915_GEM_USERPTR on that file then gets an object made of the surface's memory instead of a userptr.
++ * Its pages are the descriptor's physical ranges, wired once by prepare(); like a stolen object it has no struct
++ * pages, only DMA addresses (nothing maps or clflushes it: no CPU write domain, the coherent PAT a userptr gets), and
++ * the descriptor is completed and released with it.  An announcement nobody matched goes after 2 s or with its file.
++ */
++struct xg_drm_surf_expect {
++	u32	ticket;		/* in: from the accelerator */
++	u32	pad;
++	u64	user_ptr;	/* in: the pointer and size of the userptr import that follows */
++	u64	user_size;
++};
++#define XG_DRM_IOCTL_SURF_EXPECT	_IOW('N', 0x4A, struct xg_drm_surf_expect)
++
++struct xg_ticket {
++	struct list_head	link;
++	u32			id;
++	void			*task;
++	void			*md;
++	u64			size;	/* the descriptor's, page-rounded */
++	u64			born;	/* ns */
++	void			*key;	/* once announced: the file, the pointer and the size of the import */
++	u64			user_ptr, user_size;
++};
++struct xg_surfobj {
++	struct list_head		link;
++	struct drm_i915_gem_object	*obj;
++	void				*md;
++	u64				*pa, *len;
++	unsigned int			n;
++};
++static LIST_HEAD(xg_tickets);		/* handed over, not announced yet */
++static LIST_HEAD(xg_expects);		/* announced, waiting for their userptr */
++static LIST_HEAD(xg_surfobjs);
++static DEFINE_MUTEX(xg_surf_lock);
++static u32 xg_ticket_next;
++/* debug.xegfx_uhold (xg_kext.cpp) */
++u64 xg_surf_imports, xg_surf_pages, xg_surf_ns, xg_surf_ranges, xg_surf_frees, xg_surf_live, xg_surf_fail;
++
++/* with xg_surf_lock held: tickets and announcements older than 2 s move to *stale */
++static void
++xg_surf_expire_locked(u64 now, struct list_head *stale)
++{
++	struct xg_ticket *e, *et;
++
++	list_for_each_entry_safe(e, et, &xg_tickets, link)
++		if (now - e->born > 2000000000ull)
++			list_move(&e->link, stale);
++	list_for_each_entry_safe(e, et, &xg_expects, link)
++		if (now - e->born > 2000000000ull)
++			list_move(&e->link, stale);
++}
++
++static void
++xg_surf_drop_list(struct list_head *l)
++{
++	struct xg_ticket *e, *et;
++
++	list_for_each_entry_safe(e, et, l, link) {
++		list_del(&e->link);
++		xg_md_drop(e->md, 0);
++		kfree(e);
++	}
++}
++
++/* "xgSurfTicket" (xg_kext.cpp): md is the surface's descriptor, task the caller's; 0 and *ticket set, or -errno */
++int
++xg_surf_ticket(void *md, void *task, unsigned int *ticket, unsigned long long *size)
++{
++	struct xg_ticket *t;
++	const u64 now = ktime_get_ns();
++	LIST_HEAD(stale);
++	u64 len;
++
++	if (md == NULL || task == NULL || ticket == NULL || size == NULL)
++		return -EINVAL;
++	len = xg_md_length(md);
++	if (len == 0 || len > (4ull << 30))
++		return -EINVAL;
++	t = kzalloc(sizeof(*t), GFP_KERNEL);
++	if (t == NULL)
++		return -ENOMEM;
++	xg_md_retain(md);
++	t->md = md;
++	t->task = task;
++	t->size = round_up(len, PAGE_SIZE);
++	t->born = now;
++	mutex_lock(&xg_surf_lock);
++	xg_surf_expire_locked(now, &stale);
++	if (++xg_ticket_next == 0)
++		xg_ticket_next = 1;
++	t->id = xg_ticket_next;
++	list_add_tail(&t->link, &xg_tickets);
++	mutex_unlock(&xg_surf_lock);
++	xg_surf_drop_list(&stale);
++	*ticket = t->id;
++	*size = t->size;
+ 	return 0;
+ }
+ 
++/* SURF_EXPECT: the caller's ticket, for the userptr import of [user_ptr, user_ptr + user_size) on this file */
++static int
++xg_surf_expect(void *key, struct xg_drm_surf_expect *a)
++{
++	struct xg_ticket *t = NULL, *e;
++	void *task = xg_current_task();
++
++	if (a->user_ptr == 0 || a->user_size == 0 || (a->user_ptr & (PAGE_SIZE - 1)) || (a->user_size & (PAGE_SIZE - 1)))
++		return -EINVAL;
++	mutex_lock(&xg_surf_lock);
++	list_for_each_entry(e, &xg_tickets, link)
++		if (e->id == a->ticket && e->task == task) {
++			t = e;
++			break;
++		}
++	if (t != NULL && a->user_size <= t->size) {
++		t->key = key;
++		t->user_ptr = a->user_ptr;
++		t->user_size = a->user_size;
++		t->born = ktime_get_ns();
++		list_move_tail(&t->link, &xg_expects);
++		mutex_unlock(&xg_surf_lock);
++		return 0;
++	}
++	if (t != NULL)	/* larger than the surface: the plain userptr it will be */
++		list_del(&t->link);
++	mutex_unlock(&xg_surf_lock);
++	if (t != NULL) {
++		xg_md_drop(t->md, 0);
++		kfree(t);
++		return -E2BIG;
++	}
++	return -ENOENT;
++}
++
++static struct xg_surfobj *
++xg_surfobj_find(struct drm_i915_gem_object *obj)
++{
++	struct xg_surfobj *so, *found = NULL;
++
++	mutex_lock(&xg_surf_lock);
++	list_for_each_entry(so, &xg_surfobjs, link)
++		if (so->obj == obj) {
++			found = so;
++			break;
++		}
++	mutex_unlock(&xg_surf_lock);
++	return found;
++}
++
++static int
++xg_surf_get_pages(struct drm_i915_gem_object *obj)
++{
++	struct xg_surfobj *so = xg_surfobj_find(obj);
++	struct scatterlist *sg;
++	struct sg_table *st;
++	unsigned int i;
++
++	if (so == NULL)
++		return -ENODEV;
++	st = kmalloc(sizeof(*st), GFP_KERNEL);
++	if (st == NULL)
++		return -ENOMEM;
++	if (sg_alloc_table(st, so->n, GFP_KERNEL)) {
++		kfree(st);
++		return -ENOMEM;
++	}
++	for_each_sg(st->sgl, sg, so->n, i) {
++		sg->offset = 0;
++		sg->length = (unsigned int)so->len[i];
++		sg_dma_address(sg) = (dma_addr_t)so->pa[i];
++		sg_dma_len(sg) = (unsigned int)so->len[i];
++	}
++	__i915_gem_object_set_pages(obj, st);
++	return 0;
++}
++
++static void
++xg_surf_put_pages(struct drm_i915_gem_object *obj, struct sg_table *pages)
++{
++	sg_free_table(pages);
++	kfree(pages);
++}
++
++static void
++xg_surf_release(struct drm_i915_gem_object *obj)
++{
++	struct xg_surfobj *so = NULL, *e;
++
++	mutex_lock(&xg_surf_lock);
++	list_for_each_entry(e, &xg_surfobjs, link)
++		if (e->obj == obj) {
++			list_del(&e->link);
++			so = e;
++			break;
++		}
++	mutex_unlock(&xg_surf_lock);
++	if (so == NULL)
++		return;
++	xg_md_drop(so->md, 1);
++	kvfree(so->pa);
++	kvfree(so->len);
++	kfree(so);
++	xg_surf_frees++;
++	xg_surf_live--;
++}
++
++static const struct drm_i915_gem_object_ops xg_surf_ops = {
++	.name = "xg_iosurface",
++	.get_pages = xg_surf_get_pages,
++	.put_pages = xg_surf_put_pages,
++	.release = xg_surf_release,
++};
++
++/*
++ * DRM_IOCTL_I915_GEM_USERPTR on a file with an announcement for exactly this pointer and size: the object is made of
++ * the surface's memory.  -ENOENT when nothing matches (the ioctl goes on to i915 as a plain userptr).
++ */
++static int
++xg_surf_userptr(struct file *filp, void *key, struct drm_i915_gem_userptr *u)
++{
++	static struct lock_class_key lock_class;
++	struct drm_file *file = filp->private_data;
++	struct drm_device *dev = file->minor->dev;
++	struct xg_ticket *t = NULL, *e;
++	struct drm_i915_gem_object *obj;
++	struct xg_surfobj *so;
++	const u64 t0 = ktime_get_ns();
++	unsigned int npages, n = 0;
++	u32 handle = 0;
++	int err;
++
++	mutex_lock(&xg_surf_lock);
++	list_for_each_entry(e, &xg_expects, link)
++		if (e->key == key && e->user_ptr == u->user_ptr && e->user_size == u->user_size) {
++			list_del(&e->link);
++			t = e;
++			break;
++		}
++	mutex_unlock(&xg_surf_lock);
++	if (t == NULL)
++		return -ENOENT;
++	npages = (unsigned int)(t->user_size >> PAGE_SHIFT);
++	so = kzalloc(sizeof(*so), GFP_KERNEL);
++	if (so != NULL) {
++		so->pa = kvcalloc(npages, sizeof(*so->pa), GFP_KERNEL);
++		so->len = kvcalloc(npages, sizeof(*so->len), GFP_KERNEL);
++	}
++	if (so == NULL || so->pa == NULL || so->len == NULL ||
++	    xg_md_prepare_ranges(t->md, t->user_size, so->pa, so->len, npages, &n) != 0) {
++		if (so != NULL) {
++			kvfree(so->pa);
++			kvfree(so->len);
++			kfree(so);
++		}
++		xg_md_drop(t->md, 0);
++		kfree(t);
++		xg_surf_fail++;
++		return -ENOENT;	/* a plain userptr after all */
++	}
++	so->md = t->md;
++	so->n = n;
++	kfree(t);
++	obj = i915_gem_object_alloc();
++	if (obj == NULL) {
++		xg_md_drop(so->md, 1);
++		kvfree(so->pa);
++		kvfree(so->len);
++		kfree(so);
++		xg_surf_fail++;
++		return -ENOMEM;
++	}
++	drm_gem_private_object_init(dev, &obj->base, npages << PAGE_SHIFT);
++	i915_gem_object_init(obj, &xg_surf_ops, &lock_class, I915_BO_ALLOC_USER);
++	obj->mem_flags = 0;	/* no struct pages: nothing maps, kmaps or clflushes it */
++	obj->read_domains = I915_GEM_DOMAIN_CPU | I915_GEM_DOMAIN_GTT;
++	obj->write_domain = 0;
++	i915_gem_object_set_cache_coherency(obj, I915_CACHE_LLC);	/* as a userptr: the CPU's pages, snooped */
++	if (u->flags & I915_USERPTR_READ_ONLY)
++		i915_gem_object_set_readonly(obj);
++	so->obj = obj;
++	mutex_lock(&xg_surf_lock);
++	list_add_tail(&so->link, &xg_surfobjs);
++	mutex_unlock(&xg_surf_lock);
++	xg_surf_live++;
++	err = drm_gem_handle_create(file, &obj->base, &handle);
++	i915_gem_object_put(obj);	/* the handle holds it now; on error this frees it (xg_surf_release) */
++	if (err) {
++		xg_surf_fail++;
++		return err;
++	}
++	u->handle = handle;
++	xg_surf_imports++;
++	xg_surf_pages += npages;
++	xg_surf_ranges += n;
++	xg_surf_ns += ktime_get_ns() - t0;
++	return 0;
++}
++
++/* a closing file's announcements go with it */
++static void
++xg_surf_close(void *key)
++{
++	struct xg_ticket *e, *et;
++	LIST_HEAD(gone);
++
++	mutex_lock(&xg_surf_lock);
++	list_for_each_entry_safe(e, et, &xg_expects, link)
++		if (e->key == key)
++			list_move(&e->link, &gone);
++	mutex_unlock(&xg_surf_lock);
++	xg_surf_drop_list(&gone);
++}
++
+ /* the PCI identity libdrm reads on the BSDs and Darwin to enumerate devices (drmParsePciBusInfo) */
+ static int
+ xg_pciinfo(struct file *filp, struct drm_pciinfo *pi)
+@@ -258,6 +722,19 @@
+ 		err = xg_map_munmap(key, data);
+ 	else if (cmd == DRM_IOCTL_GET_PCIINFO)
+ 		err = xg_pciinfo(lfile, data);
++	else if (cmd == XG_DRM_IOCTL_BO_SCANOUT)
++		err = xg_scan_add(lfile, key, data);
++	else if (cmd == XG_DRM_IOCTL_BO_UNSCANOUT)
++		err = xg_scan_del(key, data);
++	else if (cmd == XG_DRM_IOCTL_SURF_EXPECT)
++		err = xg_surf_expect(key, data);	/* §37.17 */
++	else if (cmd == DRM_IOCTL_I915_GEM_USERPTR) {	/* §37.17: an announced IOSurface, else i915's own */
++		if (list_empty(&xg_expects))
++			return ENOTTY;
++		err = xg_surf_userptr(lfile, key, data);
++		if (err == -ENOENT)
++			return ENOTTY;
++	}
+ 	else if (cmd == XG_DRM_IOCTL_BO_EXPORT_FENCE || cmd == XG_DRM_IOCTL_BO_IMPORT_FENCE)
+ 		err = xg_drm_bo_fence(((struct file *)lfile)->private_data, cmd == XG_DRM_IOCTL_BO_EXPORT_FENCE, data);
+ 	else
+@@ -278,6 +755,19 @@
+ 	mutex_unlock(&xg_maps_lock);
+ 	list_for_each_entry_safe(m, t, &dead, link)
+ 		xg_map_free(m);
++	xg_surf_close(key);	/* §37.17 */
++	{	/* §37.14: the file's scanout pins go with it */
++		struct xg_scan *e, *et;
++		LIST_HEAD(gone);
++
++		mutex_lock(&xg_scans_lock);
++		list_for_each_entry_safe(e, et, &xg_scans, link)
++			if (e->key == key)
++				list_move(&e->link, &gone);
++		mutex_unlock(&xg_scans_lock);
++		list_for_each_entry_safe(e, et, &gone, link)
++			xg_scan_free(e);
++	}
+ }
+ 
+ void
