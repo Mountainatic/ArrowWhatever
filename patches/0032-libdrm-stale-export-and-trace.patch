@@ -1,0 +1,315 @@
+# 0032 libdrm (XeGfx Darwin stand-in): stale exported handles, ioctl tracing
+#
+# Base:  libdrm b97cbde15c5c3abfe44d78e8f57139e50f612fec (2.4.134) + NvGfx 5a19a73f gpu/userland/patches/
+#        libdrm-macos.patch + libdrm-xegfx.patch (as gpu/userland/scripts/build_libdrm.sh applies them)
+# Files: xf86drm_xegfx.c
+# Apply: in the libdrm tree after the two NvGfx patches: patch -p1 < patches/0032-libdrm-stale-export-and-trace.patch
+# Build: libdrm.2.dylib becdb50aa750 (after install_name_tool / ad-hoc signing), installed next to ANV in
+#        /Library/GPUBundles/xemtl/
+#
+# Stale exported handles: the stand-in turns a dma-buf / sync_file / syncobj export into a pipe fd and keeps a table
+# of (fd number, dev, ino) -> GEM handle or syncobj.  XNU gives a pipe the inode VM_KERNEL_ADDRHASH(pipe), and a pipe
+# made right after one was closed often reuses both its number and its zone element, so the old entry kept matching
+# and lookup() handed out the old export's handle.  On 11-04 a compressed scanout image was pinned as the IOSurface
+# import that handle had come to name.  new_efd() now drops every entry with the number pipe() just returned before
+# adding the new one, as well as entries the caller has closed since.
+#
+# Tracing (XEMTL_DRM_TRACE=1, set by the XeMTL first-loss journal of 0007): every ioctl routed through the stand-in is
+# logged to syslog with route, minor, request, kernel return, result and errno (the first 512 successes and 64
+# failures), and GEM_USERPTR / GEM_EXECBUFFER2 get detail probes (pointer, size, protection of the source pages; the
+# buffer list and timeline fence extension) read with mach_vm_read_overwrite on the caller's own task, so a stale
+# pointer cannot crash it.  Off by default.
+#
+--- a/xf86drm_xegfx.c
++++ b/xf86drm_xegfx.c
+@@ -13,6 +13,10 @@
+  */
+ #ifdef __APPLE__
+ #include <errno.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <syslog.h>
++#include <time.h>
+ #include <fcntl.h>
+ #include <pthread.h>
+ #include <stdint.h>
+@@ -21,6 +25,9 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <IOKit/IOKitLib.h>
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++#include <mach/vm_region.h>
+ 
+ #include "libdrm_macros.h"
+ #include "xf86drm.h"
+@@ -92,6 +99,215 @@
+     return (int)(st.st_rdev & 0xffffff);
+ }
+ 
++static pthread_once_t xg_trace_once = PTHREAD_ONCE_INIT;
++static int xg_trace_on;
++static _Atomic unsigned long long xg_trace_sequence;
++static _Atomic unsigned xg_trace_ok, xg_trace_errors;
++static _Thread_local unsigned long long xg_trace_current;
++static void xg_trace_init(void)
++{
++    const char *v = getenv("XEMTL_DRM_TRACE");
++    xg_trace_on = v && v[0] == '1' && v[1] == 0;
++}
++static void xg_trace_record(const char *route, int minor, unsigned long request,
++                            long kr, unsigned long long scalar, int result, int error)
++{
++    int saved = errno;
++    unsigned n;
++    uint64_t tid = 0;
++    struct timespec t;
++    pthread_once(&xg_trace_once, xg_trace_init);
++    if (!xg_trace_on) return;
++    n = result ? atomic_fetch_add(&xg_trace_errors, 1) : atomic_fetch_add(&xg_trace_ok, 1);
++    if (n < (result ? 64u : 512u)) {
++        pthread_threadid_np(NULL, &tid);
++        clock_gettime(CLOCK_MONOTONIC_RAW, &t);
++        syslog(result ? LOG_ERR : LOG_NOTICE,
++            "XEGFX_IOCTL pid=%d tid=%llu seq=%llu route=%s minor=%d request=%#lx group=%u nr=%u kr=%#lx scalar=%llu ret=%d errno=%d mono_ns=%llu",
++            getpid(), (unsigned long long)tid, xg_trace_current, route, minor, request,
++            (unsigned)((request >> 8) & 255), (unsigned)(request & 255), (unsigned long)kr,
++            scalar, result, error, (unsigned long long)t.tv_sec*1000000000ull+t.tv_nsec);
++    }
++    errno = saved;
++}
++
++/* ---------------------------------------------------------------------------------------------
++ * Detail probes for the two i915 ioctls behind the WindowServer "execbuf EFAULT" (device lost):
++ * GEM_USERPTR (a host import's source pages) and GEM_EXECBUFFER2 (the submit that returns EFAULT).
++ * Every probe reads through mach_vm_read_overwrite() on our own task, so a stale pointer cannot
++ * crash the caller. Enabled together with XEGFX_IOCTL by XEMTL_DRM_TRACE=1.
++ * ------------------------------------------------------------------------------------------- */
++struct xg_i915_userptr {
++    uint64_t user_ptr;
++    uint64_t user_size;
++    uint32_t flags;
++    uint32_t handle;
++};
++struct xg_i915_eb2 {
++    uint64_t buffers_ptr;
++    uint32_t buffer_count;
++    uint32_t batch_start_offset;
++    uint32_t batch_len;
++    uint32_t DR1;
++    uint32_t DR4;
++    uint32_t num_cliprects;
++    uint64_t cliprects_ptr;
++    uint64_t flags;
++    uint64_t rsvd1;
++    uint64_t rsvd2;
++};
++struct xg_i915_eo2 {
++    uint32_t handle;
++    uint32_t relocation_count;
++    uint64_t relocs_ptr;
++    uint64_t alignment;
++    uint64_t offset;
++    uint64_t flags;
++    uint64_t rsvd1;
++    uint64_t rsvd2;
++};
++struct xg_i915_uext {
++    uint64_t next_extension;
++    uint32_t name;
++    uint32_t flags;
++    uint32_t rsvd[4];
++};
++struct xg_i915_tl_ext {
++    struct xg_i915_uext base;
++    uint64_t fence_count;
++    uint64_t handles_ptr;
++    uint64_t values_ptr;
++};
++#define XG_I915_GEM_USERPTR_IOCTL 0xc0186473ul
++#define XG_I915_GEM_EXECBUFFER2_IOCTL 0x80406469ul
++#define XG_I915_EXEC_USE_EXTENSIONS (1ull << 21)
++
++static int xg_trace_read(uint64_t addr, void *out, size_t len)
++{
++    mach_vm_size_t got = 0;
++
++    if (addr == 0 || len == 0)
++        return -1;
++    if (mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr, (mach_vm_size_t)len,
++                               (mach_vm_address_t)(uintptr_t)out, &got) != KERN_SUCCESS || got != len)
++        return -1;
++    return 0;
++}
++
++static int xg_trace_prot(uint64_t addr)
++{
++    mach_vm_address_t a = (mach_vm_address_t)addr;
++    mach_vm_size_t size = 0;
++    vm_region_basic_info_data_64_t info;
++    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++    mach_port_t object = MACH_PORT_NULL;
++    int prot = -1;
++
++    if (mach_vm_region(mach_task_self(), &a, &size, VM_REGION_BASIC_INFO_64,
++                       (vm_region_info_t)&info, &count, &object) == KERN_SUCCESS) {
++        prot = (int)info.protection;
++        if (object != MACH_PORT_NULL)
++            mach_port_deallocate(mach_task_self(), object);
++    }
++    return prot;
++}
++
++static void xg_trace_detail_before(unsigned long request, void *arg)
++{
++    int saved = errno;
++
++    pthread_once(&xg_trace_once, xg_trace_init);
++    if (!xg_trace_on || arg == NULL)
++        return;
++    if (request == XG_I915_GEM_USERPTR_IOCTL) {
++        struct xg_i915_userptr u;
++
++        if (xg_trace_read((uint64_t)(uintptr_t)arg, &u, sizeof(u)) != 0) {
++            syslog(LOG_ERR, "XEGFX_USERPTR_DETAIL pid=%d seq=%llu read_failed arg=%#llx",
++                   getpid(), xg_trace_current, (unsigned long long)(uintptr_t)arg);
++        } else {
++            syslog(LOG_NOTICE,
++                   "XEGFX_USERPTR_DETAIL pid=%d seq=%llu user_ptr=%#llx user_size=%llu flags=%#x page_off=%#llx prot=%#x end_prot=%#x",
++                   getpid(), xg_trace_current, (unsigned long long)u.user_ptr,
++                   (unsigned long long)u.user_size, u.flags, (unsigned long long)(u.user_ptr & 0xfffull),
++                   xg_trace_prot(u.user_ptr),
++                   u.user_size ? xg_trace_prot(u.user_ptr + u.user_size - 1) : -1);
++        }
++    } else if (request == XG_I915_GEM_EXECBUFFER2_IOCTL) {
++        struct xg_i915_eb2 e;
++        struct xg_i915_eo2 o[8];
++        int i, n, listed;
++
++        if (xg_trace_read((uint64_t)(uintptr_t)arg, &e, sizeof(e)) != 0) {
++            syslog(LOG_ERR, "XEGFX_EXEC_DETAIL pid=%d seq=%llu read_failed arg=%#llx",
++                   getpid(), xg_trace_current, (unsigned long long)(uintptr_t)arg);
++            errno = saved;
++            return;
++        }
++        n = (int)e.buffer_count;
++        if (n > 8)
++            n = 8;
++        listed = 0;
++        if (n > 0 && xg_trace_read(e.buffers_ptr, o, (size_t)n * sizeof(o[0])) == 0) {
++            listed = 1;
++            for (i = 0; i < n; i++)
++                syslog(LOG_NOTICE,
++                       "XEGFX_EXEC_OBJ pid=%d seq=%llu idx=%d handle=%u reloc_count=%u relocs=%#llx alignment=%#llx offset=%#llx flags=%#llx",
++                       getpid(), xg_trace_current, i, o[i].handle, o[i].relocation_count,
++                       (unsigned long long)o[i].relocs_ptr, (unsigned long long)o[i].alignment,
++                       (unsigned long long)o[i].offset, (unsigned long long)o[i].flags);
++        }
++        syslog(LOG_NOTICE,
++               "XEGFX_EXEC_DETAIL pid=%d seq=%llu buffers=%#llx count=%u start=%u len=%u DR1=%u DR4=%u num_clip=%u cliprects=%#llx flags=%#llx rsvd1=%#llx rsvd2=%#llx listed=%d",
++               getpid(), xg_trace_current, (unsigned long long)e.buffers_ptr, e.buffer_count,
++               e.batch_start_offset, e.batch_len, e.DR1, e.DR4, e.num_cliprects,
++               (unsigned long long)e.cliprects_ptr, (unsigned long long)e.flags,
++               (unsigned long long)e.rsvd1, (unsigned long long)e.rsvd2, listed);
++        if ((e.flags & XG_I915_EXEC_USE_EXTENSIONS) != 0) {
++            uint64_t next = e.cliprects_ptr;
++
++            for (i = 0; i < 4 && next != 0; i++) {
++                struct xg_i915_tl_ext t;
++
++                if (xg_trace_read(next, &t, sizeof(t)) != 0) {
++                    syslog(LOG_ERR, "XEGFX_EXEC_EXT pid=%d seq=%llu idx=%d unreadable=%#llx",
++                           getpid(), xg_trace_current, i, (unsigned long long)next);
++                    break;
++                }
++                syslog(LOG_NOTICE, "XEGFX_EXEC_EXT pid=%d seq=%llu idx=%d name=%u flags=%#x next=%#llx",
++                       getpid(), xg_trace_current, i, t.base.name, t.base.flags,
++                       (unsigned long long)t.base.next_extension);
++                if (t.base.name == 0)
++                    syslog(LOG_NOTICE,
++                           "XEGFX_EXEC_EXT_TL pid=%d seq=%llu fence_count=%llu handles=%#llx values=%#llx",
++                           getpid(), xg_trace_current, (unsigned long long)t.fence_count,
++                           (unsigned long long)t.handles_ptr, (unsigned long long)t.values_ptr);
++                next = t.base.next_extension;
++            }
++        }
++    }
++    errno = saved;
++}
++
++static void xg_trace_detail_before(unsigned long request, void *arg);
++
++static void xg_trace_detail_after(unsigned long request, void *arg, int result, int error)
++{
++    int saved = errno;
++
++    pthread_once(&xg_trace_once, xg_trace_init);
++    if (!xg_trace_on)
++        return;
++    /* A submit is dumped only when it fails: the arguments stay valid until execbuf returns, and
++     * dumping every submit would cost more than the submission itself. */
++    if (result != 0 && request == XG_I915_GEM_EXECBUFFER2_IOCTL)
++        xg_trace_detail_before(request, arg);
++    if ((request == XG_I915_GEM_USERPTR_IOCTL || request == XG_I915_GEM_EXECBUFFER2_IOCTL) && result != 0)
++        syslog(LOG_ERR, "XEGFX_DETAIL_RESULT pid=%d seq=%llu request=%#lx ret=%d errno=%d",
++               getpid(), xg_trace_current, request, result, error);
++    errno = saved;
++}
++
+ static int remote_ioctl(int minor, unsigned long request, void *arg)
+ {
+     uint64_t in[3] = { (uint64_t)minor, (uint64_t)request, (uint64_t)(uintptr_t)arg }, out = 0;
+@@ -103,7 +319,11 @@
+         return -1;
+     }
+     do {
+-        if (IOConnectCallScalarMethod(xg_conn, 0, in, 3, &out, &n) != KERN_SUCCESS) {
++        kern_return_t kr = IOConnectCallScalarMethod(xg_conn, 0, in, 3, &out, &n);
++        xg_trace_record("iokit", minor, request, kr, out,
++                        kr != KERN_SUCCESS || out != 0 ? -1 : 0,
++                        kr != KERN_SUCCESS ? EIO : (int)out);
++        if (kr != KERN_SUCCESS) {
+             errno = EIO;
+             return -1;
+         }
+@@ -119,11 +339,20 @@
+ {
+     int ret, minor = remote_minor(fd);
+ 
+-    if (minor >= 0)
+-        return remote_ioctl(minor, request, arg);
++    xg_trace_current = atomic_fetch_add(&xg_trace_sequence, 1) + 1;
++    if (request == XG_I915_GEM_USERPTR_IOCTL)
++        xg_trace_detail_before(request, arg);
++    if (minor >= 0) {
++        ret = remote_ioctl(minor, request, arg);
++        xg_trace_record("remote_result", minor, request, 0, 0, ret, ret ? errno : 0);
++        xg_trace_detail_after(request, arg, ret, ret ? errno : 0);
++        return ret;
++    }
+     do {
+         ret = ioctl(fd, request, arg);
+     } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++    xg_trace_record("device_ioctl", minor, request, 0, 0, ret, ret ? errno : 0);
++    xg_trace_detail_after(request, arg, ret, ret ? errno : 0);
+     return ret;
+ }
+ 
+@@ -179,9 +408,15 @@
+     e.dev = st.st_dev;
+     e.ino = st.st_ino;
+     pthread_mutex_lock(&xg_lock);
+-    /* stand-ins the caller has closed since: their numbers now name something else, or nothing */
++    /*
++     * stand-ins the caller has closed since: their numbers now name something else, or nothing.  An entry with the
++     * number pipe() just returned is always one of them, even when it still looks ours: XNU gives a pipe the inode
++     * VM_KERNEL_ADDRHASH(pipe), and a pipe made right after one was closed often reuses both its number and its zone
++     * element, so the old entry kept matching and lookup() handed out the old export's GEM handle (11-04: a compressed
++     * scanout image was pinned as the surface import that handle had come to name).
++     */
+     for (i = xg_n - 1; i >= 0; i--)
+-        if (!still_ours(&xg_tab[i]))
++        if (xg_tab[i].fd == e.fd || !still_ours(&xg_tab[i]))
+             drop(i);
+     if (xg_n == xg_cap) {
+         int cap = xg_cap ? 2 * xg_cap : 64;
