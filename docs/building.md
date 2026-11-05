@@ -36,16 +36,23 @@ ArrowWhatever 使用两套 NvGfx `xe` 源码：
 
 ## 构建产物
 
-一次完整部署包含五个 kext 与一个 Metal plugin bundle：
+一次完整部署包含五个 kext、一个 Metal plugin bundle，以及 `/Library/GPUBundles/xemtl/` 里的 ANV 与 libdrm：
 
 | 产物 | 补丁链 | 作用 |
 | --- | --- | --- |
-| `XeGfx.kext` | `0001 → 0008 → 0011 → 0020 → 0022` | GPU core、boot-arm、VBT/KMS、AUX、K1 eDP readout |
-| `XeGfxAccel.kext` | `0002 → 0009 → 0012` | display-pipe、zero-copy present、adapter/accel contract |
+| `XeGfx.kext` | `0001 → 0008 → 0011 → 0020 → 0022 → 0023 → 0028` | GPU core、boot-arm、VBT/KMS、AUX、K1 eDP readout、压缩扫描 BO、按 surface 导入 |
+| `XeGfxAccel.kext` | `0002 → 0009 → 0012 → 0024 → 0029` | display-pipe、zero-copy present、延迟 flip、page-off、压缩扫描登记 |
 | `XeGfxIntelFB.kext` | `0003 → 0010 → 0014` | panel timing、detailed timing、L0 ready |
-| `XeGfxAGDC.kext` | `0004 → 0013 → 0017` | AGDC/K5 与启动阶段显示映射 |
-| `XeGfxDisplay.kext` | `0015 → 0018 → 0021` | KMS framebuffer adapter、scanout、EDID/DDC |
-| `XeMTLDriver.bundle` | `0005 → 0006 → 0007` | Metal → Vulkan/ANV |
+| `XeGfxAGDC.kext` | `0004 → 0013 → 0017 → 0030` | AGDC/K5、启动阶段显示映射、颜色级与平面格式 |
+| `XeGfxDisplay.kext` | `0015 → 0018 → 0021 → 0025` | KMS framebuffer adapter、scanout、EDID/DDC、模式与硬件光标 |
+| `XeMTLDriver.bundle` | `0005 → 0006 → 0007 → 0026 → 0031` | Metal → Vulkan/ANV |
+| `libvulkan_intel.dylib` | NvGfx Mesa 移植补丁 → `0033` | ANV：XeMTL 显式驻留、只读 SSBO 与地址表常量 push |
+| `libdrm.2.dylib` | NvGfx libdrm 移植补丁 → `0032` | Darwin 上的 DRM 替身 |
+
+ANV 与 libdrm 用 NvGfx 的 `gpu/userland/scripts/build_mesa.sh`、`build_libdrm.sh` 构建（基点与移植补丁见 `patches/README.md`）。
+装到 `/Library/GPUBundles/xemtl/` 之前把 libdrm 的依赖改成 `@loader_path/libdrm.2.dylib`、去掉 rpath，再做 ad-hoc 签名。
+本机没有 ninja 时，`tools/anv/minininja.py <builddir> src/intel/vulkan/libvulkan_intel.dylib` 可以按 `build.ninja`
+只重编改过的文件并重新链接。
 
 ## 构建 XeGfx core
 
