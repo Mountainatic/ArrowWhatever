@@ -25,7 +25,7 @@
 | 显示能力协商   | AGDC 颜色处理级别、BGRA 平面格式及 HiDPI 平面尺寸                      |
 | GPU 执行优化 | Mesa ANV 常量推送、资源驻留管理及 libdrm 适配                        |
 
-目前的开发工作集中在提高 WindowServer 合成吞吐、完善显示色彩管理、GPU 动态调频及图形内存同步，部分系统动画仍有优化空间，夜览暂时无法正常色调调节。
+目前的开发工作集中在提高 WindowServer 合成吞吐、完善显示色彩管理、GPU 动态调频及图形内存同步，部分系统动画仍有优化空间，夜览暂时无法正常色调调节，常规渲染约100fps，神奇效果动画下约50fps。
 
 ![Intel Xe-LPG 核显与 HiDPI 显示信息](assets/intel-gpu-info.png)
 
