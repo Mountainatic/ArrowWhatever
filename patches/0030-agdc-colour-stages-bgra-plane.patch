@@ -1,0 +1,175 @@
+# 0030 XeGfxAGDC: display-pipe colour stages, BGRA plane format, plane limits at the desktop size
+#
+# Base:  kexts/NVRMAGDC after 0004 + 0013 + 0017
+# Files: kexts/NVRMAGDC/nvrm-agdc.cpp, kexts/NVRMAGDC/nvrm-agdc-k5.h
+# Apply: patch -p1 < patches/0030-agdc-colour-stages-bgra-plane.patch
+# Build: XeGfxAGDC dda3c30e4fab
+#
+# CoreDisplay asks the AGDC K5 path (command 0x711, getDisplayPipeCapabilityExtended) what the display pipe can do.
+# With the old answers it decided the plane could neither do colour nor fetch WindowServer's composite, and ran an
+# extra full-screen GPUPass before every scanout.  The answers now follow what Apple's ICL framebuffer returns for its
+# built-in panel:
+#   - colour stages: type 1 (CSC matrix, range -1.0 .. 1.0) and types 2 / 4 (1024-entry tables, 0.0 .. 1.0), one generic
+#     entry each.  Without them CoreDisplay reported "plane with no gamma" and added a full-screen LUT pass.
+#     debug.xegfx_agdc_k5_colour (1 = answer, default; boot argument xegfxagdcnocolour starts it at 0) and
+#     debug.xegfx_agdc_k5_colour_answers.
+#   - plane pixel formats: the plane entry's AGDC format mask is BGRA (bits 0 and 16, which IOPresentment moves to its
+#     bits 32 / 48 that CoreDisplay's SupportsPixelFormat('BGRA') needs) with the second word 1, instead of 0x80004 / 0.
+#     Without it CoreDisplay copied WindowServer's BGRA composite into a display surface with GPUPass every frame.
+#     BGRA only: the flip path scans out 32-bit RGB.  debug.xegfx_agdc_k5_bgra (boot argument xegfxagdcnobgra).
+#   - plane scaler limits: both size arrays hold the current desktop (the framebuffer's XeGfxDesktop property), not the
+#     panel's 2560x1600 timing, each entry BGRA with the sixth word 2.  A 3840x2400 HiDPI composite failed CoreDisplay's
+#     sub-region / scaling checks against the panel size and also went through GPUPass.
+#   - the first 64 extended-capability queries are logged (which stages CoreDisplay asks about and what it got).
+#
+--- a/kexts/NVRMAGDC/nvrm-agdc.cpp
++++ b/kexts/NVRMAGDC/nvrm-agdc.cpp
+@@ -105,6 +105,7 @@
+ static void nvdaAgdcPublish(void);   // the read-only observables; called from the 0x980 path, the worker and the poll
+ 
+ static int    gAgdcK5 = 0;
++static SInt64 gAgdcK5Colour = 0;   // §37.12: colour-stage capability queries answered
+ static SInt64 gAgdcK5Link = 0, gAgdcK5Caps = 0;
+ static int    gAgdcK5Why = 0;
+ static SInt64 gAgdcCmds = 0, gAgdcUnsupported = 0;
+@@ -163,7 +164,35 @@
+         h[i].t = have ? t[i] : NULL; h[i].tBytes = tBytes;
+     }
+     int why = 0; int32_t idx = -1;
++    const uint32_t capType = (cmd == NVK5_CMD_FBCAPEX && in && inSize >= 12) ? ((const uint32_t *)in)[1] : 0;
++    const uint32_t capCount = (cmd == NVK5_CMD_FBCAPEX && in && inSize >= 12) ? ((const uint32_t *)in)[2] : 0;
+     int r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, h, nh, &why, &idx);
++    // §37.13: the plane entry as Apple's ICL framebuffer builds it (getDisplayPipeCapabilityExtended, type 0x10): both
++    // size arrays hold the current desktop (min = max = the framebuffer's source size, not the panel's native timing),
++    // each entry's format group is BGRA (0x10000) and its sixth word is 2.  With the panel's 2560x1600 there, a 3840x2400
++    // HiDPI composite failed CoreDisplay's sub-region / scaling checks and went through GPUPass every frame.
++    if (cmd == NVK5_CMD_FBCAPEX && capType == NVK5_CAP_PLANESCALER && r == NVK5_R_CAPS && nvk5_bgra_on && out
++        && idx >= 0 && (unsigned)idx < nh && slot[idx]) {
++        OSNumber *dn = OSDynamicCast(OSNumber, slot[idx]->getProperty("XeGfxDesktop"));
++        const uint64_t dv = dn ? dn->unsigned64BitValue() : 0;
++        const uint32_t dw = (uint32_t)(dv >> 32), dh = (uint32_t)dv;
++        if (dw >= 640 && dh >= 400 && dw <= 16384 && dh <= 16384) {
++            uint8_t *e = ((struct NVAGDCFBExtCap *)out)->entry[0];
++            for (unsigned a = 0x24; a <= 0x1ac; a += 0x188) {
++                nvk5_put32(e, a + 0x00, dh); nvk5_put32(e, a + 0x04, dw); nvk5_put32(e, a + 0x08, dh); nvk5_put32(e, a + 0x0c, dw);
++                nvk5_put32(e, a + 0x10, 0x10000); nvk5_put32(e, a + 0x14, 2);
++            }
++            static SInt32 told; if (OSIncrementAtomic(&told) < 4) FBLOG("AGDC 0x711: plane 0 limits set to the desktop %ux%u (Apple layout)", dw, dh);
++        }
++    }
++    // §37.12: every extended-capability query, the first 64: which colour stages CoreDisplay asks about
++    if (cmd == NVK5_CMD_FBCAPEX) {
++        static SInt32 said;
++        if (capType == 1 || capType == 2 || capType == 4) { if (r == NVK5_R_CAPS) OSAddAtomic64(1, &gAgdcK5Colour); }
++        if (OSIncrementAtomic(&said) < 64)
++            FBLOG("AGDC 0x711: fb %d type %#x count %u -> %s", idx, capType, capCount,
++                  r == NVK5_R_CAPS ? (capType == NVK5_CAP_PLANESCALER ? "plane scaler" : "colour stage answered") : r == NVK5_R_UNSUPPORTED ? "Unsupported" : "refused");
++    }
+     const UInt32 bit = (idx >= 0 && idx < 32) ? (1u << idx) : 0;
+     if (bit) OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5Asked);
+     if (r == NVK5_R_LINK) { OSAddAtomic64(1, &gAgdcK5Link); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5LinkMask); return kIOReturnSuccess; }
+@@ -702,6 +731,9 @@
+ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5,      CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gAgdcK5,     0, "K5: 1 = answer kAGDCLinkConfig + plane-scaler capabilities (0 after every boot)");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_k5_link, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Link,    "K5: kAGDCLinkConfig queries answered");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_agdc_k5_caps, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Caps,    "K5: plane-scaler capability queries answered");
++SYSCTL_INT (_debug, OID_AUTO, xegfx_agdc_k5_colour, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nvk5_colour_on, 0, "§37.12: 1 = answer the colour-stage capabilities (CSC, tables); read by WindowServer when it starts");
++SYSCTL_INT (_debug, OID_AUTO, xegfx_agdc_k5_bgra, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &nvk5_bgra_on, 0, "§37.13: 1 = the plane capability lists BGRA (CoreDisplay can scan WindowServer's composite directly); read when WindowServer starts");
++SYSCTL_QUAD(_debug, OID_AUTO, xegfx_agdc_k5_colour_answers, CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Colour, "§37.12: colour-stage capability queries answered");
+ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_k5_why,  CTLFLAG_RD | CTLFLAG_LOCKED, &gAgdcK5Why,  0, "K5: why the last K5 query was not answered");
+ SYSCTL_STRING(_debug, OID_AUTO, nvrmfb_agdc_fbmap, CTLFLAG_RD | CTLFLAG_LOCKED, gAgdcFBMap, sizeof gAgdcFBMap, "the slot table our 0x980 reports: n, then [i]id per IOFBDependentIndex");
+ SYSCTL_INT (_debug, OID_AUTO, nvrmfb_agdc_client_ack, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gAgdcClientAck, 0, "1 = accept WindowServer's 0x2001 client set");
+@@ -720,6 +752,8 @@
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_caps); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_why);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_fbmap); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_maxfb);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_rescans);
++    sysctl_unregister_oid(&sysctl__debug_xegfx_agdc_k5_bgra);
++    sysctl_unregister_oid(&sysctl__debug_xegfx_agdc_k5_colour); sysctl_unregister_oid(&sysctl__debug_xegfx_agdc_k5_colour_answers);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_asked); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_link_mask);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_caps_mask); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_k5_last_refused_idx);
+     sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_ack); sysctl_unregister_oid(&sysctl__debug_nvrmfb_agdc_client_set);
+@@ -732,6 +766,8 @@
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_caps); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_why);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_fbmap); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_maxfb);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_rescans);
++    sysctl_register_oid(&sysctl__debug_xegfx_agdc_k5_bgra);
++    sysctl_register_oid(&sysctl__debug_xegfx_agdc_k5_colour); sysctl_register_oid(&sysctl__debug_xegfx_agdc_k5_colour_answers);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_asked); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_link_mask);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_caps_mask); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_k5_last_refused_idx);
+     sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_ack); sysctl_register_oid(&sysctl__debug_nvrmfb_agdc_client_set);
+@@ -750,6 +786,8 @@
+     { if (nvrm_driver_off()) return false; }
+ #endif
+     if (!IOService::start(provider)) return false;
++    { int v = 0; if (PE_parse_boot_argn("xegfxagdcnocolour", &v, sizeof v)) nvk5_colour_on = 0; }   // §37.12
++    { int v = 0; if (PE_parse_boot_argn("xegfxagdcnobgra", &v, sizeof v)) nvk5_bgra_on = 0; }       // §37.13
+     nvdaAgdcInstallSysctl();
+ #ifdef NMX_XEGFX
+     // M3d: the accelerator's XeGfxAccelAgdcRequest (set on the GPU node at boot-armed 6/6) arms AGDC automatically;
+--- a/kexts/NVRMAGDC/nvrm-agdc-k5.h
++++ b/kexts/NVRMAGDC/nvrm-agdc-k5.h
+@@ -87,13 +87,20 @@
+     nvk5_fill_link(l, t); l->port = port;
+ }
+ 
++static int nvk5_colour_on = 1;   // debug.xegfx_agdc_k5_colour; boot-arg xegfxagdcnocolour starts it at 0
++static int nvk5_bgra_on = 1;     // debug.xegfx_agdc_k5_bgra; boot-arg xegfxagdcnobgra starts it at 0 (the old 0x80004 mask)
+ static inline void nvk5_fill_planescaler(struct NVAGDCFBExtCap *c, const uint32_t *t)
+ {
+     uint32_t idx = c->fbIndex, type = c->type; nvk5_zero(c, sizeof *c); c->fbIndex = idx; c->type = type;
+     c->count = 1;
+     uint8_t *e = c->entry[0]; uint32_t w = t[NVK5_T_HVIS], h = t[NVK5_T_VVIS];
+-    nvk5_put32(e, 0x000, 0x80004);
+-    nvk5_put32(e, 0x004, 0);
++    // §37.13: e+0 is the plane's AGDC pixel-format mask.  IOPresentment (AGDCPixelFormatTypeToIOPresentment) moves AGDC
++    // bits 0 / 1 / 16 / 17 to its bits 32 / 33 / 48 / 49, and CoreDisplay's SupportsPixelFormat('BGRA') needs bit 32 or 48
++    // (IOPPixelFormatMaskForIOSurfacePixelFormat).  Without them CoreDisplay cannot fetch WindowServer's BGRA composite on
++    // the plane and copies it into a display surface with GPUPass every frame.  BGRA only (AGDC bits 0 and 16): the flip
++    // path scans out 32-bit RGB only.  e+4 = 1 as Apple's ICL answers.
++    nvk5_put32(e, 0x000, nvk5_bgra_on ? 0x10001u : 0x80004u);
++    nvk5_put32(e, 0x004, nvk5_bgra_on ? 1u : 0u);
+     nvk5_put32(e, 0x01c, 1);
+     nvk5_put32(e, 0x024, h); nvk5_put32(e, 0x028, w); nvk5_put32(e, 0x02c, h); nvk5_put32(e, 0x030, w);
+     nvk5_put32(e, 0x034, 0x70007);
+@@ -104,6 +111,30 @@
+     nvk5_put32(e, 0x1c0, 0);
+ }
+ 
++// §37.12: the display pipe's colour stages, answered the way Apple's ICL framebuffer answers them for its built-in panel
++// (getDisplayPipeCapabilityExtended: type 1 = the CSC matrix range, types 2 and 4 = 1024-entry tables; one generic
++// entry each, without Intel's vendor-specific second entry).  Without these CoreDisplay finds "plane with no gamma"
++// and runs its GPUPass (a full-screen LUT pass) before every scanout.  Each entry is offset 0xc into the reply.
++static inline void nvk5_putf(uint8_t *e, unsigned off, uint32_t bits) { nvk5_put32(e, off, bits); }
++static inline int nvk5_fill_colour(struct NVAGDCFBExtCap *c)
++{
++    uint32_t idx = c->fbIndex, type = c->type; uint8_t *e = c->entry[0];
++    if (type != 1 && type != 2 && type != 4) return 0;
++    nvk5_zero(c, sizeof *c); c->fbIndex = idx; c->type = type; c->count = 1;
++    if (type == 1) {
++        nvk5_put32(e, 0x00, 5); nvk5_put32(e, 0x10, 8); nvk5_put32(e, 0x20, 0x30700);
++        nvk5_putf(e, 0x24, 0xbf800000u); nvk5_putf(e, 0x28, 0x3f800000u);            // -1.0 .. 1.0
++    } else {
++        nvk5_put32(e, 0x00, type == 2 ? 0x101001u : 0x100001u);
++        nvk5_put32(e, 0x04, type == 2 ? 3u : 2u);
++        nvk5_putf(e, 0x0c, type == 2 ? 0x41480000u : 0x40855555u);                   // 3 x / 1 x a 240 Hz frame, ms
++        nvk5_put32(e, 0x10, type == 2 ? 0x10u : 0x8u);
++        nvk5_putf(e, 0x20, 0); nvk5_putf(e, 0x24, 0x3f800000u);                      // 0.0 .. 1.0
++        nvk5_put32(e, 0x28, 0x400);                                                   // 1024 entries
++    }
++    return 1;
++}
++
+ #define NVK5_R_UNSUPPORTED  0
+ #define NVK5_R_LINK         1
+ #define NVK5_R_CAPS         2
+@@ -125,7 +156,10 @@
+     }
+     uint32_t idx = link ? (uint32_t)((struct NVAGDCLinkConfig *)out)->id : ((struct NVAGDCFBExtCap *)out)->fbIndex;
+     *idxOut = (int32_t)idx;
+-    if (!link && ((struct NVAGDCFBExtCap *)out)->type != NVK5_CAP_PLANESCALER) return NVK5_R_UNSUPPORTED;
++    if (!link && ((struct NVAGDCFBExtCap *)out)->type != NVK5_CAP_PLANESCALER) {
++        if (idx >= nh || !nvk5_colour_on) return NVK5_R_UNSUPPORTED;
++        return nvk5_fill_colour((struct NVAGDCFBExtCap *)out) ? NVK5_R_CAPS : NVK5_R_UNSUPPORTED;
++    }
+     if (idx >= nh) { *why = link ? 0x11 : 0x21; return NVK5_R_BADARG; }
+     const uint32_t *t = h[idx].t;
+     int bad = t ? nvk5_timing_bad(t, h[idx].tBytes) : 0x31;
