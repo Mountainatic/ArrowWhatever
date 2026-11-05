@@ -20,6 +20,9 @@
 | `tools/flip-sampler.pl` | 每 10 ms 记录一次 accel 的翻页计数（时间 ms 与累计数），卡顿表现为两次计数之间的空档 |
 | `tools/mark-timeout-watch.sh` | 合成标记等待超时或最长等待增长时打印一行带时间的记录 |
 | `tools/passtime-summ.py`、`tools/passtime-sizes.py` | 汇总插件的 passtime 日志（可直接读 `.gz`）：每个命令缓冲的 GPU 时间、按目标尺寸与着色器的 pass 和每次 draw 时间 |
+| `tools/genie-fps.m`、`tools/genie-fps.sh` | 稳定帧率与神奇效果帧率：读 accel 的翻页计数（每 0.5 ms），给出 fps、帧间隔 p50/p90/p99/最长，以及忙时 GPU 频率；`genie-fps.sh` 需要时自动编译，并把每次结果追加到 `../data/fps-history.tsv` |
+| `tools/tl-summ.py` | `sysctl -n debug.nvaccel_iop_xe_tl` 输出的每帧时间线，按步骤给出 p10/p50/p90 |
+| `tools/dt-tgt.py` | 带逐 draw 计时的 passtime 日志：按每个命令缓冲的 GPU 时间排 draw，附源纹理和渲染目标 |
 
 ## 环境变量
 
@@ -67,6 +70,8 @@ clang -O2 -framework ApplicationServices -framework CoreVideo \
 clang -O2 -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo \
       -o /tmp/fps-probe scripts/tools/fps-probe.m
 clang -O2 -fobjc-arc -framework Cocoa -o /tmp/anim-probe scripts/tools/anim-probe.m
+clang -O2 -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo \
+      -o scripts/tools/genie-fps scripts/tools/genie-fps.m
 ```
 
 ## 语法检查

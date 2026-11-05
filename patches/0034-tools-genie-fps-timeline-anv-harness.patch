@@ -1,0 +1,1561 @@
+# 0034 native-display tools: frame-rate and Genie measurement, flip timeline, per-draw surfaces, re-arm, hang log,
+#      ANV push verification harness
+#
+# Base:  tools/ after 0016 + 0019 + 0027
+# Files: new: tools/{genie-fps.m, genie-fps.sh, tl-summ.py, dt-tgt.py, rearm-after-fallback.sh},
+#        tools/livelog/{xegfx-livelog.py, com.xegfx.livelog.plist},
+#        tools/anv/{ssbo-push-test.c, ptr-push-test.c, diff-test.c, gen_vs.py, mkspv.py, plower.m, shader-stats.py,
+#        sweep.py, diff-one.sh, map-test.c, pool-test.c, cum-test.c, minininja.py}
+# Apply: patch -p1 < patches/0034-tools-genie-fps-timeline-anv-harness.patch
+#
+# Measurement (paths follow the scripts/README policy: files next to a script are found from its own location):
+#   - genie-fps.m / genie-fps.sh: panel frame rate from the accel's flip counter (debug.xegfxaccel_iop_xe_flips,
+#     sampled every 0.5 ms on a thread), so it counts frames that reached the panel, not frames the app drew.
+#     (1) steady: a window repaints on every display-link tick for N seconds -> fps and frame-time p50 / p90 / p99 /
+#     longest gap; GPU clock while busy (debug.xegfx_gt_act every 10 ms: average, maximum, share at 550 MHz).
+#     (2) Genie: the tool minimizes and restores its own window (no Accessibility permission needed) -> per animation
+#     duration, flips, fps, longest gap.  genie-fps.sh builds it when needed and appends one line per run to
+#     data/fps-history.tsv (minutes since boot, WindowServer uptime, results), to follow a slowdown over time.
+#     Usage: tools/genie-fps.sh [steady seconds = 5] [Genie cycles = 4]
+#   - tl-summ.py <file>: percentiles of each step of the accel's per-frame flip timeline (sysctl -n
+#     debug.nvaccel_iop_xe_tl): gap, queued->pop, pop->mark (the composite), mark->arm, arm->latch, latch->signal,
+#     signal->next.
+#   - dt-tgt.py <drawtime log> [n]: the draws of a passtime log taken with per-draw timing (XeMTL 0031), ranked by GPU
+#     time per command buffer, with the source texture and the render target (scanout framebuffer or other image)
+#     when the plugin logs surface IDs.
+#
+# Boot guard: rearm-after-fallback.sh (run as root) writes back the display gates a claim boot ran with (phase 2,
+# trial 1, starts 0, fail 0, expose 1, bootarm 0; trial last) after m4a2-bootguard fell back to IntelFB, backing up
+# NVRAM to /Library/XeGfxTrial/rearm-*; it also creates /Library/GPUBundles/.xemtl-no-ssbo-push (ANV pushes off),
+# remove that file to keep them on.  For when m3db-arm.sh's preflight refuses only because of pins.
+#
+# Hang log: livelog/ is a LaunchDaemon (com.xegfx.livelog, runs /usr/local/xegfx/xegfx-livelog.py) that streams the
+# XeGfx kexts', CoreDisplay's and the XeMTL plugin's log messages into /var/log/xegfx-live/ (fsynced every 0.25 s, last
+# 12 files kept) with a heartbeat line every second carrying the flip and E2 counters, so the tail before a hard hang
+# survives the forced reboot.  Diagnostics only.
+#
+# ANV push verification (anv/, for Mesa 0033; XEGFX_ICD names the ICD json, default the installed one):
+#   - ssbo-push-test.c / ptr-push-test.c: render hand-made shaders (mkspv.py) reading NonWritable SSBOs, or constants
+#     through the binding-640 table, at aligned and misaligned offsets, with a GPU update inside the command buffer
+#     and a robustness bound; check the result and print ANV's statistics.  "ssbo-push-test real <frag.spv>" compiles
+#     a captured plugin shader under the plugin's descriptor layout.
+#   - plower.m: the plugin's module preparation offline (libxemtl_translate.dylib's buffer-address lowering), to turn
+#     WindowServer's cached SPIR-V into what ANV really compiles.
+#   - shader-stats.py / sweep.py: which lowered shaders the pushes change, and totals for XEMTL_PTR_PUSH_* settings.
+#   - diff-test.c + gen_vs.py + diff-one.sh: render each lowered shader with deterministic inputs (32 storage buffers,
+#     the address table with misaligned pointers, sampled and storage images, samplers, the bindless heap) with the
+#     pushes off and on and compare the pixels byte for byte (MISALIGN=0/8/16 sets the pointers' misalignment).
+#   - map-test.c / pool-test.c / cum-test.c: the largest host-visible allocation that maps now, the plugin's
+#     descriptor pool sizes until creation fails, and many maps held at once (per-mapping vs total limits; 0028).
+#   - minininja.py <builddir> <target> [-n]: rebuild one target of a meson build.ninja without ninja (recompile what
+#     is newer, re-archive, relink).
+#
+--- /dev/null
++++ b/tools/genie-fps.m
+@@ -0,0 +1,212 @@
++// genie-fps: panel frame rate, steady and during the Genie minimize/restore animation.
++// Counts real flips through the accel's counter (debug.xegfxaccel_iop_xe_flips), sampled every 0.5 ms on a thread, so
++// it measures what reached the panel, not what the app drew.
++//   1. steady: a window repaints on every display-link tick for S seconds -> flips/s, frame-time p50/p90/p99, max gap
++//   2. genie:  the tool minimizes and restores its own window N times -> per animation: duration, flips, fps, max gap
++// Prints a summary line (tab separated) for fps-history; see genie-fps.sh.
++// Build: clang -O2 -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo genie-fps.m -o genie-fps
++// Usage: genie-fps [steady_seconds=5] [genie_cycles=4] [width=1400] [height=900]
++#import <Cocoa/Cocoa.h>
++#import <QuartzCore/QuartzCore.h>
++#import <CoreVideo/CoreVideo.h>
++#include <sys/sysctl.h>
++#include <mach/mach_time.h>
++#include <pthread.h>
++
++static double now_s(void)
++{
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom) mach_timebase_info(&tb);
++    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e9;
++}
++
++static long flips(void)
++{
++    int64_t v = 0; size_t n = sizeof v;
++    if (sysctlbyname("debug.xegfxaccel_iop_xe_flips", &v, &n, NULL, 0) != 0) return -1;
++    return n == 4 ? (long)*(int32_t *)&v : (long)v;
++}
++
++#define MAXEV 200000
++static double gEvT[MAXEV];
++static volatile int gEvN;
++static volatile int gStop;
++static volatile long gFreqSum, gFreqN, gFreqBusy, gFreqMax, gFreqAt550;
++static volatile int gFreqOn;
++
++static int gt_act(void)
++{
++    int v = 0; size_t n = sizeof v;
++    return sysctlbyname("debug.xegfx_gt_act", &v, &n, NULL, 0) == 0 ? v : -1;
++}
++
++static void *sampler(void *arg)
++{
++    (void)arg;
++    long last = flips();
++    int k = 0;
++    while (!gStop) {
++        if (gFreqOn && (++k % 20) == 0) {
++            int f = gt_act();
++            if (f > 0) { gFreqSum += f; gFreqBusy++; if (f > gFreqMax) gFreqMax = f; if (f <= 550) gFreqAt550++; }
++            if (f >= 0) gFreqN++;
++        }
++        long f = flips();
++        if (f > last) {
++            double t = now_s();
++            for (long k = last; k < f && gEvN < MAXEV; k++) gEvT[gEvN++] = t;
++            last = f;
++        }
++        usleep(500);
++    }
++    return NULL;
++}
++
++static int cmpd(const void *a, const void *b)
++{
++    double x = *(const double *)a, y = *(const double *)b;
++    return x < y ? -1 : x > y;
++}
++
++typedef struct { int n; double fps, p50, p90, p99, maxgap; } stats;
++
++static stats window_stats(double t0, double t1)
++{
++    stats s = { 0 };
++    static double gaps[MAXEV];
++    int ng = 0; double prev = t0, last = t0;
++    for (int i = 0; i < gEvN; i++) {
++        double t = gEvT[i];
++        if (t < t0 || t > t1) continue;
++        s.n++;
++        if (t > prev) gaps[ng++] = (t - prev) * 1e3;
++        prev = t; last = t;
++    }
++    if (t1 > last) gaps[ng++] = (t1 - last) * 1e3;
++    s.fps = s.n / (t1 - t0);
++    if (ng) {
++        qsort(gaps, ng, sizeof gaps[0], cmpd);
++        s.p50 = gaps[ng / 2]; s.p90 = gaps[(int)(ng * 0.9)]; s.p99 = gaps[(int)(ng * 0.99) < ng ? (int)(ng * 0.99) : ng - 1];
++        s.maxgap = gaps[ng - 1];
++    }
++    return s;
++}
++
++static NSWindow *gWin;
++static NSView *gView;
++static CVDisplayLinkRef gLink;
++static volatile int gAnimate;
++static double gNominal;
++
++static CVReturn tick(CVDisplayLinkRef l, const CVTimeStamp *n, const CVTimeStamp *o, CVOptionFlags f, CVOptionFlags *fo, void *c)
++{
++    (void)l; (void)n; (void)f; (void)fo; (void)c;
++    if (gNominal == 0 && o->videoRefreshPeriod) gNominal = (double)o->videoTimeScale / (double)o->videoRefreshPeriod;
++    if (!gAnimate) return kCVReturnSuccess;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        static int k; k++;
++        [CATransaction begin]; [CATransaction setDisableActions:YES];
++        CGColorRef c = CGColorCreateGenericRGB(0.2 + 0.6 * ((k >> 0) & 1), 0.2 + 0.6 * ((k >> 1) & 1), 0.2 + 0.6 * ((k >> 2) & 1), 1);
++        gView.layer.backgroundColor = c; CGColorRelease(c);
++        [CATransaction commit];
++    });
++    return kCVReturnSuccess;
++}
++
++static void spin(double secs)
++{
++    double end = now_s() + secs;
++    while (now_s() < end)
++        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.005]];
++}
++
++static int wait_until(BOOL (^cond)(void), double timeout)
++{
++    double end = now_s() + timeout;
++    while (!cond()) {
++        if (now_s() > end) return 0;
++        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.002]];
++    }
++    return 1;
++}
++
++int main(int argc, char **argv)
++{
++    @autoreleasepool {
++        setvbuf(stdout, NULL, _IONBF, 0);
++        double steady = argc > 1 ? atof(argv[1]) : 5;
++        int cycles = argc > 2 ? atoi(argv[2]) : 4;
++        double w = argc > 3 ? atof(argv[3]) : 1400, h = argc > 4 ? atof(argv[4]) : 900;
++        if (flips() < 0) { fprintf(stderr, "cannot read debug.xegfxaccel_iop_xe_flips (XeGfx accel not loaded?)\n"); return 1; }
++
++        [NSApplication sharedApplication];
++        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++        NSRect vis = NSScreen.mainScreen.visibleFrame;
++        NSRect r = NSMakeRect(NSMidX(vis) - w / 2, NSMidY(vis) - h / 2, w, h);
++        gWin = [[NSWindow alloc] initWithContentRect:r
++                                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskClosable
++                                             backing:NSBackingStoreBuffered defer:NO];
++        gWin.title = @"genie-fps";
++        gWin.releasedWhenClosed = NO;
++        gView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
++        gView.wantsLayer = YES;
++        gView.layer.backgroundColor = CGColorGetConstantColor(kCGColorWhite);
++        NSTextField *label = [NSTextField labelWithString:@"genie-fps: measuring, please don't touch this window"];
++        label.font = [NSFont systemFontOfSize:28 weight:NSFontWeightSemibold];
++        label.frame = NSMakeRect(40, h / 2 - 20, w - 80, 40);
++        [gView addSubview:label];
++        gWin.contentView = gView;
++        [gWin makeKeyAndOrderFront:nil];
++        [NSApp activateIgnoringOtherApps:YES];
++
++        pthread_t th; pthread_create(&th, NULL, sampler, NULL);
++        CVDisplayLinkCreateWithActiveCGDisplays(&gLink);
++        CVDisplayLinkSetOutputCallback(gLink, tick, NULL);
++        CVDisplayLinkStart(gLink);
++        spin(1.0);
++
++        double s0 = now_s();
++        gAnimate = 1; gFreqOn = 1;
++        spin(steady);
++        gAnimate = 0; gFreqOn = 0;
++        double s1 = now_s();
++        stats st = window_stats(s0 + 0.2, s1);
++        printf("display link nominal %.1f Hz\n", gNominal);
++        printf("steady   %5.1f fps  frame p50 %5.2f p90 %5.2f p99 %5.2f max %6.1f ms  (%d flips in %.1f s)\n",
++               st.fps, st.p50, st.p90, st.p99, st.maxgap, st.n, s1 - s0 - 0.2);
++        if (gFreqBusy)
++            printf("gpu clock while busy: avg %ld MHz, max %ld MHz, %.0f%% of busy samples at 550 MHz (busy %ld of %ld samples)\n",
++                   gFreqSum / gFreqBusy, gFreqMax, 100.0 * gFreqAt550 / gFreqBusy, gFreqBusy, gFreqN);
++        spin(0.5);
++
++        double gfps[64], gmax[64], gdur[64]; int ng = 0;
++        for (int c = 0; c < cycles && ng < 62; c++) {
++            for (int dir = 0; dir < 2; dir++) {
++                double t0 = now_s();
++                if (dir == 0) [gWin miniaturize:nil]; else [gWin deminiaturize:nil];
++                int ok = wait_until(^BOOL { return dir == 0 ? gWin.isMiniaturized : (!gWin.isMiniaturized && gWin.isVisible); }, 5);
++                double t1 = now_s();
++                spin(0.05);
++                double t2 = now_s();
++                stats g = window_stats(t0, t1);
++                gfps[ng] = g.fps; gmax[ng] = g.maxgap; gdur[ng] = (t1 - t0) * 1e3; ng++;
++                printf("genie %-8s %5.1f fps  %3d flips in %5.0f ms  frame p50 %5.2f p90 %5.2f max %6.1f ms%s\n",
++                       dir == 0 ? "minimize" : "restore", g.fps, g.n, (t1 - t0) * 1e3, g.p50, g.p90, g.maxgap, ok ? "" : "  (timed out)");
++                (void)t2;
++                spin(0.6);
++            }
++        }
++        double sf = 0, sm = 0, sd = 0, worst = 0;
++        for (int i = 0; i < ng; i++) { sf += gfps[i]; sm += gmax[i]; sd += gdur[i]; if (gmax[i] > worst) worst = gmax[i]; }
++        if (ng) printf("genie    %5.1f fps average over %d animations, average longest gap %.1f ms, worst %.1f ms, avg duration %.0f ms\n",
++                       sf / ng, ng, sm / ng, worst, sd / ng);
++
++        gStop = 1; pthread_join(th, NULL);
++        CVDisplayLinkStop(gLink);
++        printf("SUMMARY\t%.1f\t%.2f\t%.2f\t%.1f\t%.1f\t%.1f\t%.1f\t%ld\t%.0f\n", st.fps, st.p50, st.p99, st.maxgap,
++               ng ? sf / ng : 0, ng ? sm / ng : 0, worst, gFreqBusy ? gFreqSum / gFreqBusy : 0,
++               gFreqBusy ? 100.0 * gFreqAt550 / gFreqBusy : 0);
++        [gWin close];
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/genie-fps.sh
+@@ -0,0 +1,19 @@
++#!/bin/sh
++# genie-fps.sh: run genie-fps (steady and Genie frame rate) and append one line to data/fps-history.tsv with system
++# and WindowServer uptime, so a slowdown over time shows up across runs.  Usage: tools/genie-fps.sh [steady_s] [cycles]
++set -e
++HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$(dirname "$HERE")
++BIN="$HERE/genie-fps"
++if [ ! -x "$BIN" ] || [ "$HERE/genie-fps.m" -nt "$BIN" ]; then
++  clang -O2 -fobjc-arc -framework Cocoa -framework QuartzCore -framework CoreVideo "$HERE/genie-fps.m" -o "$BIN"
++fi
++OUT=$("$BIN" "${1:-5}" "${2:-4}" 2>/dev/null)
++echo "$OUT" | grep -v '^SUMMARY'
++boot=$(sysctl -n kern.boottime | sed 's/^{ sec = \([0-9]*\).*/\1/'); nowt=$(date +%s)
++ws=$(pgrep -x WindowServer | head -1); wsup=$(ps -o etime= -p "$ws" | tr -d ' ')
++H="$ROOT/data/fps-history.tsv"
++[ -f "$H" ] || printf 'time\tuptime_min\tws_uptime\tsteady_fps\tp50_ms\tp99_ms\tmaxgap_ms\tgenie_fps\tgenie_avg_maxgap_ms\tgenie_worst_ms\tgpu_busy_avg_mhz\tgpu_pct_at_550\n' > "$H"
++echo "$OUT" | grep '^SUMMARY' | cut -f2- | while read -r l; do
++  printf '%s\t%d\t%s\t%s\n' "$(date '+%m-%dT%H:%M:%S')" $(( (nowt - boot) / 60 )) "$wsup" "$l" | tr ' ' '\t' >> "$H"
++done
++tail -1 "$H"
+--- /dev/null
++++ b/tools/tl-summ.py
+@@ -0,0 +1,11 @@
++# tl-summ: percentiles of the accel's per-frame flip timeline (sysctl debug.nvaccel_iop_xe_tl, §37.9)
++import sys
++rows = []
++for l in open(sys.argv[1]):
++    p = l.split()
++    if len(p) >= 10 and p[0].lstrip('-').isdigit(): rows.append([int(x) for x in p[:7]])
++names = ['gap', 'queued->pop', 'pop->mark', 'mark->arm', 'arm->latch', 'latch->sig', 'sig->next']
++print(len(rows), 'frames')
++for i, n in enumerate(names):
++    v = sorted(r[i] for r in rows if r[i] >= 0)
++    if v: print('%-12s p10 %6d p50 %6d p90 %6d us' % (n, v[len(v) // 10], v[len(v) // 2], v[len(v) * 9 // 10]))
+--- /dev/null
++++ b/tools/dt-tgt.py
+@@ -0,0 +1,22 @@
++# dt-tgt: rank the draws of a drawtime log (tgtid plugin, §37.25) by GPU time per cb, with source and target surface
++import re, sys, collections
++L = [l.rstrip() for l in open(sys.argv[1]) if l.startswith('cb ') and (' tgt ' in l or ' id ' in l)]
++cbs = collections.OrderedDict()
++for l in L:
++    m = re.match(r'cb (\d+) pass (\d+) ', l); cbs.setdefault(int(m[1]), []).append(l)
++def cls(i): return 'fb%d' % (int(i, 16) & 0xffff) if i.startswith('8') else ('img' if i != '00000000' else '-')
++agg = collections.defaultdict(lambda: [0, 0.0])
++for cb, ls in cbs.items():
++    tg = {}
++    for l in ls:
++        m = re.match(r'cb \d+ pass (\d+) (\d+x\d+) .* tgt (\w+)', l)
++        if m: tg[m[1]] = m[3]
++    for l in ls:
++        m = re.match(r'cb \d+ pass (\d+) draw (\d+) gpu_us ([\d.]+) fs (\w+) n (\d+) sc (\d+x\d+) t0 (\S+) (\S+) id (\w+)', l)
++        if not m: continue
++        key = (m[4], m[5], m[6], m[7] + ' ' + m[8], 'fb' if m[9].startswith('8') else cls(m[9]), 'fb' if tg.get(m[1], '0').startswith('8') else cls(tg.get(m[1], '00000000')))
++        agg[key][0] += 1; agg[key][1] += float(m[3])
++n = len(cbs); tot = sum(v[1] for v in agg.values())
++print('%d cbs, GPU %.2f ms per cb (draws serialised)' % (n, tot / n / 1e3))
++for k, (c, us) in sorted(agg.items(), key=lambda kv: -kv[1][1])[:int(sys.argv[2]) if len(sys.argv) > 2 else 10]:
++    print('  %6.0f us/cb  x%.2f  fs %s n %-3s sc %-9s src %-16s %-3s -> %s' % (us / n, c / n, *k))
+--- /dev/null
++++ b/tools/rearm-after-fallback.sh
+@@ -0,0 +1,13 @@
++#!/bin/bash
++# Re-arm the claim boot after a bootguard fallback: restore the gates the guard recorded as gates_before.
++set -euo pipefail
++B=/Library/XeGfxTrial/rearm-$(date +%Y%m%d-%H%M%S)
++mkdir -p "$B"
++/usr/sbin/nvram -x -p > "$B/nvram-before.plist"
++touch /Library/GPUBundles/.xemtl-no-ssbo-push
++for kv in expose=%01%00%00%00 starts=%00%00%00%00 fail=%00%00%00%00 bootarm=%00%00%00%00 phase=%02%00%00%00 trial=%01%00%00%00; do
++  /usr/sbin/nvram "xegfx-disp-$kv"
++done
++for g in phase trial starts fail expose bootarm; do /usr/sbin/nvram "xegfx-disp-$g"; done | tee "$B/gates-after.txt"
++ls -la /Library/GPUBundles/.xemtl-no-ssbo-push
++echo "backup=$B"
+--- /dev/null
++++ b/tools/livelog/xegfx-livelog.py
+@@ -0,0 +1,59 @@
++#!/Library/Developer/CommandLineTools/usr/bin/python3
++# xegfx-livelog: survives a hard hang.  Streams our kexts' and WindowServer's display messages from the unified log
++# (which keeps them in memory and loses the tail on a forced reboot) into /var/log/xegfx-live/, fsynced every 0.25 s,
++# and writes a heartbeat line every second with the display counters.  The last heartbeat before a hang says when user
++# space stopped; the last messages say what the driver was doing.  Diagnostics only: it changes nothing in the driver.
++import os, subprocess, sys, threading, time
++
++DIR = '/var/log/xegfx-live'
++KEEP = 12
++PRED = ('(process == "kernel" AND (sender BEGINSWITH "XeGfx" OR sender BEGINSWITH "NV" OR eventMessage CONTAINS[c] "panic"'
++        ' OR eventMessage CONTAINS "watchdog")) OR (process == "WindowServer" AND (subsystem == "com.apple.CoreDisplay"'
++        ' OR sender == "XeMTLDriver")) OR (process == "loginwindow" AND messageType == error)')
++SYSCTLS = ['debug.xegfxaccel_iop_xe_flips', 'debug.xegfxaccel_iop_xe_early', 'debug.xegfxaccel_iop_xe_early_signals',
++           'debug.xegfxaccel_iop_xe_mark_timeouts', 'debug.xegfxaccel_iop_xe_idle_forced', 'debug.xegfxaccel_iop_xe_tile4_frames',
++           'debug.xegfx_agdc_k5_colour_answers', 'vm.page_free_count']
++
++os.makedirs(DIR, exist_ok=True)
++names = sorted(f for f in os.listdir(DIR) if f.endswith('.log'))
++for f in names[:-(KEEP - 1)] if len(names) >= KEEP else []:
++    try: os.unlink(os.path.join(DIR, f))
++    except OSError: pass
++boot = subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.bootsessionuuid'], capture_output=True, text=True).stdout.strip()[:8]
++path = os.path.join(DIR, time.strftime('%Y%m%d-%H%M%S-') + boot + '.log')
++out = open(path, 'a', buffering=1)
++lock = threading.Lock()
++dirty = [False]
++
++def write(line):
++    with lock:
++        out.write(line if line.endswith('\n') else line + '\n'); dirty[0] = True
++
++def syncer():
++    while True:
++        time.sleep(0.25)
++        with lock:
++            if dirty[0]:
++                out.flush(); os.fsync(out.fileno()); dirty[0] = False
++
++def heartbeat():
++    n = 0
++    while True:
++        try:
++            r = subprocess.run(['/usr/sbin/sysctl'] + SYSCTLS, capture_output=True, text=True, timeout=5).stdout
++            vals = ' '.join(l.split(': ', 1)[0].split('.')[-1] + '=' + l.split(': ', 1)[1] for l in r.splitlines() if ': ' in l)
++        except Exception as e:
++            vals = 'sysctl failed: %r' % e
++        up = time.clock_gettime(time.CLOCK_MONOTONIC_RAW) if hasattr(time, 'CLOCK_MONOTONIC_RAW') else 0
++        write('%s HB %d up %.1f %s' % (time.strftime('%H:%M:%S'), n, up, vals))
++        n += 1
++        time.sleep(1)
++
++write('%s xegfx-livelog start boot %s pid %d' % (time.strftime('%Y-%m-%d %H:%M:%S'), boot, os.getpid()))
++threading.Thread(target=syncer, daemon=True).start()
++threading.Thread(target=heartbeat, daemon=True).start()
++p = subprocess.Popen(['/usr/bin/log', 'stream', '--style', 'compact', '--level', 'info', '--predicate', PRED],
++                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
++for line in p.stdout:
++    write(line)
++write('%s log stream ended rc %s' % (time.strftime('%H:%M:%S'), p.wait()))
+--- /dev/null
++++ b/tools/livelog/com.xegfx.livelog.plist
+@@ -0,0 +1,13 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>Label</key><string>com.xegfx.livelog</string>
++    <key>ProgramArguments</key>
++    <array><string>/Library/Developer/CommandLineTools/usr/bin/python3</string><string>/usr/local/xegfx/xegfx-livelog.py</string></array>
++    <key>RunAtLoad</key><true/>
++    <key>KeepAlive</key><true/>
++    <key>Nice</key><integer>5</integer>
++    <key>StandardErrorPath</key><string>/var/log/xegfx-livelog.err</string>
++</dict>
++</plist>
+--- /dev/null
++++ b/tools/anv/ssbo-push-test.c
+@@ -0,0 +1,247 @@
++// ssbo-push-test: ANV read-only SSBO push (XEMTL_SSBO_PUSH). Renders fs.spv, which reads two NonWritable SSBOs at
++// constant offsets, under bindings at aligned and misaligned offsets, a GPU update inside the command buffer, and a
++// robustness bound; prints the fragment shader's statistics. "real <frag.spv>" compiles a captured plugin shader under
++// the plugin's descriptor layout and prints its statistics only.
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#define CK(x) do { VkResult r_ = (x); if (r_) { printf("FAIL %s = %d (line %d)\n", #x, r_, __LINE__); exit(1); } } while (0)
++
++static VkDevice dev; static VkPhysicalDevice pd; static VkQueue q;
++static PFN_vkGetPipelineExecutablePropertiesKHR pExecProps;
++static PFN_vkGetPipelineExecutableStatisticsKHR pExecStats;
++
++static void *slurp(const char *p, size_t *n)
++{
++    FILE *f = fopen(p, "rb"); if (!f) { printf("cannot open %s\n", p); exit(1); }
++    fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
++    void *b = malloc(*n); fread(b, 1, *n, f); fclose(f); return b;
++}
++static VkShaderModule module(const char *p)
++{
++    size_t n; void *b = slurp(p, &n); VkShaderModule m;
++    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, n, b };
++    CK(vkCreateShaderModule(dev, &ci, NULL, &m)); free(b); return m;
++}
++static uint32_t memtype(uint32_t bits, VkMemoryPropertyFlags want)
++{
++    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
++    printf("no memory type\n"); exit(1);
++}
++typedef struct { VkBuffer b; VkDeviceMemory m; void *p; } buf;
++static buf mkbuf(VkDeviceSize sz, VkBufferUsageFlags u)
++{
++    buf r; VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, sz, u };
++    CK(vkCreateBuffer(dev, &bi, NULL, &r.b)); VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, r.b, &mr);
++    VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size,
++        memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
++    CK(vkAllocateMemory(dev, &ma, NULL, &r.m)); CK(vkBindBufferMemory(dev, r.b, r.m, 0)); CK(vkMapMemory(dev, r.m, 0, sz, 0, &r.p));
++    return r;
++}
++static void stats(VkPipeline pipe, const char *tag)
++{
++    VkPipelineInfoKHR pi = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, NULL, pipe };
++    uint32_t ne = 0; pExecProps(dev, &pi, &ne, NULL);
++    VkPipelineExecutablePropertiesKHR ep[16]; if (ne > 16) ne = 16;
++    for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR };
++    pExecProps(dev, &pi, &ne, ep);
++    for (uint32_t e = 0; e < ne; e++) {
++        if (!(ep[e].stages & VK_SHADER_STAGE_FRAGMENT_BIT)) continue;
++        VkPipelineExecutableInfoKHR ei = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, pipe, e };
++        uint32_t ns = 0; pExecStats(dev, &ei, &ns, NULL); VkPipelineExecutableStatisticKHR st[64]; if (ns > 64) ns = 64;
++        for (uint32_t i = 0; i < ns; i++) st[i] = (VkPipelineExecutableStatisticKHR){ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR };
++        pExecStats(dev, &ei, &ns, st);
++        printf("  %s %s:", tag, ep[e].name);
++        for (uint32_t i = 0; i < ns; i++) {
++            const char *n = st[i].name;
++            if (strstr(n, "Instruction Count") || strstr(n, "SEND") || strstr(n, "Cycle") || strstr(n, "Push") || strstr(n, "Spill") || strstr(n, "Fill"))
++                printf(" %s=%llu", n, (unsigned long long)st[i].value.u64);
++        }
++        printf("\n");
++    }
++}
++static VkPipeline pipeline(VkPipelineLayout pl, VkShaderModule vs, VkShaderModule fs, VkFormat fmt)
++{
++    VkPipelineShaderStageCreateInfo ss[2] = {
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main" },
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main" } };
++    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
++    VkViewport vp = { 0, 0, 1, 1, 0, 1 }; VkRect2D sc = { { 0, 0 }, { 1, 1 } };
++    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, &vp, 1, &sc };
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO }; rs.lineWidth = 1;
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT };
++    VkPipelineColorBlendAttachmentState ba = { 0 }; ba.colorWriteMask = 0xf;
++    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba };
++    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &fmt };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR,
++        2, ss, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cb, NULL, pl };
++    VkPipeline p; CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gi, NULL, &p)); return p;
++}
++static VkDescriptorSetLayout layout(const VkDescriptorSetLayoutBinding *b, uint32_t n, const VkDescriptorBindingFlags *fl, VkDescriptorSetLayoutCreateFlags f)
++{
++    VkDescriptorSetLayoutBindingFlagsCreateInfo bf = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, NULL, n, fl };
++    VkDescriptorSetLayoutCreateInfo li = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, fl ? &bf : NULL, f, n, b };
++    VkDescriptorSetLayout l; CK(vkCreateDescriptorSetLayout(dev, &li, NULL, &l)); return l;
++}
++
++static int real(const char *dir, const char *spv)
++{
++    static VkDescriptorSetLayoutBinding b[400]; uint32_t n = 0;
++    for (uint32_t i = 0; i < 32; i++) b[n++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL };
++    for (uint32_t i = 32; i < 160; i++) b[n++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL };
++    for (uint32_t i = 160; i < 192; i++) b[n++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL };
++    b[n++] = (VkDescriptorSetLayoutBinding){ 640, getenv("TABLE_SSBO") ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL };
++    for (uint32_t i = 480; i < 608; i++) b[n++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_ALL };
++    VkDescriptorSetLayout main = layout(b, n, NULL, 0);
++    VkDescriptorBindingFlags hf[2] = { VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT };
++    hf[1] = hf[0];
++    VkDescriptorSetLayoutBinding hb[2] = { { 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 131072, VK_SHADER_STAGE_ALL }, { 1, VK_DESCRIPTOR_TYPE_SAMPLER, 2048, VK_SHADER_STAGE_ALL } };
++    VkDescriptorSetLayout heap = layout(hb, 2, hf, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT);
++    VkDescriptorSetLayoutBinding fb[8];
++    for (uint32_t i = 0; i < 8; i++) fb[i] = (VkDescriptorSetLayoutBinding){ 192 + i, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT };
++    VkDescriptorSetLayout fetch = layout(fb, 8, NULL, 0);
++    VkDescriptorSetLayout sl[4] = { main, main, heap, fetch };
++    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 4, sl };
++    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
++    char p[1024]; snprintf(p, sizeof p, "%s/vs.spv", dir);
++    VkPipeline pipe = pipeline(pl, module(p), module(spv), VK_FORMAT_R16G16B16A16_SFLOAT);
++    stats(pipe, "real");
++    return 0;
++}
++
++int main(int argc, char **argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    const char *dir = getenv("SPDIR") ? getenv("SPDIR") : ".";
++    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "ssbo-push", 1, NULL, 0, VK_API_VERSION_1_3 };
++    VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &ai };
++    VkInstance inst; CK(vkCreateInstance(&ii, NULL, &inst));
++    uint32_t n = 1; vkEnumeratePhysicalDevices(inst, &n, &pd); if (!n) { puts("no device"); return 1; }
++    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pe = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
++    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &pe };
++    VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13 };
++    VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12 };
++    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
++    vkGetPhysicalDeviceFeatures2(pd, &f2);
++    f2.features.robustBufferAccess = getenv("NO_ROBUST") ? VK_FALSE : f2.features.robustBufferAccess;
++    printf("robustBufferAccess %d\n", f2.features.robustBufferAccess);
++    const char *ext[] = { "VK_KHR_pipeline_executable_properties" };
++    float pr = 1; VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr };
++    VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qi, 0, NULL, 1, ext };
++    CK(vkCreateDevice(pd, &di, NULL, &dev)); vkGetDeviceQueue(dev, 0, 0, &q);
++    pExecProps = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutablePropertiesKHR");
++    pExecStats = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutableStatisticsKHR");
++    if (argc > 2 && !strcmp(argv[1], "real")) return real(dir, argv[2]);
++
++    VkDescriptorSetLayoutBinding b[8];
++    for (uint32_t i = 0; i < 8; i++) b[i] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL };
++    VkDescriptorSetLayout sl = layout(b, 8, NULL, 0);
++    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &sl };
++    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
++    char p[1024]; snprintf(p, sizeof p, "%s/vs.spv", dir); VkShaderModule vs = module(p);
++    snprintf(p, sizeof p, "%s/fs.spv", dir); VkShaderModule fs = module(p);
++    VkPipeline pipe = pipeline(pl, vs, fs, VK_FORMAT_R32G32B32A32_SFLOAT);
++    stats(pipe, "test");
++
++    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 };
++    VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, 8, 1, &ps };
++    VkDescriptorPool dp; CK(vkCreateDescriptorPool(dev, &dpi, NULL, &dp));
++    const VkDeviceSize SZ = 65536;
++    buf dbuf = mkbuf(SZ, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    buf hbuf = mkbuf(SZ, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    buf dummy = mkbuf(256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++    buf rb = mkbuf(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    VkImage img[2]; VkImageView iv[2];
++    for (int i = 0; i < 2; i++) {
++        VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, { 1, 1, 1 }, 1, 1,
++            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT };
++        CK(vkCreateImage(dev, &ic, NULL, &img[i])); VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img[i], &mr);
++        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
++        VkDeviceMemory m; CK(vkAllocateMemory(dev, &ma, NULL, &m)); CK(vkBindImageMemory(dev, img[i], m, 0));
++        VkImageViewCreateInfo vc = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img[i], VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, {0}, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++        CK(vkCreateImageView(dev, &vc, NULL, &iv[i]));
++    }
++    VkCommandPool pool; VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, 0 };
++    CK(vkCreateCommandPool(dev, &pci, NULL, &pool));
++    VkCommandBuffer cb; VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
++    CK(vkAllocateCommandBuffers(dev, &ca, &cb));
++
++    struct { const char *name; uint32_t off4, off2; VkDeviceSize range4; int update; } cases[] = {
++        { "aligned (0, 0)",              0,  0, VK_WHOLE_SIZE, 0 },
++        { "misaligned 16 (16, 48)",     16, 48, VK_WHOLE_SIZE, 0 },
++        { "misaligned 16/8 (80, 72)",   80, 72, VK_WHOLE_SIZE, 0 },
++        { "GPU update in the cb",       48, 40, VK_WHOLE_SIZE, 1 },
++        { "robust bound 256 B (16, 0)", 16,  0, 256, 0 },
++    };
++    int bad = 0;
++    for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; c++) {
++        float *d = dbuf.p; uint16_t *h = hbuf.p;
++        for (VkDeviceSize i = 0; i < SZ / 4; i++) d[i] = 9999.0f;
++        for (VkDeviceSize i = 0; i < SZ / 2; i++) h[i] = 0x5bff;   // 255.875 * 2^... a nonzero half
++        for (int i = 0; i < 64; i++) for (int k = 0; k < 4; k++) {
++            d[(cases[c].off4 + i * 16 + k * 4) / 4] = (float)(i * 10 + k);
++            _Float16 hv = (_Float16)(1000 + i * 10 + k); memcpy(&h[(cases[c].off2 + i * 8 + k * 2) / 2], &hv, 2);
++        }
++        VkDescriptorSet set; VkDescriptorSetAllocateInfo sa = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 1, &sl };
++        CK(vkAllocateDescriptorSets(dev, &sa, &set));
++        VkDescriptorBufferInfo bi[8]; VkWriteDescriptorSet w[8];
++        for (uint32_t i = 0; i < 8; i++) {
++            bi[i] = (VkDescriptorBufferInfo){ dummy.b, 0, VK_WHOLE_SIZE };
++            if (i == 4) bi[i] = (VkDescriptorBufferInfo){ dbuf.b, cases[c].off4, cases[c].range4 };
++            if (i == 2) bi[i] = (VkDescriptorBufferInfo){ hbuf.b, cases[c].off2, VK_WHOLE_SIZE };
++            w[i] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[i] };
++        }
++        vkUpdateDescriptorSets(dev, 8, w, 0, NULL);
++        CK(vkResetCommandBuffer(cb, 0));
++        VkCommandBufferBeginInfo bb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++        CK(vkBeginCommandBuffer(cb, &bb));
++        const int draws = cases[c].update ? 2 : 1;
++        for (int k = 0; k < draws; k++) {
++            if (k == 1) {
++                VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT };
++                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++                float nv = 777.0f; vkCmdUpdateBuffer(cb, dbuf.b, cases[c].off4 + 1 * 16, 4, &nv);
++                _Float16 nh[4] = { 5, 6, 7, 8 }; vkCmdUpdateBuffer(cb, hbuf.b, cases[c].off2 + 12 * 8, 8, nh);
++                VkMemoryBarrier mb2 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT };
++                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
++            }
++            VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, 0, img[k], { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
++            VkRenderingAttachmentInfo at = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, iv[k], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++            at.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { 1, 1 } }, 1, 0, 1, &at };
++            vkCmdBeginRendering(cb, &ri);
++            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 0, NULL);
++            vkCmdDraw(cb, 3, 1, 0, 0);
++            vkCmdEndRendering(cb);
++            ib.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
++            VkBufferImageCopy bc = { (VkDeviceSize)k * 16, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { 1, 1, 1 } };
++            vkCmdCopyImageToBuffer(cb, img[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.b, 1, &bc);
++        }
++        CK(vkEndCommandBuffer(cb));
++        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb };
++        CK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CK(vkQueueWaitIdle(q));
++        const float *o = rb.p;
++        for (int k = 0; k < draws; k++) {
++            float e[4] = { 10, 21 + 1032 * 1000.0f, 92, 303 + 1120 * 1000.0f };
++            if (k == 1) { e[0] = 777; e[3] = 303 + 5 * 1000.0f; }
++            if (cases[c].range4 != VK_WHOLE_SIZE) e[3] = 1120 * 1000.0f;
++            int ok = !memcmp(e, o + 4 * k, 16);
++            printf("%-28s draw %d: %.0f %.0f %.0f %.0f  %s\n", cases[c].name, k, o[4 * k], o[4 * k + 1], o[4 * k + 2], o[4 * k + 3],
++                   ok ? "ok" : "WRONG");
++            if (!ok) printf("%28s expected %.0f %.0f %.0f %.0f\n", "", e[0], e[1], e[2], e[3]);
++            bad += !ok;
++        }
++        vkFreeDescriptorSets(dev, dp, 1, &set);
++    }
++    printf("%s\n", bad ? "SSBO PUSH TEST FAILED" : "SSBO PUSH TEST PASSED");
++    return bad != 0;
++}
+--- /dev/null
++++ b/tools/anv/ptr-push-test.c
+@@ -0,0 +1,146 @@
++// ptr-push-test: ANV push of constant data reached through a pointer in a dynamic UBO address table (XEMTL_SSBO_PUSH),
++// the shape the plugin's address lowering produces. fsptr.spv reads t[4] -> vec4[] and t[2] -> f16vec4[] from the table at
++// set 0 binding 640. Each case records two draws in one command buffer through two table slots (dynamic offsets 0 and 256)
++// pointing at two data regions, with a vkCmdUpdateBuffer of region 2 between them.
++#define main ssbo_main
++#include "ssbo-push-test.c"
++#undef main
++
++static buf mkbda(VkDeviceSize sz, VkBufferUsageFlags u, VkDeviceAddress *addr)
++{
++    buf r; VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, sz, u | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT };
++    CK(vkCreateBuffer(dev, &bi, NULL, &r.b)); VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, r.b, &mr);
++    VkMemoryAllocateFlagsInfo fi = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
++    VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size,
++        memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
++    CK(vkAllocateMemory(dev, &ma, NULL, &r.m)); CK(vkBindBufferMemory(dev, r.b, r.m, 0)); CK(vkMapMemory(dev, r.m, 0, sz, 0, &r.p));
++    VkBufferDeviceAddressInfo ai = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r.b };
++    *addr = vkGetBufferDeviceAddress(dev, &ai);
++    return r;
++}
++
++int main(int argc, char **argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    const char *dir = getenv("SPDIR") ? getenv("SPDIR") : ".";
++    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "ptr-push", 1, NULL, 0, VK_API_VERSION_1_3 };
++    VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &ai };
++    VkInstance inst; CK(vkCreateInstance(&ii, NULL, &inst));
++    uint32_t n = 1; vkEnumeratePhysicalDevices(inst, &n, &pd); if (!n) { puts("no device"); return 1; }
++    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pe = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
++    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &pe };
++    VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13 };
++    VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12 };
++    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
++    vkGetPhysicalDeviceFeatures2(pd, &f2);
++    printf("robustBufferAccess %d bufferDeviceAddress %d scalarBlockLayout %d\n", f2.features.robustBufferAccess, f12.bufferDeviceAddress, f12.scalarBlockLayout);
++    const char *ext[] = { "VK_KHR_pipeline_executable_properties" };
++    float pr = 1; VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr };
++    VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qi, 0, NULL, 1, ext };
++    CK(vkCreateDevice(pd, &di, NULL, &dev)); vkGetDeviceQueue(dev, 0, 0, &q);
++    pExecProps = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutablePropertiesKHR");
++    pExecStats = (void *)vkGetDeviceProcAddr(dev, "vkGetPipelineExecutableStatisticsKHR");
++
++    VkDescriptorSetLayoutBinding b = { 640, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL };
++    VkDescriptorSetLayout sl = layout(&b, 1, NULL, 0);
++    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &sl };
++    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
++    char p[1024]; snprintf(p, sizeof p, "%s/vs.spv", dir); VkShaderModule vs = module(p);
++    snprintf(p, sizeof p, "%s/fsptr.spv", dir); VkShaderModule fs = module(p);
++    VkPipeline pipe = pipeline(pl, vs, fs, VK_FORMAT_R32G32B32A32_SFLOAT);
++    stats(pipe, "ptr");
++
++    const VkDeviceSize SZ = 65536;
++    VkDeviceAddress da, ha, ta;
++    buf dbuf = mkbda(SZ, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &da);
++    buf hbuf = mkbda(SZ, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &ha);
++    buf tbuf = mkbda(4096, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &ta);
++    buf rb = mkbuf(64, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 4 };
++    VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, 1, 1, &ps };
++    VkDescriptorPool dp; CK(vkCreateDescriptorPool(dev, &dpi, NULL, &dp));
++    VkDescriptorSet set; VkDescriptorSetAllocateInfo sa = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 1, &sl };
++    CK(vkAllocateDescriptorSets(dev, &sa, &set));
++    VkDescriptorBufferInfo tbi = { tbuf.b, 0, 64 };
++    VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, 640, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &tbi };
++    vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
++    VkImage img[2]; VkImageView iv[2];
++    for (int i = 0; i < 2; i++) {
++        VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, { 1, 1, 1 }, 1, 1,
++            VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT };
++        CK(vkCreateImage(dev, &ic, NULL, &img[i])); VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img[i], &mr);
++        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
++        VkDeviceMemory m; CK(vkAllocateMemory(dev, &ma, NULL, &m)); CK(vkBindImageMemory(dev, img[i], m, 0));
++        VkImageViewCreateInfo vc = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img[i], VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R32G32B32A32_SFLOAT, {0}, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++        CK(vkCreateImageView(dev, &vc, NULL, &iv[i]));
++    }
++    VkCommandPool pool; VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, 0 };
++    CK(vkCreateCommandPool(dev, &pci, NULL, &pool));
++    VkCommandBuffer cb; VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
++    CK(vkAllocateCommandBuffers(dev, &ca, &cb));
++
++    struct { uint32_t off4, off2; } cases[] = { { 0, 0 }, { 16, 48 }, { 20, 72 }, { 4, 2 }, { 1004, 1022 } };
++    const float B[2] = { 0, 20000 }, Hb[2] = { 1000, 500 };
++    const uint32_t region = 8192;
++    int bad = 0;
++    for (unsigned c = 0; c < sizeof cases / sizeof cases[0]; c++) {
++        float *d = dbuf.p; uint16_t *h = hbuf.p;
++        for (VkDeviceSize i = 0; i < SZ / 4; i++) d[i] = 9999.0f;
++        for (VkDeviceSize i = 0; i < SZ / 2; i++) h[i] = 0x5bff;
++        uint64_t *t = tbuf.p; memset(t, 0, 4096);
++        for (int r = 0; r < 2; r++) {
++            const uint32_t o4 = cases[c].off4 + r * region, o2 = cases[c].off2 + r * region;
++            for (int i = 0; i < 64; i++) for (int k = 0; k < 4; k++) {
++                memcpy((char *)d + o4 + i * 16 + k * 4, &(float){ B[r] + i * 10 + k }, 4);
++                _Float16 hv = (_Float16)(Hb[r] + i * 10 + k); memcpy((char *)h + o2 + i * 8 + k * 2, &hv, 2);
++            }
++            t[r * 32 + 4] = da + o4; t[r * 32 + 2] = ha + o2;   // slot r at byte 256 * r
++        }
++        CK(vkResetCommandBuffer(cb, 0));
++        VkCommandBufferBeginInfo bb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++        CK(vkBeginCommandBuffer(cb, &bb));
++        for (int k = 0; k < 2; k++) {
++            if (k == 1) {
++                VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT };
++                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++                const uint32_t o4 = cases[c].off4 + region;
++                float nv = 777.0f;
++                if (o4 % 4 == 0) vkCmdUpdateBuffer(cb, dbuf.b, o4 + 16, 4, &nv);
++                VkMemoryBarrier mb2 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT };
++                vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
++            }
++            VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, 0, img[k], { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
++            VkRenderingAttachmentInfo at = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, iv[k], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++            at.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++            VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { 1, 1 } }, 1, 0, 1, &at };
++            vkCmdBeginRendering(cb, &ri);
++            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++            uint32_t dyn = 256 * k;
++            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &set, 1, &dyn);
++            vkCmdDraw(cb, 3, 1, 0, 0);
++            vkCmdEndRendering(cb);
++            ib.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT; ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++            ib.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
++            VkBufferImageCopy bc = { (VkDeviceSize)k * 16, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { 1, 1, 1 } };
++            vkCmdCopyImageToBuffer(cb, img[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.b, 1, &bc);
++        }
++        CK(vkEndCommandBuffer(cb));
++        VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb };
++        CK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CK(vkQueueWaitIdle(q));
++        const float *o = rb.p;
++        for (int k = 0; k < 2; k++) {
++            float e[4] = { B[k] + 10, B[k] + 21 + (Hb[k] + 32) * 1000.0f, B[k] + 92, B[k] + 303 + (Hb[k] + 120) * 1000.0f };
++            if (k == 1 && (cases[c].off4 + region) % 4 == 0) e[0] = 777;
++            int ok = !memcmp(e, o + 4 * k, 16);
++            printf("table offsets (%4u, %4u) draw %d: %.0f %.0f %.0f %.0f  %s\n", cases[c].off4, cases[c].off2, k,
++                   o[4 * k], o[4 * k + 1], o[4 * k + 2], o[4 * k + 3], ok ? "ok" : "WRONG");
++            if (!ok) printf("%33s expected %.0f %.0f %.0f %.0f\n", "", e[0], e[1], e[2], e[3]);
++            bad += !ok;
++        }
++    }
++    printf("%s\n", bad ? "PTR PUSH TEST FAILED" : "PTR PUSH TEST PASSED");
++    return bad != 0;
++}
+--- /dev/null
++++ b/tools/anv/diff-test.c
+@@ -0,0 +1,188 @@
++// diff-test: render one lowered plugin fragment shader with deterministic inputs and dump the pixels, so the output with
++// XEMTL_SSBO_PUSH=0 and =1 can be compared byte for byte. usage: diff-test <vs.spv> <frag.spv> <out.bin>
++#define main ssbo_main
++#include "ssbo-push-test.c"
++#undef main
++
++#define W 32
++#define H 32
++#define DATA_SZ (32 * 4096 + 65536)
++#define TABLE_BYTES ((2 * 32 + 128) * 8)
++
++static buf mkbda(VkDeviceSize sz, VkBufferUsageFlags u, VkDeviceAddress *addr)
++{
++    buf r; VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, sz, u | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT };
++    CK(vkCreateBuffer(dev, &bi, NULL, &r.b)); VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, r.b, &mr);
++    VkMemoryAllocateFlagsInfo fi = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
++    VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fi, mr.size,
++        memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
++    CK(vkAllocateMemory(dev, &ma, NULL, &r.m)); CK(vkBindBufferMemory(dev, r.b, r.m, 0)); CK(vkMapMemory(dev, r.m, 0, sz, 0, &r.p));
++    VkBufferDeviceAddressInfo ai = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, r.b };
++    if (addr) *addr = vkGetBufferDeviceAddress(dev, &ai);
++    return r;
++}
++
++static VkImage mkimg(VkFormat f, VkImageUsageFlags u, VkImageView *view)
++{
++    VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, f, { W, H, 1 }, 1, 1,
++        VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, u };
++    VkImage img; CK(vkCreateImage(dev, &ic, NULL, &img)); VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img, &mr);
++    VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr.size, memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
++    VkDeviceMemory m; CK(vkAllocateMemory(dev, &ma, NULL, &m)); CK(vkBindImageMemory(dev, img, m, 0));
++    VkImageViewCreateInfo vc = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, VK_IMAGE_VIEW_TYPE_2D, f, {0}, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    CK(vkCreateImageView(dev, &vc, NULL, view));
++    return img;
++}
++
++static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to)
++{
++    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        from, to, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, img, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++}
++
++int main(int argc, char **argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    if (argc < 4) { puts("usage: diff-test vs.spv frag.spv out.bin"); return 2; }
++    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "diff", 1, NULL, 0, VK_API_VERSION_1_3 };
++    VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &ai };
++    VkInstance inst; CK(vkCreateInstance(&ii, NULL, &inst));
++    uint32_t n = 1; vkEnumeratePhysicalDevices(inst, &n, &pd); if (!n) { puts("no device"); return 1; }
++    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
++    VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f13 };
++    VkPhysicalDeviceVulkan11Features f11 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12 };
++    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11 };
++    vkGetPhysicalDeviceFeatures2(pd, &f2);
++    float pr = 1; VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr };
++    VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2, 0, 1, &qi };
++    CK(vkCreateDevice(pd, &di, NULL, &dev)); vkGetDeviceQueue(dev, 0, 0, &q);
++
++    static VkDescriptorSetLayoutBinding b[400]; uint32_t nb = 0;
++    for (uint32_t i = 0; i < 32; i++) b[nb++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL };
++    for (uint32_t i = 32; i < 160; i++) b[nb++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_ALL };
++    for (uint32_t i = 160; i < 192; i++) b[nb++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL };
++    b[nb++] = (VkDescriptorSetLayoutBinding){ 640, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_ALL };
++    for (uint32_t i = 480; i < 608; i++) b[nb++] = (VkDescriptorSetLayoutBinding){ i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_ALL };
++    VkDescriptorSetLayout mainl = layout(b, nb, NULL, 0);
++    VkDescriptorBindingFlags hf[2] = { VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT };
++    hf[1] = hf[0];
++    VkDescriptorSetLayoutBinding hb[2] = { { 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 131072, VK_SHADER_STAGE_ALL }, { 1, VK_DESCRIPTOR_TYPE_SAMPLER, 2048, VK_SHADER_STAGE_ALL } };
++    VkDescriptorSetLayout heap = layout(hb, 2, hf, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT);
++    VkDescriptorSetLayoutBinding fb[8];
++    for (uint32_t i = 0; i < 8; i++) fb[i] = (VkDescriptorSetLayoutBinding){ 192 + i, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT };
++    VkDescriptorSetLayout fetch = layout(fb, 8, NULL, 0);
++    VkDescriptorSetLayout sl[4] = { mainl, mainl, heap, fetch };
++    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 3, sl };
++    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
++
++    VkFormat fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
++    VkPipelineShaderStageCreateInfo ss[2] = {
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, module(argv[1]), "main" },
++        { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, module(argv[2]), "main" } };
++    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
++    VkViewport vp = { 0, 0, W, H, 0, 1 }; VkRect2D sc = { { 0, 0 }, { W, H } };
++    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, &vp, 1, &sc };
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO }; rs.lineWidth = 1;
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT };
++    VkPipelineColorBlendAttachmentState ba = { 0 }; ba.colorWriteMask = 0xf;
++    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, 0, 0, 1, &ba };
++    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, 1, &fmt };
++    VkGraphicsPipelineCreateInfo gi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0,
++        2, ss, &vi, &ia, NULL, &vps, &rs, &ms, NULL, &cbs, NULL, pl };
++    VkPipeline pipe; CK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gi, NULL, &pipe));
++
++    VkDeviceAddress da, ta;
++    buf data = mkbda(DATA_SZ, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &da);
++    uint32_t *dw = data.p;
++    for (uint32_t i = 0; i < DATA_SZ / 4; i++) {
++        uint32_t h = i * 2654435761u;
++        uint16_t hi = 0x3800 | ((h >> 8) & 0x3ff), lo = 0x3400 | ((h >> 20) & 0x3ff);
++        dw[i] = ((uint32_t)hi << 16) | lo;
++    }
++    const uint32_t table_off = 3 * TABLE_BYTES;
++    buf table = mkbda(8 * TABLE_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &ta);
++    uint64_t *t = (uint64_t *)((uint8_t *)table.p + table_off);
++    const uint32_t mis = getenv("MISALIGN") ? (uint32_t)atoi(getenv("MISALIGN")) : 8; for (uint32_t i = 0; i < 32; i++) t[i] = da + i * 4096 + (i * mis) % 32;
++    for (uint32_t i = 0; i < 32; i++) t[32 + i] = ta + table_off + i * 8;
++    for (uint32_t i = 0; i < 128; i++) t[64 + i] = (uint64_t)W | ((uint64_t)H << 32);
++
++    VkImageView tv, sv, rv;
++    VkImage tex = mkimg(VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &tv);
++    VkImage simg = mkimg(VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &sv);
++    VkImage rt = mkimg(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &rv);
++    buf up = mkbuf(W * H * 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
++    uint16_t *px = up.p;
++    for (uint32_t y = 0; y < H; y++) for (uint32_t x = 0; x < W; x++) {
++        px[(y * W + x) * 4 + 0] = 0x3000 + x * 64; px[(y * W + x) * 4 + 1] = 0x3000 + y * 64;
++        px[(y * W + x) * 4 + 2] = 0x3800; px[(y * W + x) * 4 + 3] = 0x3c00;
++    }
++    buf rb = mkbuf(W * H * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
++        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
++    VkSampler smp; CK(vkCreateSampler(dev, &sci, NULL, &smp));
++
++    VkDescriptorPoolSize ps[6] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 }, { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256 + 131072 },
++        { VK_DESCRIPTOR_TYPE_SAMPLER, 64 + 2048 }, { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256 },
++        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 8 } };
++    VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, 4, 6, ps };
++    VkDescriptorPool dp; CK(vkCreateDescriptorPool(dev, &dpi, NULL, &dp));
++    VkDescriptorSet ds[3];
++    VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, dp, 3, sl };
++    CK(vkAllocateDescriptorSets(dev, &dai, ds));
++    static VkWriteDescriptorSet wr[1024]; static VkDescriptorBufferInfo bis[64]; uint32_t nw = 0;
++    VkDescriptorImageInfo tii = { VK_NULL_HANDLE, tv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
++    VkDescriptorImageInfo sii = { smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
++    VkDescriptorImageInfo stii = { VK_NULL_HANDLE, sv, VK_IMAGE_LAYOUT_GENERAL };
++    VkDescriptorBufferInfo tbi = { table.b, 0, TABLE_BYTES };
++    for (int s = 0; s < 2; s++) {
++        for (uint32_t i = 0; i < 32; i++) {
++            bis[s * 32 + i] = (VkDescriptorBufferInfo){ data.b, i * 4096, DATA_SZ - i * 4096 };
++            wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[s], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bis[s * 32 + i] };
++        }
++        for (uint32_t i = 32; i < 160; i++) wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[s], i, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &tii };
++        for (uint32_t i = 160; i < 192; i++) wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[s], i, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &sii };
++        wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[s], 640, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &tbi };
++        for (uint32_t i = 480; i < 608; i++) wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[s], i, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &stii };
++    }
++    for (uint32_t i = 0; i < 64; i++) wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[2], 0, i, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &tii };
++    for (uint32_t i = 0; i < 64; i++) wr[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, ds[2], 1, i, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &sii };
++    vkUpdateDescriptorSets(dev, nw, wr, 0, NULL);
++
++    VkCommandPool pool; VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, 0, 0 };
++    CK(vkCreateCommandPool(dev, &pci, NULL, &pool));
++    VkCommandBuffer cb; VkCommandBufferAllocateInfo ca = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
++    CK(vkAllocateCommandBuffers(dev, &ca, &cb));
++    VkCommandBufferBeginInfo bgi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++    CK(vkBeginCommandBuffer(cb, &bgi));
++    barrier(cb, tex, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    VkBufferImageCopy bic = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { W, H, 1 } };
++    vkCmdCopyBufferToImage(cb, up.b, tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
++    barrier(cb, tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    barrier(cb, simg, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++    VkClearColorValue cc = { .float32 = { 0.25f, 0.5f, 0.75f, 1.0f } }; VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++    vkCmdClearColorImage(cb, simg, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rr);
++    barrier(cb, simg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
++    barrier(cb, rt, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    VkRenderingAttachmentInfo att = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, rv, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
++    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    att.clearValue.color = (VkClearColorValue){ .float32 = { 0.125f, 0.125f, 0.125f, 0.125f } };
++    VkRenderingInfo rinfo = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { W, H } }, 1, 0, 1, &att };
++    vkCmdBeginRendering(cb, &rinfo);
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
++    uint32_t dyn[2] = { table_off, table_off };
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 3, ds, 2, dyn);
++    vkCmdDraw(cb, 3, 1, 0, 0);
++    vkCmdEndRendering(cb);
++    barrier(cb, rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    vkCmdCopyImageToBuffer(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rb.b, 1, &bic);
++    CK(vkEndCommandBuffer(cb));
++    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb };
++    CK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); CK(vkQueueWaitIdle(q));
++    FILE *f = fopen(argv[3], "wb"); fwrite(rb.p, 1, W * H * 8, f); fclose(f);
++    uint16_t *o = rb.p;
++    printf("px0 %04x %04x %04x %04x  mid %04x %04x %04x %04x\n", o[0], o[1], o[2], o[3],
++           o[(16 * W + 16) * 4], o[(16 * W + 16) * 4 + 1], o[(16 * W + 16) * 4 + 2], o[(16 * W + 16) * 4 + 3]);
++    return 0;
++}
+--- /dev/null
++++ b/tools/anv/gen_vs.py
+@@ -0,0 +1,122 @@
++# gen_vs.py <frag.spv> <out vs.spv>: a vertex shader for a captured fragment shader -- a full-screen triangle that
++# writes every input the fragment shader reads at its location (vec2/vec4 floats from the position, other types as
++# constants), so diff-test renders it with defined varyings.
++import struct, sys
++
++def words(p):
++    b = open(p, 'rb').read()
++    return list(struct.unpack('<%dI' % (len(b) // 4), b[:len(b) // 4 * 4]))
++
++def frag_inputs(p):
++    w = words(p); i = 5
++    fl, it, vec, ptr, var, loc, bi = {}, {}, {}, {}, {}, {}, set()
++    while i < len(w):
++        n = w[i] >> 16; op = w[i] & 0xffff
++        if n == 0: break
++        a = w[i + 1:i + n]
++        if op == 22: fl[a[0]] = a[1]
++        elif op == 21: it[a[0]] = (a[1], a[2])
++        elif op == 23: vec[a[0]] = (a[1], a[2])
++        elif op == 32: ptr[a[0]] = (a[1], a[2])
++        elif op == 59 and a[2] == 1: var[a[1]] = a[0]
++        elif op == 71 and a[1] == 30: loc[a[0]] = a[2]
++        elif op == 71 and a[1] == 11: bi.add(a[0])
++        i += n
++    out = []
++    for v, pt in var.items():
++        if v in bi or v not in loc: continue
++        t = ptr[pt][1]
++        comp, cnt = vec.get(t, (t, 1))
++        if comp in fl: out.append((loc[v], 'f', fl[comp], cnt))
++        elif comp in it: out.append((loc[v], 'u' if not it[comp][1] else 'i', it[comp][0], cnt))
++        else: raise SystemExit('unsupported input type at location %d' % loc[v])
++    return sorted(out)
++
++class E:
++    def __init__(s): s.n = 1; s.sec = {k: [] for k in 'cap mm ep dec ty fn'.split()}
++    def id(s): s.n += 1; return s.n - 1
++    def put(s, sec, op, *a): s.sec[sec].append((op, list(a)))
++    def emit(s, path):
++        w = [0x07230203, 0x00010000, 0, s.n, 0]
++        for k in 'cap mm ep dec ty fn'.split():
++            for op, a in s.sec[k]:
++                ws = []
++                for x in a:
++                    if isinstance(x, str):
++                        b = x.encode() + b'\0'; b += b'\0' * (-len(b) % 4); ws += struct.unpack('<%dI' % (len(b) // 4), b)
++                    else: ws.append(x & 0xffffffff)
++                w += [op | ((len(ws) + 1) << 16)] + ws
++        open(path, 'wb').write(struct.pack('<%dI' % len(w), *w))
++
++def gen(frag, path):
++    ins = frag_inputs(frag)
++    e = E(); e.put('cap', 17, 1)
++    if any(b == 16 for _, _, b, _ in ins):
++        e.put('cap', 17, 9); e.put('cap', 17, 22); e.put('cap', 17, 4436)
++    e.put('mm', 14, 0, 1)
++    tys = {}
++    def ty(key):
++        if key in tys: return tys[key]
++        r = e.id(); k = key[0]
++        if k == 'void': e.put('ty', 19, r)
++        elif k == 'f': e.put('ty', 22, r, key[1])
++        elif k in 'iu': e.put('ty', 21, r, key[1], 1 if k == 'i' else 0)
++        elif k == 'v': e.put('ty', 23, r, ty(key[1]), key[2])
++        elif k == 'p': e.put('ty', 32, r, key[1], ty(key[2]))
++        elif k == 'fn': e.put('ty', 33, r, ty(('void',)))
++        elif k == 'arr': e.put('ty', 28, r, ty(key[1]), const(('u', 32), 3))
++        tys[key] = r; return r
++    cs = {}
++    def const(t, v):
++        if (t, v) in cs: return cs[(t, v)]
++        r = e.id()
++        if t[0] == 'f' and t[1] == 32: e.put('ty', 43, ty(t), r, struct.unpack('<I', struct.pack('<f', v))[0])
++        elif t[0] == 'f' and t[1] == 16: e.put('ty', 43, ty(t), r, struct.unpack('<H', struct.pack('<e', v))[0])
++        else: e.put('ty', 43, ty(t), r, int(v))
++        cs[(t, v)] = r; return r
++    f32 = ('f', 32); v4 = ('v', f32, 4)
++    void = ty(('void',)); fnt = ty(('fn',))
++    pts = [(-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)]
++    vecs = []
++    for x, y in pts:
++        r = e.id(); e.put('ty', 44, ty(v4), r, const(f32, x), const(f32, y), const(f32, 0.0), const(f32, 1.0)); vecs.append(r)
++    arr = ('arr', v4)
++    arrc = e.id(); e.put('ty', 44, ty(arr), arrc, *vecs)
++    parr = ty(('p', 6, arr)); gpos = e.id(); e.put('ty', 59, parr, gpos, 6, arrc)
++    i32 = ('i', 32)
++    vidx = e.id(); e.put('ty', 59, ty(('p', 1, i32)), vidx, 1); e.put('dec', 71, vidx, 11, 42)
++    pos = e.id(); e.put('ty', 59, ty(('p', 3, v4)), pos, 3); e.put('dec', 71, pos, 11, 0)
++    outs = []
++    for loc, k, b, cnt in ins:
++        comp = (k, b); t = comp if cnt == 1 else ('v', comp, cnt)
++        v = e.id(); e.put('ty', 59, ty(('p', 3, t)), v, 3); e.put('dec', 71, v, 30, loc)
++        if k == 'i' or k == 'u': e.put('dec', 71, v, 14)
++        outs.append((v, k, b, cnt, t))
++    fn = e.id(); lab = e.id()
++    e.put('fn', 54, void, fn, 0, fnt); e.put('fn', 248, lab)
++    vi = e.id(); e.put('fn', 61, ty(i32), vi, vidx)
++    ac = e.id(); e.put('fn', 65, ty(('p', 6, v4)), ac, gpos, vi)
++    p = e.id(); e.put('fn', 61, ty(v4), p, ac)
++    e.put('fn', 62, pos, p)
++    uv = []
++    for c in (0, 1):
++        x = e.id(); e.put('fn', 81, ty(f32), x, p, c)
++        m = e.id(); e.put('fn', 133, ty(f32), m, x, const(f32, 0.5))
++        a = e.id(); e.put('fn', 129, ty(f32), a, m, const(f32, 0.5)); uv.append(a)
++    base = [0.4, 0.8, 0.25, 0.6]
++    for v, k, b, cnt, t in outs:
++        comps = []
++        for c in range(cnt):
++            if k == 'f' and b == 32 and c < 2: comps.append(uv[c])
++            elif k == 'f': comps.append(const((k, b), base[(c + 2) % 4]))
++            else: comps.append(const((k, b), 1 + c))
++        if cnt == 1: val = comps[0]
++        else: val = e.id(); e.put('fn', 80, ty(t), val, *comps)
++        e.put('fn', 62, v, val)
++    e.put('fn', 253); e.put('fn', 56)
++    e.put('ep', 15, 0, fn, 'main', vidx, pos, *[o[0] for o in outs])
++    e.emit(path)
++    return ins
++
++if __name__ == '__main__':
++    print(gen(sys.argv[1], sys.argv[2]))
+--- /dev/null
++++ b/tools/anv/mkspv.py
+@@ -0,0 +1,138 @@
++# mkspv.py <dir>: writes vs.spv, fs.spv and fsptr.spv, the hand-assembled test shaders ssbo-push-test and ptr-push-test
++# render (fs reads two NonWritable SSBOs at constant offsets; fsptr reads constants through the binding-640 table).
++import struct, sys
++OP = dict(Capability=17, Extension=10, MemoryModel=14, EntryPoint=15, ExecutionMode=16, Decorate=71, MemberDecorate=72,
++          TypeVoid=19, TypeBool=20, TypeInt=21, TypeFloat=22, TypeVector=23, TypeArray=28, TypeRuntimeArray=29,
++          TypeStruct=30, TypePointer=32, TypeFunction=33, Constant=43, Variable=59, Load=61, Store=62, AccessChain=65,
++          Function=54, FunctionEnd=56, Label=248, Return=253, CompositeExtract=81, CompositeConstruct=80,
++          BitwiseAnd=199, ShiftRightLogical=194, ConvertSToF=111, FConvert=115, FMul=133, FSub=131, FAdd=129, Bitcast=124, ConvertUToPtr=120, IAdd=128)
++class M:
++    def __init__(s): s.n = 1; s.sec = {k: [] for k in 'cap ext mm ep em dec ty fn'.split()}
++    def id(s): s.n += 1; return s.n - 1
++    def i(s, sec, op, *a): s.sec[sec].append([OP[op]] + [x for x in a]); 
++    def r(s, sec, op, *a): x = s.id(); s.sec[sec].append([OP[op], *a[:1], x, *a[1:]] if a and a[0] == 'T' else None); return x
++    def emit(s, path):
++        w = [0x07230203, 0x00010300, 0, s.n, 0]
++        for k in 'cap ext mm ep em dec ty fn'.split():
++            for ins in s.sec[k]:
++                ws = []
++                for x in ins[1:]:
++                    if isinstance(x, str):
++                        b = x.encode() + b'\0'; b += b'\0' * (-len(b) % 4); ws += struct.unpack('<%dI' % (len(b) // 4), b)
++                    else: ws.append(x & 0xffffffff)
++                w += [ins[0] | ((len(ws) + 1) << 16)] + ws
++        open(path, 'wb').write(struct.pack('<%dI' % len(w), *w))
++def str_(s): return s
++def common(m, model):
++    m.i('cap', 'Capability', 1)
++    m.i('mm', 'MemoryModel', 0, 1)
++def vs(path):
++    m = M(); common(m, 0)
++    v = m.id(); m.i('ty', 'TypeVoid', v)
++    fnt = m.id(); m.i('ty', 'TypeFunction', fnt, v)
++    i32 = m.id(); m.i('ty', 'TypeInt', i32, 32, 1); f32 = m.id(); m.i('ty', 'TypeFloat', f32, 32)
++    v4 = m.id(); m.i('ty', 'TypeVector', v4, f32, 4)
++    pi = m.id(); m.i('ty', 'TypePointer', pi, 1, i32); po = m.id(); m.i('ty', 'TypePointer', po, 3, v4)
++    vi = m.id(); m.i('ty', 'Variable', pi, vi, 1); pos = m.id(); m.i('ty', 'Variable', po, pos, 3)
++    m.i('dec', 'Decorate', vi, 11, 42); m.i('dec', 'Decorate', pos, 11, 0)
++    c = {}
++    for k, (t, val) in dict(one=(i32, 1), f4=(f32, 0x40800000), f1=(f32, 0x3f800000), f0=(f32, 0)).items():
++        c[k] = m.id(); m.i('ty', 'Constant', t, c[k], val)
++    main = m.id(); m.i('ep', 'EntryPoint', 0, main, 'main', vi, pos)
++    m.i('fn', 'Function', v, main, 0, fnt); m.i('fn', 'Label', m.id())
++    x = m.id(); m.i('fn', 'Load', i32, x, vi)
++    a = m.id(); m.i('fn', 'BitwiseAnd', i32, a, x, c['one'])
++    s1 = m.id(); m.i('fn', 'ShiftRightLogical', i32, s1, x, c['one']); b = m.id(); m.i('fn', 'BitwiseAnd', i32, b, s1, c['one'])
++    out = []
++    for q in (a, b):
++        f = m.id(); m.i('fn', 'ConvertSToF', f32, f, q); g = m.id(); m.i('fn', 'FMul', f32, g, f, c['f4']); h = m.id(); m.i('fn', 'FSub', f32, h, g, c['f1']); out.append(h)
++    p = m.id(); m.i('fn', 'CompositeConstruct', v4, p, out[0], out[1], c['f0'], c['f1'])
++    m.i('fn', 'Store', pos, p); m.i('fn', 'Return'); m.i('fn', 'FunctionEnd'); m.emit(path)
++def fs(path):
++    # binding 4: NonWritable { vec4 d[]; }  binding 2: NonWritable { f16vec4 h[]; }
++    # out = (d[1].x, d[2].y + h[3].z*1000, d[9].z, d[30].w + h[12].x*1000)
++    m = M(); common(m, 0); m.i('cap', 'Capability', 9); m.i('cap', 'Capability', 4433)
++    m.i('ext', 'Extension', 'SPV_KHR_16bit_storage'); m.i('ext', 'Extension', 'SPV_KHR_storage_buffer_storage_class')
++    v = m.id(); m.i('ty', 'TypeVoid', v); fnt = m.id(); m.i('ty', 'TypeFunction', fnt, v)
++    i32 = m.id(); m.i('ty', 'TypeInt', i32, 32, 1); f32 = m.id(); m.i('ty', 'TypeFloat', f32, 32); f16 = m.id(); m.i('ty', 'TypeFloat', f16, 16)
++    v4 = m.id(); m.i('ty', 'TypeVector', v4, f32, 4); h4 = m.id(); m.i('ty', 'TypeVector', h4, f16, 4)
++    ra = m.id(); m.i('ty', 'TypeRuntimeArray', ra, v4); rh = m.id(); m.i('ty', 'TypeRuntimeArray', rh, h4)
++    sa = m.id(); m.i('ty', 'TypeStruct', sa, ra); sh = m.id(); m.i('ty', 'TypeStruct', sh, rh)
++    psa = m.id(); m.i('ty', 'TypePointer', psa, 12, sa); psh = m.id(); m.i('ty', 'TypePointer', psh, 12, sh)
++    pv4 = m.id(); m.i('ty', 'TypePointer', pv4, 12, v4); ph4 = m.id(); m.i('ty', 'TypePointer', ph4, 12, h4)
++    po = m.id(); m.i('ty', 'TypePointer', po, 3, v4)
++    D = m.id(); m.i('ty', 'Variable', psa, D, 12); H = m.id(); m.i('ty', 'Variable', psh, H, 12); O = m.id(); m.i('ty', 'Variable', po, O, 3)
++    for var, b in ((D, 4), (H, 2)):
++        m.i('dec', 'Decorate', var, 34, 0); m.i('dec', 'Decorate', var, 33, b); m.i('dec', 'Decorate', var, 24)
++    m.i('dec', 'Decorate', ra, 6, 16); m.i('dec', 'Decorate', rh, 6, 8)
++    for st in (sa, sh): m.i('dec', 'Decorate', st, 2); m.i('dec', 'MemberDecorate', st, 0, 35, 0)
++    m.i('dec', 'Decorate', O, 30, 0)
++    cs = {}
++    def ci(n):
++        if n not in cs: cs[n] = m.id(); m.i('ty', 'Constant', i32, cs[n], n)
++        return cs[n]
++    k1000 = m.id(); m.i('ty', 'Constant', f32, k1000, 0x447a0000)
++    main = m.id(); m.i('ep', 'EntryPoint', 4, main, 'main', O, D, H); m.i('em', 'ExecutionMode', main, 7)
++    m.i('fn', 'Function', v, main, 0, fnt); m.i('fn', 'Label', m.id())
++    def ld(var, pt, vt, idx, comp, half=False):
++        p = m.id(); m.i('fn', 'AccessChain', pt, p, var, ci(0), ci(idx)); x = m.id(); m.i('fn', 'Load', vt, x, p)
++        e = m.id(); m.i('fn', 'CompositeExtract', f16 if half else f32, e, x, comp)
++        if half: g = m.id(); m.i('fn', 'FConvert', f32, g, e); e = g
++        return e
++    def mad(a, b):
++        t = m.id(); m.i('fn', 'FMul', f32, t, b, k1000); u = m.id(); m.i('fn', 'FAdd', f32, u, a, t); return u
++    o0 = ld(D, pv4, v4, 1, 0)
++    o1 = mad(ld(D, pv4, v4, 2, 1), ld(H, ph4, h4, 3, 2, True))
++    o2 = ld(D, pv4, v4, 9, 2)
++    o3 = mad(ld(D, pv4, v4, 30, 3), ld(H, ph4, h4, 12, 0, True))
++    r = m.id(); m.i('fn', 'CompositeConstruct', v4, r, o0, o1, o2, o3)
++    m.i('fn', 'Store', O, r); m.i('fn', 'Return'); m.i('fn', 'FunctionEnd'); m.emit(path)
++def fs_ptr(path):
++    # table: Uniform block { uvec2 t[8]; } at set 0 binding 640; t[4] -> vec4 array, t[2] -> f16vec4 array (NonWritable, PhysicalStorageBuffer)
++    # out = (d[1].x, d[2].y + h[3].z*1000, d[9].z, d[30].w + h[12].x*1000), loads Aligned 4 / 2 like the plugin's lowered modules
++    m = M(); m.i('cap', 'Capability', 1); m.i('cap', 'Capability', 9); m.i('cap', 'Capability', 4433); m.i('cap', 'Capability', 11); m.i('cap', 'Capability', 5347)
++    m.i('ext', 'Extension', 'SPV_KHR_16bit_storage'); m.i('ext', 'Extension', 'SPV_KHR_physical_storage_buffer')
++    m.i('mm', 'MemoryModel', 5348, 1)
++    v = m.id(); m.i('ty', 'TypeVoid', v); fnt = m.id(); m.i('ty', 'TypeFunction', fnt, v)
++    i32 = m.id(); m.i('ty', 'TypeInt', i32, 32, 1); u32 = m.id(); m.i('ty', 'TypeInt', u32, 32, 0); u64 = m.id(); m.i('ty', 'TypeInt', u64, 64, 0)
++    f32 = m.id(); m.i('ty', 'TypeFloat', f32, 32); f16 = m.id(); m.i('ty', 'TypeFloat', f16, 16)
++    uv2 = m.id(); m.i('ty', 'TypeVector', uv2, u32, 2)
++    v4 = m.id(); m.i('ty', 'TypeVector', v4, f32, 4); h4 = m.id(); m.i('ty', 'TypeVector', h4, f16, 4)
++    c8 = m.id(); m.i('ty', 'Constant', u32, c8, 8)
++    ta = m.id(); m.i('ty', 'TypeArray', ta, uv2, c8); ts = m.id(); m.i('ty', 'TypeStruct', ts, ta); pts = m.id(); m.i('ty', 'TypePointer', pts, 2, ts)
++    puv2 = m.id(); m.i('ty', 'TypePointer', puv2, 2, uv2)
++    ra = m.id(); m.i('ty', 'TypeRuntimeArray', ra, v4); rh = m.id(); m.i('ty', 'TypeRuntimeArray', rh, h4)
++    sa = m.id(); m.i('ty', 'TypeStruct', sa, ra); sh = m.id(); m.i('ty', 'TypeStruct', sh, rh)
++    psa = m.id(); m.i('ty', 'TypePointer', psa, 5349, sa); psh = m.id(); m.i('ty', 'TypePointer', psh, 5349, sh)
++    pv4 = m.id(); m.i('ty', 'TypePointer', pv4, 5349, v4); ph4 = m.id(); m.i('ty', 'TypePointer', ph4, 5349, h4)
++    po = m.id(); m.i('ty', 'TypePointer', po, 3, v4)
++    T = m.id(); m.i('ty', 'Variable', pts, T, 2); O = m.id(); m.i('ty', 'Variable', po, O, 3)
++    m.i('dec', 'Decorate', T, 34, 0); m.i('dec', 'Decorate', T, 33, 640); m.i('dec', 'Decorate', ta, 6, 8); m.i('dec', 'Decorate', ts, 2); m.i('dec', 'MemberDecorate', ts, 0, 35, 0)
++    m.i('dec', 'Decorate', ra, 6, 16); m.i('dec', 'Decorate', rh, 6, 8)
++    for st in (sa, sh): m.i('dec', 'Decorate', st, 2); m.i('dec', 'MemberDecorate', st, 0, 35, 0); m.i('dec', 'MemberDecorate', st, 0, 24)
++    m.i('dec', 'Decorate', O, 30, 0)
++    cs = {}
++    def ci(n):
++        if n not in cs: cs[n] = m.id(); m.i('ty', 'Constant', i32, cs[n], n)
++        return cs[n]
++    k1000 = m.id(); m.i('ty', 'Constant', f32, k1000, 0x447a0000)
++    main = m.id(); m.i('ep', 'EntryPoint', 4, main, 'main', O, T); m.i('em', 'ExecutionMode', main, 7)
++    m.i('fn', 'Function', v, main, 0, fnt); m.i('fn', 'Label', m.id())
++    def base(k, pt):
++        p = m.id(); m.i('fn', 'AccessChain', puv2, p, T, ci(0), ci(k)); x = m.id(); m.i('fn', 'Load', uv2, x, p)
++        y = m.id(); m.i('fn', 'Bitcast', u64, y, x); z = m.id(); m.i('fn', 'ConvertUToPtr', pt, z, y); return z
++    D = base(4, psa); H = base(2, psh)
++    def ld(ptr, pt, vt, idx, comp, al, half=False):
++        p = m.id(); m.i('fn', 'AccessChain', pt, p, ptr, ci(0), ci(idx)); x = m.id(); m.i('fn', 'Load', vt, x, p, 2, al)
++        e = m.id(); m.i('fn', 'CompositeExtract', f16 if half else f32, e, x, comp)
++        if half: g = m.id(); m.i('fn', 'FConvert', f32, g, e); e = g
++        return e
++    def mad(a, b):
++        t = m.id(); m.i('fn', 'FMul', f32, t, b, k1000); u = m.id(); m.i('fn', 'FAdd', f32, u, a, t); return u
++    o0 = ld(D, pv4, v4, 1, 0, 4)
++    o1 = mad(ld(D, pv4, v4, 2, 1, 4), ld(H, ph4, h4, 3, 2, 2, True))
++    o2 = ld(D, pv4, v4, 9, 2, 4)
++    o3 = mad(ld(D, pv4, v4, 30, 3, 4), ld(H, ph4, h4, 12, 0, 2, True))
++    r = m.id(); m.i('fn', 'CompositeConstruct', v4, r, o0, o1, o2, o3)
++    m.i('fn', 'Store', O, r); m.i('fn', 'Return'); m.i('fn', 'FunctionEnd'); m.emit(path)
++vs(sys.argv[1] + '/vs.spv'); fs(sys.argv[1] + '/fs.spv'); fs_ptr(sys.argv[1] + '/fsptr.spv')
+--- /dev/null
++++ b/tools/anv/plower.m
+@@ -0,0 +1,35 @@
++// plower: the plugin's fragment/vertex module preparation (nvmtl_vk.c nvmtl_address_shader), offline
++#import <Foundation/Foundation.h>
++#include <dlfcn.h>
++#define nvlog(...) (printf(__VA_ARGS__), printf("\n"))
++#include "nvmtl_readonly_metadata.h"
++#include "nvmtl_physical_bounds.h"
++#include "nvmtl_independent_helpers.h"
++typedef int (*lower_ex_fn)(const uint8_t *, size_t, uint32_t, uint8_t **, size_t *, uint32_t *, char *, size_t);
++typedef void (*free_fn)(uint8_t *, size_t);
++static lower_ex_fn lo; static free_fn fr;
++static NSData *g(NSData *in, uint32_t flags, uint32_t *info)
++{
++    NSData *p = nvmtl_preserve_readonly_metadata(in);
++    uint8_t *out = NULL; size_t n = 0; char err[512] = {0};
++    if (lo(p.bytes, p.length, flags | 2u, &out, &n, info, err, sizeof err)) { printf("lower refused: %s\n", err); return nil; }
++    NSMutableData *r = [NSMutableData dataWithBytes:out length:n]; fr(out, n);
++    int k = nvmtl_relax_physical_bounds(r.mutableBytes, r.length / 4); if (k) printf("relaxed %d\n", k);
++    return nvmtl_independent_helpers(r);
++}
++int main(int argc, char **argv)
++{
++    @autoreleasepool {
++        void *h = dlopen("/Library/GPUBundles/XeMTLDriver.bundle/Contents/MacOS/libxemtl_translate.dylib", RTLD_NOW);
++        lo = (lower_ex_fn)dlsym(h, "nvmtl_lower_buffer_addresses_ex"); fr = (free_fn)dlsym(h, "nvmtl_translate_free");
++        NSData *in = [NSData dataWithContentsOfFile:@(argv[1])];
++        uint32_t info[4] = {0};
++        NSData *d = g(in, 0, info);
++        printf("flags 0: info %u %u %u %u\n", info[0], info[1], info[2], info[3]);
++        if (d && (info[0] || info[2])) { d = g(in, 1, NULL); printf("SAFE module\n"); }
++        if (!d) return 1;
++        [d writeToFile:@(argv[2]) atomically:NO];
++        printf("%zu bytes\n", (size_t)d.length);
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/anv/shader-stats.py
+@@ -0,0 +1,15 @@
++# shader-stats.py: compile every lowered fragment shader in low/ with ANV's pushes off and on (ssbo-push-test real)
++# and print the ones whose statistics change: (SIMD, SENDs, cycles, spills, fills) off, then on.
++# XEGFX_ICD names the ICD json (default: the installed /Library/GPUBundles/xemtl/intel_icd.json).
++import subprocess, re, os, sys, glob, concurrent.futures as cf
++S = os.path.dirname(os.path.abspath(__file__))
++def st(spv, push):
++    e = dict(os.environ, VK_ICD_FILENAMES=os.environ.get('XEGFX_ICD', '/Library/GPUBundles/xemtl/intel_icd.json'), MESA_SHADER_CACHE_DISABLE='true', XEMTL_SSBO_PUSH=push, SPDIR=S)
++    o = subprocess.run([os.path.join(S, 'ssbo-push-test'), 'real', spv], capture_output=True, text=True, env=e).stdout
++    m = re.search(r'SIMD(\d+) fragment: SENDs=(\d+) Cycles=(\d+) Spills=(\d+) Fills=(\d+)', o)
++    return m.groups() if m else None
++spvs = sorted(glob.glob(os.path.join(S, 'low', '*.spv')))
++def one(p): return p, st(p, '0'), st(p, '1')
++with cf.ThreadPoolExecutor(6) as ex:
++    for p, a, b in ex.map(one, spvs):
++        if a != b: print(os.path.basename(p), a, b, flush=True)
+--- /dev/null
++++ b/tools/anv/sweep.py
+@@ -0,0 +1,24 @@
++# sweep.py MIN=16,MAXLEN=64 ...: total SENDs / cycles of the lowered shaders in ws/ for XEMTL_PTR_PUSH_* settings, against
++# pushes off, with the shaders that got worse.  XEGFX_ICD names the ICD json (default: the installed one).
++import subprocess, re, os, sys, glob
++S = os.path.dirname(os.path.abspath(__file__))
++icd = os.environ.get('XEGFX_ICD', '/Library/GPUBundles/xemtl/intel_icd.json')
++def st(spv, env):
++    e = dict(os.environ, VK_ICD_FILENAMES=icd, MESA_SHADER_CACHE_DISABLE='true', **env)
++    o = subprocess.run([os.path.join(S, 'ssbo-push-test'), 'real', spv], capture_output=True, text=True, env=e).stdout
++    m = re.search(r'SIMD16 fragment: SENDs=(\d+) Cycles=(\d+) Spills=(\d+) Fills=(\d+)', o) or re.search(r'SIMD8 fragment: SENDs=(\d+) Cycles=(\d+) Spills=(\d+) Fills=(\d+)', o)
++    return tuple(int(m.group(i)) for i in range(1, 5)) if m else None
++spvs = sorted(glob.glob(os.path.join(S, 'ws', '*.spv')))
++base = {p: st(p, {'XEMTL_SSBO_PUSH': '0'}) for p in spvs}
++for mn in sys.argv[1:]:
++    tot0 = tot1 = c0 = c1 = worse = changed = 0; wl = []
++    for p in spvs:
++        env = {'XEMTL_SSBO_PUSH': '1'}
++        for kv in mn.split(','):
++            k, v = kv.split('='); env['XEMTL_PTR_PUSH_' + k] = v
++        a = base[p]; b = st(p, env)
++        if not a or not b: continue
++        tot0 += a[0]; tot1 += b[0]; c0 += a[1]; c1 += b[1]
++        if a != b: changed += 1
++        if b[1] > a[1]: worse += 1; wl.append((os.path.basename(p)[:8], a, b))
++    print('%s: changed %d, SENDs %d -> %d, cycles %d -> %d (%.1f%%), worse %d %s' % (mn, changed, tot0, tot1, c0, c1, 100.0 * (c1 - c0) / c0, worse, sorted(wl, key=lambda w: w[1][1] - w[2][1])[:5]))
+--- /dev/null
++++ b/tools/anv/diff-one.sh
+@@ -0,0 +1,10 @@
++#!/bin/sh
++# diff-one.sh <hash>: render one lowered fragment shader low/<hash>.spv with ANV's pushes off and on (diff-test) and
++# compare the pixels.  Prints "<hash> same", "DIFF", "fail" or "vsgen-skip".  Run from this directory after building
++# diff-test; XEGFX_ICD names the ICD json (default: the installed /Library/GPUBundles/xemtl/intel_icd.json).
++# Usage: ls low | sed 's/.spv//' | xargs -P6 -n1 ./diff-one.sh
++h=$1; ICD=${XEGFX_ICD:-/Library/GPUBundles/xemtl/intel_icd.json}
++mkdir -p vs out
++python3 gen_vs.py low/$h.spv vs/$h.spv >/dev/null 2>&1 || { echo "$h vsgen-skip"; exit 0; }
++for p in 0 1; do env VK_ICD_FILENAMES=$ICD MESA_SHADER_CACHE_DISABLE=true XEMTL_SSBO_PUSH=$p ./diff-test vs/$h.spv low/$h.spv out/$h.$p.bin > out/$h.$p.txt 2>&1; done
++if grep -q FAIL out/$h.0.txt; then echo "$h fail $(grep FAIL out/$h.0.txt | head -1 | cut -c1-80)"; elif cmp -s out/$h.0.bin out/$h.1.bin; then echo "$h same"; else echo "$h DIFF"; fi
+--- /dev/null
++++ b/tools/anv/map-test.c
+@@ -0,0 +1,29 @@
++// map-test: largest host-visible allocation that can be mapped now (vkAllocateMemory + vkMapMemory), in MB steps
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++int main(int argc, char **argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "map", 1, NULL, 0, VK_API_VERSION_1_3 };
++    VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &ai };
++    VkInstance inst; if (vkCreateInstance(&ii, NULL, &inst)) return 1;
++    uint32_t n = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &n, &pd);
++    float pr = 1; VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr };
++    VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qi };
++    VkDevice dev; if (vkCreateDevice(pd, &di, NULL, &dev)) return 1;
++    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++    uint32_t mt = 0; for (; mt < mp.memoryTypeCount; mt++) if (mp.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) break;
++    for (int i = 1; i < argc; i++) {
++        VkDeviceSize sz = (VkDeviceSize)atoi(argv[i]) << 20;
++        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, sz, mt };
++        VkDeviceMemory m; struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
++        VkResult r = vkAllocateMemory(dev, &ma, NULL, &m); void *p = NULL;
++        VkResult r2 = r ? r : vkMapMemory(dev, m, 0, sz, 0, &p);
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        printf("%s MB: alloc %d map %d (%.0f ms)\n", argv[i], r, r2, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
++        if (!r) { if (!r2) vkUnmapMemory(dev, m); vkFreeMemory(dev, m, NULL); }
++    }
++    return 0;
++}
+--- /dev/null
++++ b/tools/anv/pool-test.c
+@@ -0,0 +1,35 @@
++// pool-test: create the plugin's descriptor pool (nvmtl_vk.c nvmtl_desc_pool_open, 2nd-pool size) until creation fails
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++int main(int argc, char **argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "pool", 1, NULL, 0, VK_API_VERSION_1_3 };
++    VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &ai };
++    VkInstance inst; if (vkCreateInstance(&ii, NULL, &inst)) return 1;
++    uint32_t n = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &n, &pd);
++    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mf = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT, NULL, VK_TRUE };
++    const char *ext[] = { "VK_EXT_mutable_descriptor_type" };
++    float pr = 1; VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr };
++    VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &mf, 0, 1, &qi, 0, NULL, 1, ext };
++    VkDevice dev; if (vkCreateDevice(pd, &di, NULL, &dev)) { puts("device"); return 1; }
++    const uint32_t cap = argc > 1 ? atoi(argv[1]) : 8192, max = argc > 2 ? atoi(argv[2]) : 64;
++    VkDescriptorPoolSize sizes[5] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, cap }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 33 * cap },
++        { VK_DESCRIPTOR_TYPE_MUTABLE_EXT, 128 * cap }, { VK_DESCRIPTOR_TYPE_SAMPLER, 32 * cap }, { VK_DESCRIPTOR_TYPE_MUTABLE_EXT, 128 * cap } };
++    static const VkDescriptorType mut4[4] = { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
++                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER };
++    VkMutableDescriptorTypeListEXT pl[5] = { { 0, NULL }, { 0, NULL }, { 4, mut4 }, { 0, NULL }, { 4, mut4 } };
++    VkMutableDescriptorTypeCreateInfoEXT pmi = { VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT, NULL, 5, pl };
++    VkDescriptorPoolCreateInfo pci = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, &pmi, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, cap, 5, sizes };
++    for (uint32_t i = 0; i < max; i++) {
++        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
++        VkDescriptorPool p; VkResult r = vkCreateDescriptorPool(dev, &pci, NULL, &p);
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        if (r) { printf("pool %u FAILED %d\n", i, r); return 0; }
++        if (i < 2 || i % 8 == 7) printf("pool %u ok (%.1f ms)\n", i, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
++    }
++    printf("all %u pools ok\n", max);
++    return 0;
++}
+--- /dev/null
++++ b/tools/anv/cum-test.c
+@@ -0,0 +1,30 @@
++#include <vulkan/vulkan.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++int main(int argc, char **argv)
++{
++    setvbuf(stdout, NULL, _IONBF, 0);
++    int mb = atoi(argv[1]), cnt = atoi(argv[2]);
++    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "cum", 1, NULL, 0, VK_API_VERSION_1_3 };
++    VkInstanceCreateInfo ii = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &ai };
++    VkInstance inst; if (vkCreateInstance(&ii, NULL, &inst)) return 1;
++    uint32_t n = 1; VkPhysicalDevice pd; vkEnumeratePhysicalDevices(inst, &n, &pd);
++    float pr = 1; VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &pr };
++    VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &qi };
++    VkDevice dev; if (vkCreateDevice(pd, &di, NULL, &dev)) return 1;
++    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++    uint32_t mt = 0; for (; mt < mp.memoryTypeCount; mt++) if (mp.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) break;
++    int ok = 0;
++    for (int i = 0; i < cnt; i++) {
++        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, (VkDeviceSize)mb << 20, mt };
++        VkDeviceMemory m; void *p;
++        VkResult r = vkAllocateMemory(dev, &ma, NULL, &m);
++        VkResult r2 = r ? r : vkMapMemory(dev, m, 0, VK_WHOLE_SIZE, 0, &p);
++        if (r || r2) { printf("#%d fail alloc %d map %d after %d MB mapped\n", i, r, r2, ok * mb); continue; }
++        memset(p, 1, 4096);
++        ok++;
++    }
++    printf("mapped %d x %d MB = %d MB\n", ok, mb, ok * mb);
++    return 0;
++}
+--- /dev/null
++++ b/tools/anv/minininja.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python3
++"""Rebuild one target of a meson-generated build.ninja without ninja: walks the dependency graph, recompiles objects
++whose source or depfile headers are newer, re-archives and relinks. usage: minininja.py <builddir> <target> [-n]"""
++import os, re, shlex, subprocess, sys
++
++def parse(path):
++    rules, builds, glob = {}, {}, {}
++    lines = open(path).read().replace('$\n', '').splitlines()
++    i = 0
++    while i < len(lines):
++        ln = lines[i]; i += 1
++        if not ln or ln.startswith('#'): continue
++        if ln.startswith('rule '):
++            name = ln[5:].strip(); vars_ = {}
++            while i < len(lines) and lines[i].startswith(' '):
++                k, _, v = lines[i].strip().partition(' = '); vars_[k] = v; i += 1
++            rules[name] = vars_
++        elif ln.startswith('build '):
++            outs, _, rest = ln[6:].partition(': ')
++            parts = rest.replace('$ ', '\0').split(' ')
++            parts = [p.replace('\0', ' ').replace('$:', ':') for p in parts if p]
++            rule = parts[0]; exp, imp, order = [], [], []; cur = exp
++            for p in parts[1:]:
++                if p == '|': cur = imp; continue
++                if p == '||': cur = order; continue
++                cur.append(p)
++            vars_ = {}
++            while i < len(lines) and lines[i].startswith(' '):
++                k, _, v = lines[i].strip().partition(' = '); vars_[k] = v; i += 1
++            o = [x.replace('$:', ':') for x in outs.split(' ') if x and x != '|']
++            b = dict(rule=rule, outs=o, exp=exp, imp=imp, order=order, vars=vars_)
++            for x in o: builds[x] = b
++        elif ' = ' in ln and not ln.startswith(' '):
++            k, _, v = ln.partition(' = '); glob[k.strip()] = v
++    return rules, builds, glob
++
++def expand(s, env):
++    return re.sub(r'\$\{?(\w+)\}?', lambda m: env.get(m.group(1), ''), s)
++
++def mtime(p):
++    try: return os.stat(p).st_mtime
++    except OSError: return None
++
++def depfile_deps(p):
++    try: t = open(p).read().replace('\\\n', ' ')
++    except OSError: return None
++    _, _, deps = t.partition(':')
++    return [d.replace('\\ ', ' ') for d in re.split(r'(?<!\\)\s+', deps) if d]
++
++def main():
++    bdir, target = sys.argv[1], sys.argv[2]; dry = '-n' in sys.argv
++    os.chdir(bdir)
++    rules, builds, glob = parse('build.ninja')
++    done = {}
++    def build(t):
++        if t in done: return done[t]
++        b = builds.get(t)
++        if b is None or b['rule'] == 'phony':
++            if b: [build(x) for x in b['exp'] + b['imp']]
++            done[t] = mtime(t) or 0; return done[t]
++        newest = 0
++        for x in b['exp'] + b['imp']: newest = max(newest, build(x) or 0)
++        for x in b['order']: build(x)
++        out = b['outs'][0]; om = mtime(out)
++        dirty = om is None or newest > om
++        env = dict(glob); env.update(rules[b['rule']]); env.update(b['vars'])
++        env['in'] = ' '.join(shlex.quote(x) for x in b['exp']); env['out'] = ' '.join(shlex.quote(x) for x in b['outs'])
++        if not dirty and 'DEPFILE' in b['vars']:
++            deps = depfile_deps(expand(b['vars']['DEPFILE'], env))
++            if deps is not None and any((mtime(d) or 0) > om for d in deps): dirty = True
++        if dirty and b['rule'] not in ('SHSYM', 'CUSTOM_COMMAND', 'CUSTOM_COMMAND_DEP', 'REGENERATE_BUILD'):
++            cmd = expand(expand(rules[b['rule']]['command'], env), env)
++            print(('[dry] ' if dry else '') + b['rule'] + ' ' + out, flush=True)
++            if not dry:
++                r = subprocess.run(cmd, shell=True)
++                if r.returncode: print('FAILED: ' + cmd[:2000]); sys.exit(1)
++        done[t] = mtime(out) or newest; return done[t]
++    build(target)
++
++if __name__ == '__main__':
++    main()
