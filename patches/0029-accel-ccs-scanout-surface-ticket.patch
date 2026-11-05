@@ -1,0 +1,805 @@
+# 0029 XeGfxAccel: compressed scanout registry, IOSurface tickets, device-cache accelerator ID, E2 holds, MMIO hooks
+#
+# Base:  kexts/NVRM/accel after 0002 + 0009 + 0012 + 0024
+# Files: kexts/NVRM/accel/nvrm-accel.cpp, kexts/NVRM/accel/xegfx_accel_names.h
+# Apply: patch -p1 < patches/0029-accel-ccs-scanout-surface-ticket.patch
+# Build: XeGfxAccel 44aeb7cba2f5 (build/nvgfx/build_nvaccel.sh xegfxaccel; needs core 0028)
+#
+# Compressed scanout (docs/render-compression.md):
+#   - DRM client selectors 9 and 10, WindowServer only: 9 registers a compressed image the plugin made for a scanout
+#     surface (surface ID, BO_SCANOUT token, main pitch, CCS offset, CCS pitch), 10 unregisters it.  Up to a fixed
+#     number of images, each tied to the DRM client that registered it and dropped when that client closes
+#     (WindowServer exits or restarts), not left behind.
+#   - a flip of a registered surface points the flip slot at the image's own pages ("xgScanoutPhys") and switches the
+#     plane to layout 2, Tile4 + MTL RC CCS with that CCS offset and pitch ("xgPlaneLayout2").  Tokens the display may
+#     still scan (the front frame, the one before, one not yet confirmed) are not released, so an image is never freed
+#     while it is on the panel.
+#   - selector 2's reply carries the flag 0x4 when compressed scanout is on, so the plugin only makes such images then.
+#   - debug.xegfxaccel_iop_xe_ccs (1 = on, the default; boot argument xegfxccs=0 starts with it off),
+#     iop_xe_ccs_frames / _regs / _fail counters; iop_xe_tile4_plane reports 2 for the compressed layout.
+#
+# IOSurface tickets: selector 11, WindowServer only, (surface ID) -> (ticket, size).  The surface is looked up in the
+# caller's task and its IOMemoryDescriptor handed to the core ("xgSurfTicket", 0028), which makes the plugin's next
+# host-pointer import of that surface out of the surface's own memory.
+#
+# Device cache key: CoreDisplay sets each frame's surface on the display plane through IOSurface::bind_accel with the
+# accelerator's IOSurface accelerator ID; the accel's device cache used a made-up ID ('XGDC'), so the IDs never matched
+# and every plane change paged the surface off (a GPU copy back to its pages, ~17 ms).  The cache now uses the
+# accelerator's own ID.
+#
+# E2 (early completion signal, still off by default: debug.xegfxaccel_iop_xe_early = 0):
+#   - it is held off around every display reconfiguration and from system shutdown or restart on (priority
+#     sleep/wake interest registered at start); both earlier E2 failures came at those moments.
+#   - the run of distinct surfaces it requires before signalling early is 4 (WindowServer now rotates three scanout
+#     surfaces), was 32.  A 11-05 retest with three surfaces still produced hazards, so it stays off.
+#
+# MMIO hooks: every display register read (nvXeRd) is recorded on the core's watchdog slot through "xgMmioHooks"
+# (who = 2), so a read the hardware never completes is named in the hang report.
+#
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -11,6 +11,7 @@
+ #include "xegfx_accel_names.h"
+ #endif
+ #include <IOKit/IOService.h>
++#include <IOKit/pwr_mgt/RootDomain.h>   // registerPrioritySleepWakeInterest (§37.13)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/pci/IOPCIDevice.h>
+ #ifdef NMX_XEGFX
+@@ -68,6 +69,21 @@
+ static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
+                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
+ static volatile uint32_t *gDispMmio = nullptr;   // BAR0 display registers, mapped in start() for the vblank wait
++// §37.15 (native-display docs/37-RENDER-COMPRESSION.md): every display register read here is recorded on the core's
++// per-CPU watchdog slot while it is in flight ("xgMmioHooks"), so the core's irq-off panic report names a CPU stuck in
++// one of our reads (a read the display never completes stalls the CPU even for an NMI).  Until the hooks are fetched
++// (the first flip) reads go unrecorded.
++typedef void (*NVXeMmioBegin)(const volatile void *addr, int who);
++typedef void (*NVXeMmioEnd)(void);
++static NVXeMmioBegin gXeMmioBegin;
++static NVXeMmioEnd gXeMmioEnd;
++static inline uint32_t nvXeRd(uint32_t off)
++{
++    const volatile uint32_t *a = &gDispMmio[off / 4];
++    const NVXeMmioBegin b = gXeMmioBegin; const NVXeMmioEnd e = gXeMmioEnd;
++    if (b && e) { b(a, 2); const uint32_t v = *a; e(); return v; }
++    return *a;
++}
+ static void nvaccelInstallSysctl(void);
+ #ifdef NMX_XEGFX
+ extern SInt64 gCntPipeInit;
+@@ -231,13 +247,15 @@
+ static int gNvAperture = 0;
+ static void nvXeJoinerRefresh(const char *why);   // J1, defined with the PLANE_SURF writers
+ static void nvXeTile4Reread(void);                 // §32.16, the same
++static void nvXeE2Hold(unsigned ms, const char *why);   // §37.13, with the E2 state
+ class NVDisplayMachine : public IOAccelLegacyDisplayMachine {
+     OSDeclareDefaultStructors(NVDisplayMachine)
+     NM_TAHOE_FWD(NVDisplayMachine)
+ public:
+-    bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM displayModeWillChange"); return true; }
++    bool displayModeWillChange() APPLE_KEXT_OVERRIDE { ALOG("DM displayModeWillChange"); nvXeE2Hold(10000, "mode change"); return true; }
+     bool displayModeDidChange() APPLE_KEXT_OVERRIDE {
+         ALOG("DM displayModeDidChange -> true");
++        nvXeE2Hold(10000, "mode changed");
+ #ifdef NMX_XEGFX
+         nvXeJoinerRefresh("displayModeDidChange");   // a mode change may have joined pipe A with pipe B, or unjoined it
+         nvXeTile4Reread();                           // and its setPlane put a linear placeholder on the plane
+@@ -322,6 +340,11 @@
+ static void nvXePoBeforeScan(unsigned int id, const char *why);
+ static void nvSurfLayoutSet(unsigned int id, int tile4);
+ static unsigned int nvXeTile4Reply(unsigned int id);
++static OSObject *gXeAccelObj;   // §37.14: this accelerator (IOGraphicsAccelerator2), for its IOSurface accelerator ID
++static IOReturn nvXeCcsRegister(unsigned int sid, unsigned int token, unsigned int mainPitch, unsigned int ccsOff, unsigned int ccsPitch, void *client);
++static void nvXeCcsDropClient(void *client);
++static IOReturn nvXeSurfTicket(unsigned int id, uint64_t *ticket, uint64_t *size);
++static IOReturn nvXeCcsUnregister(unsigned int sid, unsigned int token);
+ // WindowServer's sandbox lets it open /dev/dri read-only but never ioctl(2) a device node; it may open IOAccel*
+ // user clients. libdrm sends its ioctls here with the minor of its read-only fd, XeGfx checks the caller opened it.
+ // Selector 1 (§32.15, native-display docs/32-FRAME-RATE.md) is the Intel path of the plugin's WindowServer surface
+@@ -332,7 +355,7 @@
+ class IOAccelXeGfxDRMClient : public IOUserClient {
+     OSDeclareDefaultStructors(IOAccelXeGfxDRMClient)
+ public:
+-    IOReturn clientClose() APPLE_KEXT_OVERRIDE { nvXePoDropClient(this); terminate(); return kIOReturnSuccess; }
++    IOReturn clientClose() APPLE_KEXT_OVERRIDE { nvXePoDropClient(this); nvXeCcsDropClient(this); terminate(); return kIOReturnSuccess; }
+     IOReturn externalMethod(uint32_t sel, IOExternalMethodArguments *a, IOExternalMethodDispatch *,
+                             OSObject *, void *) APPLE_KEXT_OVERRIDE {
+         static IOService *res;
+@@ -410,6 +433,34 @@
+             if (a->scalarInputCount != 1) return kIOReturnBadArgument;
+             nvXePoDetach((unsigned int)a->scalarInput[0], this);
+             return kIOReturnSuccess;
++        }
++        // Selectors 9 and 10 (§37.14, docs/37-RENDER-COMPRESSION.md), WindowServer only: 9 (surface ID, token, main pitch,
++        // CCS offset, CCS pitch) registers the plugin's compressed image of a scanout surface -- the token is the core's
++        // BO_SCANOUT ioctl's for the image's GEM object; unsupported while compressed scanout is off.  10 (surface ID,
++        // token) unregisters it; busy while the display may still scan it (the plugin tries again later).
++        // Selector 11 (§37.17, docs/37-RENDER-COMPRESSION.md), WindowServer only: (surface ID) -> (ticket, size).  The
++        // surface is looked up in the caller's task and its IOMemoryDescriptor handed to the core ("xgSurfTicket"); the
++        // plugin announces the ticket with its host-pointer import of the surface (the core's SURF_EXPECT ioctl), and
++        // that import's userptr becomes a GEM object made of the surface's own memory -- an import by surface, as
++        // IOAcceleratorFamily2 and NullMoth do, instead of pinning the user mapping page by page.
++        if (sel == 11) {
++            char nm[32] = { 0 };
++            proc_selfname(nm, sizeof nm);
++            if (strcmp(nm, "WindowServer")) return kIOReturnNotPermitted;
++            if (a->scalarInputCount != 1 || a->scalarOutputCount != 2) return kIOReturnBadArgument;
++            return nvXeSurfTicket((unsigned int)a->scalarInput[0], &a->scalarOutput[0], &a->scalarOutput[1]);
++        }
++        if (sel == 9 || sel == 10) {
++            char nm[32] = { 0 };
++            proc_selfname(nm, sizeof nm);
++            if (strcmp(nm, "WindowServer")) return kIOReturnNotPermitted;
++            if (sel == 9) {
++                if (a->scalarInputCount != 5) return kIOReturnBadArgument;
++                return nvXeCcsRegister((unsigned int)a->scalarInput[0], (unsigned int)a->scalarInput[1], (unsigned int)a->scalarInput[2],
++                                       (unsigned int)a->scalarInput[3], (unsigned int)a->scalarInput[4], this);
++            }
++            if (a->scalarInputCount != 2) return kIOReturnBadArgument;
++            return nvXeCcsUnregister((unsigned int)a->scalarInput[0], (unsigned int)a->scalarInput[1]);
+         }
+         if (sel != 0 || a->scalarInputCount != 3 || a->scalarOutputCount != 1) return kIOReturnBadArgument;
+         if (!res) { OSDictionary *m = IOService::serviceMatching("XeGfxResident"); if (m) res = waitForMatchingService(m, 1000ULL * 1000 * 1000); }
+@@ -1233,7 +1284,7 @@
+             // its pixels landed, so the plugin keeps marking them after the GPU finishes.
+             setProperty("NVAccelSurfaceWait", 1ULL, 32);
+             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
+-            gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
++            gAccel = this; gEnableAccel = &NVAccel::enableFromHook; gXeAccelObj = this;
+             for (unsigned i = 0; i < NV_CARRIERS; i++) {
+                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
+                 if (!c) break;
+@@ -1660,8 +1711,11 @@
+ // A1: the largest scaled desktop the adapter offers (the 1920x1200 HiDPI backing); the slots are sized for it up front,
+ // so a mode change to a bigger desktop does not leave every frame larger than the slots.
+ #define NV_XE_FLIP_MAX_DESKTOP_BYTES (3840ull * 4ull * 2400ull)
++// §37.14 A2: a compressed frame is the plugin's whole GEM object -- the pixels, the CCS after them (1/256) and ANV's
++// alignment -- so every slot gets 4 MiB on top of the largest desktop.
++#define NV_XE_FLIP_SLOT_BYTES (NV_XE_FLIP_MAX_DESKTOP_BYTES + 4ull * 1024 * 1024)
+ #define NV_PLANE_SURF_A 0x7019cu
+-#define NV_XE_FLIP_MAX_PAGES 9216	/* A1: a 3840x2400 desktop is 9000 pages */
++#define NV_XE_FLIP_MAX_PAGES 10240	/* A1: a 3840x2400 desktop is 9000 pages; A2: a slot is 10024 */
+ 
+ // --- K9: deferred Intel zero-copy flip (plan 2, kernel-level ordering).  The no-wait compositor hands WindowServer's
+ // frame to the display pipe as soon as its GPU work is submitted, so arming the plane here would scan out a frame that
+@@ -1722,10 +1776,35 @@
+ // Off by default: WindowServer alternates two surfaces here, so the early signal hardly ever applied and the frames it
+ // did apply to counted hazards (§32.7/§32.11).
+ static int gIopXeEarly = 0;		// debug.xegfxaccel_iop_xe_early: 1 = signal at the arming write when it is safe
+-#define NV_XE_EARLY_RUN 32
++#define NV_XE_EARLY_RUN 4	// §37.13: three surfaces in rotation now (was 32)
+ static volatile SInt32 gXeFlipUnsignaled;	// queued transactions not yet signalled (changed under gXeFlipLock)
+ static SInt64 gXeFlipUnsignaledSince;	// mach_absolute_time() when gXeFlipUnsignaled went 0 -> 1
+ static unsigned int gXeFlipRingRun;	// consecutive frames on a surface other than the front and the one before
++/* §37.13: E2 is kept out of every display reconfiguration.  Both E2 failures (2026-11-02 23:40 at shutdown, 11-03 00:25
++   right after WindowServer came up with E2 on from boot) hung two CPUs with interrupts off while the display was being set
++   up or torn down; ten seconds of steady compositing with E2 on were fine.  So: no early signal for 60 s after the first
++   compositor transaction, 10 s around a mode change, 2 s around an adapter present, 1 s after the compositor paused for
++   more than 0.5 s, and never again once the system starts to shut down or restart. */
++static uint64_t gXeE2HoldUntil;		// mach_absolute_time() before which E2 does not signal early
++static volatile int gXeE2Halt;		// system shutdown / restart under way
++static uint64_t gXeE2LastQueue;		// when the last compositor transaction was queued
++static void nvXeE2Hold(unsigned ms, const char *why)
++{
++    uint64_t now = mach_absolute_time(), d = 0;
++    nanoseconds_to_absolutetime((uint64_t)ms * 1000000ull, &d);
++    if (now + d > gXeE2HoldUntil) gXeE2HoldUntil = now + d;
++    gXeFlipRingRun = 0;
++    static SInt32 said;
++    if (gIopXeEarly && OSIncrementAtomic(&said) < 24) ALOG("iop: E2 held for %u ms (%s)", ms, why);
++}
++static IOReturn nvXeE2PowerNote(void *, void *, UInt32 msg, IOService *, void *, vm_size_t)
++{
++    if (msg == kIOMessageSystemWillPowerOff || msg == kIOMessageSystemWillRestart) {
++        gXeE2Halt = 1; gXeFlipRingRun = 0;
++        ALOG("iop: system %s -- E2 off for the rest of this boot", msg == kIOMessageSystemWillRestart ? "restart" : "power-off");
++    }
++    return kIOReturnSuccess;
++}
+ static bool gXeFlipLastEarly;		// the last armed frame was signalled before its latch
+ static SInt64 gCntXeEarlySignals, gCntXeEarlyHazards;
+ /* §32.14 (native-display docs/32-FRAME-RATE.md): per-frame ordering.  When the compositor's transaction is queued the
+@@ -1795,11 +1874,11 @@
+ static void nvAccelIopWaitVblank(void)
+ {
+     if (!gIopVblank || !gDispMmio) { OSAddAtomic64(1, &gCntIopVblankSkips); return; }
+-    const uint32_t before = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    const uint32_t before = nvXeRd(NV_DISP_FRAME_COUNTER);
+     const uint64_t t0 = mach_absolute_time();
+     for (;;) {
+         IOSleep(1);
+-        if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != before) break;
++        if (nvXeRd(NV_DISP_FRAME_COUNTER) != before) break;
+         if (nvIopUsBetween(t0, mach_absolute_time()) > 25000) { OSAddAtomic64(1, &gCntIopVblankSkips); return; }
+     }
+     const SInt64 us = nvIopUsBetween(t0, mach_absolute_time());
+@@ -1857,38 +1936,188 @@
+ // default (a day of use with page-off, 2026-10-31); boot argument xegfxtile4=0 starts with it off, and the sysctl still
+ // switches it at run time.
+ static int gIopXeTile4 = 1;
+-static int gXePlaneTile4 = -1;		// the plane's layout: -1 not read yet, 0 linear, 1 Tile4
++static int gXePlaneTile4 = -1;		// the plane's layout: -1 not read yet, 0 linear, 1 Tile4, 2 Tile4 + RC CCS (§37.14)
+ static SInt64 gCntXeTile4Frames, gCntXeTile4Switches, gCntXeTile4Fail;
+ static uint64_t gXeTile4WindowAbs; static int gXeTile4WindowSwitches;
+-static int nvXePlaneLayoutEnsure(int want)
++
++// --- §37.14 phase 2: compressed scanout (native-display docs/37-RENDER-COMPRESSION.md).  The plugin draws a scanout
++// surface into a private MTL_RC_CCS image of its own (a GEM object in WindowServer's DRM file, pinned by the core's
++// BO_SCANOUT ioctl, which gives it a token) and registers it here with selector 9: (surface ID, token, main pitch, CCS
++// offset, CCS pitch).  A flip of that surface then maps the object's pages -- pixels and CCS -- into the GGTT slot and
++// scans it with layout 2 (i915 programs PLANE_AUX_DIST from the placeholder, which has the same CCS offset and pitch);
++// the surface's own pages are left alone (no page-off before the scan; the CPU still gets the newest content through
++// page-off).  Selector 10 (surface ID, token) unregisters, refused (busy) while the display may still scan the object.
++// debug.xegfxaccel_iop_xe_ccs: 1 on (the default since 11-03, §37.17: stable with the per-client entries), 0 off; boot argument
++// xegfxccs=0 starts with it off.  The plugin makes compressed images only when WindowServer started with its switch.
++static int gIopXeCcs = 1;
++static SInt64 gCntXeCcsFrames, gCntXeCcsRegs, gCntXeCcsFail;
++static unsigned int gXeCcsPlaneOff, gXeCcsPlanePitch;	// the CCS offset and pitch the plane was committed with
++struct NVXeCcsImg {
++    unsigned int sid, token, mainPitch, ccsOff, ccsPitch, npages, busy;
++    unsigned int retired;	// a newer image of the surface was registered: kept only until it is unregistered
++    void *client;	// the DRM client that registered it: its images go when it closes (§37.17)
++    unsigned long long bytes;
++    unsigned long long *phys;	// IOMalloc'd, npages entries
++};
++#define NV_XE_CCS_MAX 8
++static NVXeCcsImg gXeCcs[NV_XE_CCS_MAX];
++static IOLock *gXeCcsLock;
++static unsigned int gXeCcsFrontTok, gXeCcsPrevTok, gXeCcsUncertainTok;	// tokens the display may still scan
++static IOLock *nvXeCcsLock(void)
+ {
++    if (!gXeCcsLock) {
++        IOLock *l = IOLockAlloc();
++        if (l && !OSCompareAndSwapPtr(nullptr, l, (void * volatile *)&gXeCcsLock)) IOLockFree(l);
++    }
++    return gXeCcsLock;
++}
++static int nvXePlaneLayoutEnsure(int want, unsigned int ccsOff = 0, unsigned int ccsPitch = 0)
++{
+     if (gXePlaneTile4 < 0) {
+         int cur = 0;
+         if (nvAccelResidentCall("xgPlaneLayout", (void *)(intptr_t)-1, &cur, nullptr, nullptr) != kIOReturnSuccess) return 0;
+         gXePlaneTile4 = cur;
+     }
+-    if (want == gXePlaneTile4) return gXePlaneTile4;
++    if (want == gXePlaneTile4 && (want != 2 || (ccsOff == gXeCcsPlaneOff && ccsPitch == gXeCcsPlanePitch))) return gXePlaneTile4;
+     int cur = gXePlaneTile4;
+     const uint64_t t0 = mach_absolute_time();
+-    const IOReturn rc = nvAccelResidentCall("xgPlaneLayout", (void *)(intptr_t)want, &cur, nullptr, nullptr);
++    const IOReturn rc = want == 2 ?
++        nvAccelResidentCall("xgPlaneLayout2", (void *)(intptr_t)want, &cur, (void *)(uintptr_t)ccsOff, (void *)(uintptr_t)ccsPitch) :
++        nvAccelResidentCall("xgPlaneLayout", (void *)(intptr_t)want, &cur, nullptr, nullptr);
+     const SInt64 us = nvIopUsBetween(t0, mach_absolute_time());
+     if (rc != kIOReturnSuccess) {
+         OSAddAtomic64(1, &gCntXeTile4Fail);
+-        if (want) gIopXeTile4 = 0;	// the plugin draws linear again; the plane stays as it is
+-        ALOG("iop: Tile4: plane layout %d refused (0x%x) -- Tile4 scanout off", want, rc);
++        if (want == 2) { gIopXeCcs = 0; ALOG("iop: CCS: plane layout 2 (CCS at %u, pitch %u) refused (0x%x) -- compressed scanout off", ccsOff, ccsPitch, rc); }
++        else { if (want) gIopXeTile4 = 0;	// the plugin draws linear again; the plane stays as it is
++               ALOG("iop: Tile4: plane layout %d refused (0x%x) -- Tile4 scanout off", want, rc); }
+         return gXePlaneTile4;
+     }
+     gXePlaneTile4 = cur;
++    if (cur == 2) { gXeCcsPlaneOff = ccsOff; gXeCcsPlanePitch = ccsPitch; }
+     nvXeJoinerRefresh("Tile4 layout");
+     const SInt64 n = OSAddAtomic64(1, &gCntXeTile4Switches);
+     // A layout that flips back and forth (copied frames between Tile4 ones) costs a plane commit each time: more than 20
+     // switches within 10 s turn Tile4 off rather than commit on every frame.
+     uint64_t winNs = 0; absolutetime_to_nanoseconds(t0 - gXeTile4WindowAbs, &winNs);
+     if (!gXeTile4WindowAbs || winNs > 10000000000ull) { gXeTile4WindowAbs = t0; gXeTile4WindowSwitches = 0; }
+-    if (++gXeTile4WindowSwitches > 20 && gIopXeTile4) { gIopXeTile4 = 0; ALOG("iop: Tile4: %d layout switches in 10 s -- Tile4 scanout off", gXeTile4WindowSwitches); }
+-    if (n < 16 || (n & 0xff) == 0) ALOG("iop: Tile4: plane now %s (%lld us, switch %lld)", cur ? "Tile4" : "linear", (long long)us, (long long)n + 1);
++    if (++gXeTile4WindowSwitches > 20 && (gIopXeTile4 || gIopXeCcs)) {
++        if (gIopXeCcs) { gIopXeCcs = 0; ALOG("iop: CCS: %d layout switches in 10 s -- compressed scanout off", gXeTile4WindowSwitches); }
++        else { gIopXeTile4 = 0; ALOG("iop: Tile4: %d layout switches in 10 s -- Tile4 scanout off", gXeTile4WindowSwitches); }
++        gXeTile4WindowSwitches = 0;
++    }
++    if (n < 16 || (n & 0xff) == 0)
++        ALOG("iop: Tile4: plane now %s (%lld us, switch %lld)", cur == 2 ? "Tile4 + CCS" : cur ? "Tile4" : "linear", (long long)us, (long long)n + 1);
+     return gXePlaneTile4;
++}
++// A registered compressed image of this surface, marked busy for the caller's arm: 0 none (or switched off)
++static int nvXeCcsTake(unsigned int sid, NVXeCcsImg *out)
++{
++    if (!gIopXeCcs || !gIopXeTile4 || !sid) return 0;
++    IOLock *l = nvXeCcsLock(); if (!l) return 0;
++    int found = 0;
++    IOLockLock(l);
++    for (unsigned i = 0; i < NV_XE_CCS_MAX; i++)
++        if (gXeCcs[i].sid == sid && gXeCcs[i].phys && !gXeCcs[i].retired) { gXeCcs[i].busy++; *out = gXeCcs[i]; found = 1; break; }
++    IOLockUnlock(l);
++    return found;
++}
++static void nvXeCcsFreeLocked(NVXeCcsImg *e);
++static void nvXeCcsGive(unsigned int token)
++{
++    IOLock *l = nvXeCcsLock(); if (!l) return;
++    IOLockLock(l);
++    for (unsigned i = 0; i < NV_XE_CCS_MAX; i++) if (gXeCcs[i].token == token && gXeCcs[i].busy) {
++        gXeCcs[i].busy--;
++        if (!gXeCcs[i].busy && gXeCcs[i].retired && !gXeCcs[i].client) nvXeCcsFreeLocked(&gXeCcs[i]);   // its client is gone (§37.17)
++        break;
++    }
++    IOLockUnlock(l);
++}
++static void nvXeCcsFreeLocked(NVXeCcsImg *e)
++{
++    if (e->phys) IOFree(e->phys, (vm_size_t)e->npages * sizeof(unsigned long long));
++    memset(e, 0, sizeof *e);
++}
++// selector 9: the object's pages from the core; one image per surface (a new one replaces an idle old one)
++static IOReturn nvXeCcsRegister(unsigned int sid, unsigned int token, unsigned int mainPitch, unsigned int ccsOff, unsigned int ccsPitch, void *client)
++{
++    if (!gIopXeCcs || !gIopXeTile4) return kIOReturnUnsupported;
++    if (!sid || !token || !mainPitch || (ccsOff & 0xfffu) || ccsPitch != ((mainPitch + 511u) / 512u) * 64u) return kIOReturnBadArgument;
++    const unsigned int cap = NV_XE_FLIP_MAX_PAGES;
++    unsigned long long *phys = (unsigned long long *)IOMalloc(cap * sizeof(unsigned long long));
++    if (!phys) return kIOReturnNoMemory;
++    unsigned long long out[2] = { 0, 0 };
++    IOReturn rc = nvAccelResidentCall("xgScanoutPhys", (void *)(uintptr_t)token, phys, (void *)(uintptr_t)cap, out);
++    const unsigned int npages = (unsigned int)out[0];
++    const unsigned long long bytes = out[1];
++    if (rc == kIOReturnSuccess && (npages == 0 || bytes > (unsigned long long)npages * 4096ull || (unsigned long long)ccsOff >= bytes))
++        rc = kIOReturnBadArgument;
++    if (rc != kIOReturnSuccess) {
++        IOFree(phys, cap * sizeof(unsigned long long));
++        OSAddAtomic64(1, &gCntXeCcsFail);
++        ALOG("iop: CCS: surface %u token %u: no pages (0x%x, %u pages, %llu bytes)", sid, token, rc, npages, bytes);
++        return rc;
++    }
++    unsigned long long *exact = (unsigned long long *)IOMalloc(npages * sizeof(unsigned long long));
++    if (!exact) { IOFree(phys, cap * sizeof(unsigned long long)); return kIOReturnNoMemory; }
++    memcpy(exact, phys, npages * sizeof(unsigned long long));
++    IOFree(phys, cap * sizeof(unsigned long long));
++    IOLock *l = nvXeCcsLock(); if (!l) { IOFree(exact, npages * sizeof(unsigned long long)); return kIOReturnNoMemory; }
++    IOLockLock(l);
++    int slot = -1;
++    for (unsigned i = 0; i < NV_XE_CCS_MAX && slot < 0; i++)
++        if (gXeCcs[i].sid == sid && gXeCcs[i].client == client && !gXeCcs[i].busy && gXeCcs[i].token != gXeCcsFrontTok && gXeCcs[i].token != gXeCcsPrevTok &&
++            gXeCcs[i].token != gXeCcsUncertainTok) { nvXeCcsFreeLocked(&gXeCcs[i]); slot = (int)i; }
++    for (unsigned i = 0; i < NV_XE_CCS_MAX && slot < 0; i++) if (!gXeCcs[i].sid) slot = (int)i;
++    if (slot >= 0) for (unsigned i = 0; i < NV_XE_CCS_MAX; i++) if (gXeCcs[i].sid == sid) gXeCcs[i].retired = 1;
++    if (slot >= 0) {
++        NVXeCcsImg *e = &gXeCcs[slot];
++        e->sid = sid; e->token = token; e->mainPitch = mainPitch; e->ccsOff = ccsOff; e->ccsPitch = ccsPitch;
++        e->npages = npages; e->bytes = bytes; e->phys = exact; e->busy = 0; e->client = client;
++    }
++    IOLockUnlock(l);
++    if (slot < 0) { IOFree(exact, npages * sizeof(unsigned long long)); OSAddAtomic64(1, &gCntXeCcsFail); return kIOReturnNoResources; }
++    const SInt64 n = OSAddAtomic64(1, &gCntXeCcsRegs);
++    if (n < 32 || (n & 0xff) == 0)
++        ALOG("iop: CCS: surface %u token %u registered: %llu bytes (%u pages), pitch %u, CCS at %u pitch %u", sid, token, bytes,
++             npages, mainPitch, ccsOff, ccsPitch);
++    return kIOReturnSuccess;
+ }
++// §37.17: a closing DRM client (WindowServer exits or restarts) takes its images along.  They were left behind before:
++// eight restarts filled the table, and worse, IOSurface IDs are reused -- the next WindowServer's scanout surface could
++// match a dead one's entry, and its flips mapped pages the core had already unpinned (11-03 18:2x: the top of the screen
++// white until compressed scanout was switched off).  An entry being mapped right now (busy) is only marked retired.
++static void nvXeCcsDropClient(void *client)
++{
++    IOLock *l = nvXeCcsLock(); if (!l || !client) return;
++    unsigned dropped = 0, kept = 0;
++    IOLockLock(l);
++    for (unsigned i = 0; i < NV_XE_CCS_MAX; i++) {
++        NVXeCcsImg *e = &gXeCcs[i];
++        if (!e->sid || e->client != client) continue;
++        if (e->busy) { e->retired = 1; e->client = nullptr; kept++; continue; }
++        nvXeCcsFreeLocked(e); dropped++;
++    }
++    IOLockUnlock(l);
++    if (dropped || kept) ALOG("iop: CCS: client closed, %u compressed image(s) dropped%s", dropped, kept ? " (some still being mapped: retired)" : "");
++}
++// selector 10: busy while the display may still scan it or a flip is mapping it; the plugin tries again later
++static IOReturn nvXeCcsUnregister(unsigned int sid, unsigned int token)
++{
++    IOLock *l = nvXeCcsLock(); if (!l) return kIOReturnNoMemory;
++    IOReturn rc = kIOReturnNotFound;
++    IOLockLock(l);
++    for (unsigned i = 0; i < NV_XE_CCS_MAX; i++) {
++        NVXeCcsImg *e = &gXeCcs[i];
++        if (e->sid != sid || e->token != token) continue;
++        if (e->busy || token == gXeCcsFrontTok || token == gXeCcsPrevTok || token == gXeCcsUncertainTok) { rc = kIOReturnBusy; break; }
++        nvXeCcsFreeLocked(e); rc = kIOReturnSuccess; break;
++    }
++    // a token no longer registered may still be on the panel (a newer image replaced it in the table)
++    if (rc == kIOReturnNotFound && (token == gXeCcsFrontTok || token == gXeCcsPrevTok || token == gXeCcsUncertainTok)) rc = kIOReturnBusy;
++    IOLockUnlock(l);
++    return rc;
++}
+ // The surfaces flipped lately: the plugin draws these Tile4.
+ static unsigned int gXeScanoutIds[8], gXeScanoutNext;
+ static void nvXeScanoutNote(unsigned int id)
+@@ -1899,6 +2128,7 @@
+ static unsigned int nvXeTile4Reply(unsigned int id)
+ {
+     unsigned int r = gIopXeTile4 ? 2u : 0u;
++    if (gIopXeTile4 && gIopXeCcs) r |= 4u;	// §37.14: compressed scanout is on (selector 9 takes images)
+     if (id) for (unsigned i = 0; i < 8; i++) if (gXeScanoutIds[i] == id) { r |= 1u; break; }
+     return r;
+ }
+@@ -1981,20 +2211,39 @@
+ {
+     if (gXeFlipUncertain) return false;
+     if (!gDispMmio || !s) return (false);
+-#ifdef NMX_XEGFX
+-    nvXePoBeforeScan(s->getSurfaceID(), "flip");   // §36.12: the pages must hold the newest frame before they are scanned
++    { static int tries; if (!gXeMmioBegin && tries < 4) { tries++;   // §37.15
++        void *b = nullptr, *e = nullptr;
++        if (nvAccelResidentCall("xgMmioHooks", &b, &e, nullptr, nullptr) == kIOReturnSuccess && b && e) {
++            gXeMmioEnd = (NVXeMmioEnd)e; gXeMmioBegin = (NVXeMmioBegin)b;
++            ALOG("iop: display register reads are recorded on the core's watchdog slots");
++        } } }
++    // §37.14: a surface the plugin draws into a registered compressed image is scanned from that image's pages
++    NVXeCcsImg ccs = {};
++    bool useCcs = nvXeCcsTake(s->getSurfaceID(), &ccs) != 0;
++    if (useCcs && (ccs.mainPitch != pitch || (gXeFlipSlots && ccs.bytes > gXeFlipBytes) || ccs.bytes > NV_XE_FLIP_SLOT_BYTES)) {
++        nvXeCcsGive(ccs.token); useCcs = false; OSAddAtomic64(1, &gCntXeCcsFail);
++    }
++    int tile4 = -1;
++    if (useCcs) {
++        tile4 = nvXePlaneLayoutEnsure(2, ccs.ccsOff, ccs.ccsPitch);
++        if (tile4 != 2) { nvXeCcsGive(ccs.token); useCcs = false; OSAddAtomic64(1, &gCntXeCcsFail); }
++    }
++#ifdef NMX_XEGFX
++    if (!useCcs) nvXePoBeforeScan(s->getSurfaceID(), "flip");   // §36.12: the pages must hold the newest frame before they are scanned
+ #endif
+-    const unsigned long long bytes = (unsigned long long)pitch * (unsigned long long)h;
+-    if (bytes == 0 || bytes > 64ull * 1024 * 1024) return (false);
++    const unsigned long long bytes = useCcs ? ccs.bytes : (unsigned long long)pitch * (unsigned long long)h;
++    if (bytes == 0 || bytes > 64ull * 1024 * 1024) { if (useCcs) nvXeCcsGive(ccs.token); return (false); }
+     // The reserved GGTT slots are a fixed window each (xg_flip_init sized them); mapping a larger surface into one
+     // would write the PTE range of the next slot.  The adapter can reserve them first with its own size, so check.
+-    if (gXeFlipSlots && bytes > gXeFlipBytes) { OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
++    if (gXeFlipSlots && bytes > gXeFlipBytes) { if (useCcs) nvXeCcsGive(ccs.token); OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
+     // §32.16: scan this frame with the layout its surface's newest content was drawn in
+-    const int tile4 = nvXePlaneLayoutEnsure(gIopXeTile4 && nvSurfLayoutGet(s->getSurfaceID()) ? 1 : 0);
++    if (!useCcs) tile4 = nvXePlaneLayoutEnsure(gIopXeTile4 && nvSurfLayoutGet(s->getSurfaceID()) ? 1 : 0);
++    // from here every return releases the compressed image's busy mark (the scope guard below)
++    struct CcsGuard { unsigned int tok; ~CcsGuard() { if (tok) nvXeCcsGive(tok); } } ccsGuard = { useCcs ? ccs.token : 0u };
+     {
+         // PLANE_STRIDE_1_A: 64-byte units when linear, 128-byte Tile4 rows when tiled.  The accel writes only PLANE_SURF;
+         // the stride is whatever the plane's owner (the firmware, or i915 since K2) programmed for the desktop size.
+-        const unsigned int strideBytes = (gDispMmio[NV_PLANE_STRIDE_A / 4] & 0x3fffu) * (tile4 > 0 ? 128u : 64u);
++        const unsigned int strideBytes = (nvXeRd(NV_PLANE_STRIDE_A) & 0x3fffu) * (tile4 > 0 ? 128u : 64u);
+         if (strideBytes && strideBytes != pitch) {
+             const SInt64 n = OSAddAtomic64(1, &gCntXeFlipStride);
+             if (n < 8 || (n & 0xfff) == 0)
+@@ -2005,7 +2254,7 @@
+     }
+     if (!gXeFlipSlots) {
+         unsigned int n = 0;
+-        const unsigned long long slotBytes = bytes > NV_XE_FLIP_MAX_DESKTOP_BYTES ? bytes : NV_XE_FLIP_MAX_DESKTOP_BYTES;
++        const unsigned long long slotBytes = bytes > NV_XE_FLIP_SLOT_BYTES ? bytes : NV_XE_FLIP_SLOT_BYTES;
+         if (nvAccelResidentCall("xgFlipInit", (void *)(uintptr_t)slotBytes, (void *)(uintptr_t)3,
+                 gXeFlipGgtt, &n) != kIOReturnSuccess || n == 0) {
+             OSAddAtomic64(1, &gCntXeFlipFail);
+@@ -2020,6 +2269,12 @@
+         if (slot != gXeFlipLive) break;
+     }
+     if (slot == gXeFlipLive) { OSAddAtomic64(1, &gCntXeFlipMiss); return (false); }
++    if (useCcs) {
++        // §37.14: the object stays pinned by its token until the plugin unregisters it (refused while it is scanned)
++        const IOReturn ccsRc = nvAccelResidentCall("xgFlipMap", (void *)(uintptr_t)slot, ccs.phys, (void *)(uintptr_t)ccs.npages,
++                                                   (void *)(uintptr_t)bytes);
++        if (ccsRc != kIOReturnSuccess) { OSAddAtomic64(1, &gCntXeCcsFail); OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
++    } else {
+     IOMemoryDescriptor *md = s->getMemoryDescriptor();
+     if (!md || md->getLength() < bytes) { OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
+     if (md->prepare(kIODirectionNone) != kIOReturnSuccess) { OSAddAtomic64(1, &gCntXeFlipFail); return (false); }
+@@ -2045,6 +2300,7 @@
+         OSAddAtomic64(1, &gCntXeFlipFail);
+         return (false);
+     }
++    }
+     if (waitIdle) {
+         SInt64 idleUs = 0;
+         // A GPU that stays busy past idle_ms (another client, or WindowServer redrawing everything at 3840x2400
+@@ -2075,23 +2331,24 @@
+         }
+         gXeDeferIdleLastUs = idleUs; if (idleUs > gXeDeferIdleMaxUs) gXeDeferIdleMaxUs = idleUs;
+     }
+-    const uint32_t f0 = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
+-    const uint32_t previousSurf = gDispMmio[NV_PLANE_SURF_A / 4];
++    const uint32_t f0 = nvXeRd(NV_DISP_FRAME_COUNTER);
++    const uint32_t previousSurf = nvXeRd(NV_PLANE_SURF_A);
+     nvXeSurfWrite((uint32_t)gXeFlipGgtt[slot]);	/* the arming write (both halves when joined) */
+     const uint64_t t0 = mach_absolute_time();
+     nvXeTlNote(&NVXeTl::arm);	// §37.9
+     if (armed) armed(armedArg);
+     bool latched = false;
+     while (nvIopUsBetween(t0, mach_absolute_time()) < 25000) {
+-        if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != f0) { latched = true; nvXeTlNote(&NVXeTl::latch); break; }
++        if (nvXeRd(NV_DISP_FRAME_COUNTER) != f0) { latched = true; nvXeTlNote(&NVXeTl::latch); break; }
+         IODelay(250);
+     }
+     if (!latched) {
+         // The display may still be scanning the previous front. Preserve its
+         // reference chain and restore the arming register before returning.
+         nvXeSurfWrite(previousSurf);
+-        (void)gDispMmio[NV_PLANE_SURF_A / 4];
++        (void)nvXeRd(NV_PLANE_SURF_A);
+         gXeFlipUncertain = s; ((OSObject *)s)->retain();
++        gXeCcsUncertainTok = useCcs ? ccs.token : 0;	// §37.14: its object stays registered until home is confirmed
+         gIopXeFlip = 0; gIopXeDefer = 0;
+         OSAddAtomic64(1, &gCntXeFlipFail);
+         return false;
+@@ -2099,9 +2356,11 @@
+     nvAccelXeFlipDrop(&gXeFlipPrev);
+     gXeFlipPrev = gXeFlipFront;
+     gXeFlipFront = s; ((OSObject *)s)->retain();
++    gXeCcsPrevTok = gXeCcsFrontTok; gXeCcsFrontTok = useCcs ? ccs.token : 0;	// §37.14
+     gXeFlipLive = slot; gXeFlipNext = slot + 1;
+     nvXeScanoutNote(s->getSurfaceID());
+     if (tile4 > 0) OSAddAtomic64(1, &gCntXeTile4Frames);
++    if (useCcs) OSAddAtomic64(1, &gCntXeCcsFrames);
+     const SInt64 armUs = nvIopUsBetween(t0, mach_absolute_time());
+     gXeDeferArmLastUs = armUs; if (armUs > gXeDeferArmMaxUs) gXeDeferArmMaxUs = armUs;
+     if (latched) OSAddAtomic64(1, &gCntXeFlip); else OSAddAtomic64(1, &gCntXeFlipFail);
+@@ -2124,7 +2383,7 @@
+         if (gXeFlipLock) IOLockLock(gXeFlipLock);
+         const bool busy = gXeFlipQHead != gXeFlipQTail ||
+             __atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0;
+-        if (!busy) __atomic_store_n(&gXePresentActive, 1, __ATOMIC_RELEASE);
++        if (!busy) { __atomic_store_n(&gXePresentActive, 1, __ATOMIC_RELEASE); nvXeE2Hold(2000, "adapter present"); }
+         if (gXeFlipLock) IOLockUnlock(gXeFlipLock);
+         bool ok = !busy && nvAccelXeFlipArm(s, w, h, pitch, false);
+         if (!busy) __atomic_store_n(&gXePresentActive, 0, __ATOMIC_RELEASE);
+@@ -2225,7 +2484,9 @@
+                      (long long)n + 1);
+         }
+         gXeFlipRingRun = (p.s == gXeFlipFront || p.s == gXeFlipPrev) ? 0 : gXeFlipRingRun + 1;
+-        const bool early = gIopXeEarly && gXeFlipRingRun >= NV_XE_EARLY_RUN;
++        const bool early = gIopXeEarly && !gXeE2Halt && gXeFlipRingRun >= NV_XE_EARLY_RUN &&
++                           mach_absolute_time() >= gXeE2HoldUntil &&
++                           __atomic_load_n(&gXePresentActive, __ATOMIC_ACQUIRE) == 0;	// §37.13
+         NVXeFlipSignal sg = { p.pipe, gen, false };
+         NVXeTl *tl = &gXeTl[gXeTlN % 256];	// §37.9
+         bzero(tl, sizeof *tl); tl->q = p.tq; tl->pop = mach_absolute_time(); tl->sid = p.s->getSurfaceID(); tl->early = early;
+@@ -2264,6 +2525,13 @@
+     }
+     if (!gXeFlipCall) gXeFlipCall = thread_call_allocate(nvAccelXeFlipDeferRun, nullptr);
+     if (!gXeFlipLock || !gXeFlipCall) { OSAddAtomic64(1, &gCntXeDeferDropped); return; }
++    {   // §37.13
++        const uint64_t now = mach_absolute_time(), last = gXeE2LastQueue;
++        uint64_t gapNs = 0; if (last && now > last) absolutetime_to_nanoseconds(now - last, &gapNs);
++        if (!last) nvXeE2Hold(60000, "first compositor transaction");
++        else if (gapNs > 500000000ull) nvXeE2Hold(1000, "compositor paused");
++        gXeE2LastQueue = now;
++    }
+     ((OSObject *)s)->retain();
+     ((OSObject *)pipe)->retain();
+     void *snap = nvAccelXeSnapTake();	// §32.14: everything submitted up to this transaction, the composite included
+@@ -2317,7 +2585,7 @@
+ {
+     if (nsOut) *nsOut = 0;
+     if (!gDispMmio) return 0;
+-    const unsigned int raw = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    const unsigned int raw = nvXeRd(NV_DISP_FRAME_COUNTER);
+     for (int attempt = 0; attempt < 8; attempt++) {
+         const unsigned long long st = __atomic_load_n(&gXeVblankState, __ATOMIC_ACQUIRE);
+         const unsigned int last = (unsigned int)st;
+@@ -2421,7 +2689,7 @@
+     if (gXeFlipLock) IOLockLock(gXeFlipLock);
+     const bool deferBusy = (gXeFlipQHead != gXeFlipQTail) ||
+                            (__atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0);
+-    if (!deferBusy) __atomic_store_n(&gXePresentActive, 1, __ATOMIC_RELEASE);
++    if (!deferBusy) { __atomic_store_n(&gXePresentActive, 1, __ATOMIC_RELEASE); nvXeE2Hold(2000, "adapter present"); }
+     if (gXeFlipLock) IOLockUnlock(gXeFlipLock);
+     if (deferBusy) {
+         IOLockUnlock(gXePresentLock);
+@@ -2433,8 +2701,8 @@
+     IOReturn rc = kIOReturnSuccess;
+     (void)nvXePlaneLayoutEnsure(0);	// §32.16: a copied frame and the boot scanout are linear
+     const uint64_t tStart = mach_absolute_time();
+-    const uint32_t prevSurf = gDispMmio[NV_PLANE_SURF_A / 4];
+-    const uint32_t f0 = gDispMmio[NV_DISP_FRAME_COUNTER / 4];
++    const uint32_t prevSurf = nvXeRd(NV_PLANE_SURF_A);
++    const uint32_t f0 = nvXeRd(NV_DISP_FRAME_COUNTER);
+     unsigned int wroteGgtt = 0;
+     unsigned int presentSlot = ~0u;	/* the reserved slot this present mapped, if any */
+     bool latched = false;
+@@ -2449,12 +2717,14 @@
+             if (p->phys >= 0x100000000ull || (p->phys & 0xfffull)) { rc = kIOReturnBadArgument; break; }
+             if (!gXeFlipSlots) {
+                 unsigned int n = 0;
+-                if (nvAccelResidentCall("xgFlipInit", (void *)(uintptr_t)bytes, (void *)(uintptr_t)3,
++                // A2: the compositor's frames use these slots later -- size them for the largest of those, not this one
++                const unsigned long long slotBytes = bytes > NV_XE_FLIP_SLOT_BYTES ? bytes : NV_XE_FLIP_SLOT_BYTES;
++                if (nvAccelResidentCall("xgFlipInit", (void *)(uintptr_t)slotBytes, (void *)(uintptr_t)3,
+                         gXeFlipGgtt, &n) != kIOReturnSuccess || n == 0) {
+                     rc = kIOReturnNotReady;
+                     break;
+                 }
+-                gXeFlipSlots = n; gXeFlipBytes = bytes; gXeFlipNext = 0;
++                gXeFlipSlots = n; gXeFlipBytes = slotBytes; gXeFlipNext = 0;
+                 ALOG("present: reserved %u zero-copy GGTT slots x %llu bytes for adapter frames", n, bytes);
+             } else if (bytes > gXeFlipBytes) {
+                 rc = kIOReturnBadArgument;
+@@ -2481,8 +2751,8 @@
+             rc = kIOReturnBadArgument;
+             break;
+         }
+-        if (gDispMmio[NV_PLANE_SURF_A / 4] != wroteGgtt) {
+-            const uint32_t got = gDispMmio[NV_PLANE_SURF_A / 4];
++        if (nvXeRd(NV_PLANE_SURF_A) != wroteGgtt) {
++            const uint32_t got = nvXeRd(NV_PLANE_SURF_A);
+             if (prevSurf) nvXeSurfWrite(prevSurf);
+             rc = kIOReturnNoDevice;
+             ALOG("present: PLANE_SURF_1_A read back 0x%x, expected 0x%x -- previous frame put back", got, wroteGgtt);
+@@ -2490,7 +2760,7 @@
+         }
+         if (!noWait) {
+             while (nvIopUsBetween((uint64_t)tStart, mach_absolute_time()) < 25000) {
+-                if (gDispMmio[NV_DISP_FRAME_COUNTER / 4] != f0) { latched = true; break; }
++                if (nvXeRd(NV_DISP_FRAME_COUNTER) != f0) { latched = true; break; }
+                 IOSleep(1);
+             }
+             if (!latched) {
+@@ -2579,7 +2849,7 @@
+     if (nvXePresentReady(&fb, &why)) pi->flags |= NVXE_PRESENT_INFO_READY;
+     if (gXeFlipQHead != gXeFlipQTail || __atomic_load_n(&gXeFlipBusy, __ATOMIC_ACQUIRE) != 0)
+         pi->flags |= NVXE_PRESENT_INFO_BUSY;
+-    pi->planeSurfGgtt = gDispMmio ? gDispMmio[NV_PLANE_SURF_A / 4] : 0;
++    pi->planeSurfGgtt = gDispMmio ? nvXeRd(NV_PLANE_SURF_A) : 0;
+     return kIOReturnSuccess;
+ }
+ 
+@@ -2661,7 +2931,7 @@
+     if (si.version != NVXE_ABI_VERSION || si.size != sizeof(si) ||
+         !(si.flags & NVXE_SCANOUT_READY) || !si.phys || !si.kva || !si.ggtt ||
+         !si.width || !si.height || si.pitch < 4ull * si.width) return kIOReturnNotReady;
+-    if (!gXeFlipUncertain && gDispMmio && gDispMmio[NV_PLANE_SURF_A / 4] == si.ggtt) return kIOReturnSuccess;
++    if (!gXeFlipUncertain && gDispMmio && nvXeRd(NV_PLANE_SURF_A) == si.ggtt) return kIOReturnSuccess;
+     XeGfxPresent frame = {};
+     frame.version = NVXE_ABI_VERSION; frame.size = sizeof(frame);
+     frame.phys = si.phys; frame.kva = si.kva; frame.ggtt = si.ggtt;
+@@ -2677,6 +2947,7 @@
+         nvAccelXeFlipDrop(&gXeFlipUncertain);
+         nvAccelXeFlipDrop(&gXeFlipPrev);
+         nvAccelXeFlipDrop(&gXeFlipFront);
++        gXeCcsUncertainTok = gXeCcsPrevTok = gXeCcsFrontTok = 0;	// §37.14: the adapter's buffer is on the panel
+         gXeFlipLive = ~0u;
+     }
+     return presentRc;
+@@ -2928,7 +3199,7 @@
+     nvAccelIopHome(fb, head);
+     nvAccelIopWaitVblank();
+     const unsigned int surfID = s ? (unsigned)s->getSurfaceID() : 0u;
+-    const unsigned int frameNow = gDispMmio ? gDispMmio[NV_DISP_FRAME_COUNTER / 4] : 0u;
++    const unsigned int frameNow = gDispMmio ? nvXeRd(NV_DISP_FRAME_COUNTER) : 0u;
+     if (gIopLastSurf && surfID == gIopLastSurf) OSAddAtomic64(1, &gCntIopSurfRepeat);
+     if (gIopLastFrameAtCopy && frameNow == gIopLastFrameAtCopy) OSAddAtomic64(1, &gCntIopSameRefresh);
+     gIopLastSurf = surfID;
+@@ -2968,7 +3239,7 @@
+     nvIopStat(&gIopCopyLastUs, &gIopCopyMaxUs, &gIopCopySumUs, nvIopUsBetween(copyStart, mach_absolute_time()));
+     if (gIopCopyLastUs > 12000) OSAddAtomic64(1, &gCntIopCopyOverrun);
+     {
+-        const unsigned int frameEnd = gDispMmio ? gDispMmio[NV_DISP_FRAME_COUNTER / 4] : 0u;
++        const unsigned int frameEnd = gDispMmio ? nvXeRd(NV_DISP_FRAME_COUNTER) : 0u;
+         if (frameNow && frameEnd && frameEnd != frameNow) OSAddAtomic64(1, &gCntIopCopyCross);
+         if (src) {
+             unsigned d = 0;
+@@ -3596,6 +3867,17 @@
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_tile4_fail);
+       { int t4 = 1; if (PE_parse_boot_argn("xegfxtile4", &t4, sizeof t4)) gIopXeTile4 = t4 ? 1 : 0;   // §37.10
+         ALOG("iop: Tile4 scanout %s at start%s", gIopXeTile4 ? "on" : "off", gIopXeTile4 ? "" : " (boot argument xegfxtile4=0)"); }
++      extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_ccs, sysctl__debug_nvaccel_iop_xe_ccs_frames,
++          sysctl__debug_nvaccel_iop_xe_ccs_regs, sysctl__debug_nvaccel_iop_xe_ccs_fail;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs_frames);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs_regs); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs_fail);
++      { int c = 1; if (PE_parse_boot_argn("xegfxccs", &c, sizeof c)) gIopXeCcs = c ? 1 : 0;   // §37.14, §37.17
++        ALOG("iop: compressed scanout %s at start%s", gIopXeCcs ? "on" : "off", gIopXeCcs ? "" : " (boot argument xegfxccs=0)"); }
++      // §37.13: E2 stops at system power-off / restart.  Registered here, at the accelerator's start, not from the
++      // compositor's transaction path: registering from WindowServer's display thread during its bring-up (accel
++      // 61fe51bc1751) left the desktop frozen with only the cursor moving.
++      { static IONotifier *pn; if (!pn) pn = registerPrioritySleepWakeInterest(nvXeE2PowerNote, nullptr, nullptr);
++        ALOG("iop: E2 power-off watch %s", pn ? "registered" : "NOT registered"); }
+       extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_locks, sysctl__debug_nvaccel_iop_xe_po, sysctl__debug_nvaccel_iop_xe_tl;
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_locks); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_po);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_tl); }
+@@ -3825,6 +4107,21 @@
+     ((OSObject *)surf)->release();
+     return 1;
+ }
++// §37.17: selector 11 -- the surface's descriptor to the core for an import by surface (the core retains it)
++static IOReturn nvXeSurfTicket(unsigned int id, uint64_t *ticket, uint64_t *size)
++{
++    void *root = nvXeSurfRoot();
++    if (!root || !id) return kIOReturnNotReady;
++    void *surf = _ZN13IOSurfaceRoot13lookupSurfaceEjP4task(root, id, current_task());
++    if (!surf) return kIOReturnNotFound;
++    IOMemoryDescriptor *md = ((IOSurface *)surf)->getMemoryDescriptor();
++    unsigned int t = 0; unsigned long long sz = 0;
++    const IOReturn rc = md ? nvAccelResidentCall("xgSurfTicket", md, current_task(), &t, &sz) : kIOReturnNotFound;
++    ((OSObject *)surf)->release();
++    if (rc != kIOReturnSuccess) return rc;
++    *ticket = t; *size = sz;
++    return kIOReturnSuccess;
++}
+ static void nvXeLockWatch(unsigned int id)
+ {
+     if (!gXeLockLock) {
+@@ -4036,6 +4333,40 @@
+     if (e < &gXePo[0] || e >= &gXePo[64]) return;
+     nvXePoPageoff(e, cache, "lock", 300);
+ }
++// §37.14 (docs/37-RENDER-COMPRESSION.md): CoreDisplay sets each frame's surface on the display plane with
++// IOAccelerator's setPlaneIOSurface, which calls IOSurfaceBindAccel(surface, the display pipe's accelerator ID, 0).  In
++// the kernel IOSurface::bind_accel -> synchronize_device_caches(ID, 0) leaves the current device cache alone only when
++// that cache's accelerator ID (+0x48) and plane (+0x54) are the ones asked for; otherwise it pages it off (and waits) --
++// a 17 ms copy back to the pages inside every display transaction (11-03 17:2x sample: 458 ms of 8 s in
++// IOSurfaceClientBindAccel), which demoted every compressed scanout image within a second.  So our caches carry this
++// accelerator's own ID, as the family's caches do (IOGraphicsAccelerator2::deviceCacheForIOSurface passes the ID it
++// keeps at +0x178): binding to the display we drive is no sync, a CPU lock (ID 0) or another device still pages off,
++// and the flip pages a frame off itself before it scans its pages (nvXePoBeforeScan).  The ID is read from a cache the
++// family made on the same surface for this accelerator (key: the accelerator), else from +0x178 (macOS 25G241).
++static unsigned int gXeDcAccelId;
++static unsigned int nvXeDcAccelId(void *surf)
++{
++    if (gXeDcAccelId) return gXeDcAccelId;
++    if (!gXeAccelObj || !surf) return NVXE_DC_ACCEL_ID;
++    unsigned int fam = 0;
++    IOLock *sl = *(IOLock *const *)((const char *)surf + 0x50);   // the surface's lock (deviceCacheForAccelerator takes it)
++    if (sl) {
++        IOLockLock(sl);
++        for (const char *c = *(const char *const *)((const char *)surf + 0x40); c; c = *(const char *const *)(c + 0x30))
++            if (*(void *const *)(c + 0x18) == (void *)gXeAccelObj) { fam = *(const uint32_t *)(c + 0x48); break; }
++        IOLockUnlock(sl);
++    }
++    const unsigned int off = *(const uint32_t *)((const char *)gXeAccelObj + 0x178);
++    static bool said;
++    if (fam) {
++        gXeDcAccelId = fam;
++        ALOG("page-off: device caches carry the accelerator's IOSurface ID %u (a family cache's; +0x178 holds %u%s)", fam, off,
++             fam == off ? "" : " -- DIFFERENT");
++        return fam;
++    }
++    if (!said) { said = true; ALOG("page-off: no family cache on surface yet; device caches carry +0x178's ID %u", off); }
++    return off ? off : NVXE_DC_ACCEL_ID;
++}
+ static int nvXePoCurrent(unsigned int id, task_t task, void *client)
+ {
+     if (!nvXePoInit()) return 0;
+@@ -4063,7 +4394,7 @@
+     if (!e) {
+         for (unsigned i = 0; i < 64 && !e; i++) if (!gXePo[i].id) e = &gXePo[i];
+         if (e) {
+-            void *c = _ZN9IOSurface25deviceCacheForAcceleratorEPvjj(surf, gXeDcKey, NVXE_DC_ACCEL_ID, 0);   // +1, ours
++            void *c = _ZN9IOSurface25deviceCacheForAcceleratorEPvjj(surf, gXeDcKey, nvXeDcAccelId(surf), 0);   // +1, ours (§37.14: the accelerator's ID)
+             if (c) {
+                 bzero(e, sizeof *e);
+                 e->id = id; e->surf = surf; e->cache = c; e->client = client;
+@@ -5071,10 +5402,15 @@
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_mark_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeMarkWaitMaxUs, "longest deferred-flip wait for its surface mark, us");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_tile4, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeTile4, 0,
+     "1 = WindowServer's scanout surfaces are drawn and scanned Tile4, 0 = linear (default; the plugin re-lays them out)");
+-SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_tile4_plane, CTLFLAG_RD | CTLFLAG_LOCKED, &gXePlaneTile4, 0, "the plane's layout: -1 unknown, 0 linear, 1 Tile4");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_tile4_plane, CTLFLAG_RD | CTLFLAG_LOCKED, &gXePlaneTile4, 0, "the plane's layout: -1 unknown, 0 linear, 1 Tile4, 2 Tile4 + RC CCS");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_tile4_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeTile4Frames, "frames flipped Tile4");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_tile4_switches, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeTile4Switches, "plane layout changes (each a plane-only commit)");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_tile4_fail, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeTile4Fail, "plane layout changes the core refused");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_ccs, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeCcs, 0,
++           "37.14: 1 = scan the plugin's compressed (MTL RC CCS) images of scanout surfaces");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_ccs_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeCcsFrames, "frames scanned compressed");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_ccs_regs, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeCcsRegs, "compressed images registered");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_ccs_fail, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeCcsFail, "compressed images or frames refused");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_markonly, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeMarkOnly, 0,
+     "1 = while WindowServer's surface marks are live a deferred flip waits only for its own mark (default), 0 = the fence snapshot too");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_markonly_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeMarkOnly, "deferred flips that waited only for their surface mark");
+--- a/kexts/NVRM/accel/xegfx_accel_names.h
++++ b/kexts/NVRM/accel/xegfx_accel_names.h
+@@ -308,4 +308,12 @@
+ #define sysctl__debug_nvaccel_iop_xe_tile4_switches sysctl__debug_xegfxaccel_iop_xe_tile4_switches
+ #define nvaccel_iop_xe_tile4_fail xegfxaccel_iop_xe_tile4_fail
+ #define sysctl__debug_nvaccel_iop_xe_tile4_fail sysctl__debug_xegfxaccel_iop_xe_tile4_fail
++#define nvaccel_iop_xe_ccs xegfxaccel_iop_xe_ccs
++#define sysctl__debug_nvaccel_iop_xe_ccs sysctl__debug_xegfxaccel_iop_xe_ccs
++#define nvaccel_iop_xe_ccs_frames xegfxaccel_iop_xe_ccs_frames
++#define sysctl__debug_nvaccel_iop_xe_ccs_frames sysctl__debug_xegfxaccel_iop_xe_ccs_frames
++#define nvaccel_iop_xe_ccs_regs xegfxaccel_iop_xe_ccs_regs
++#define sysctl__debug_nvaccel_iop_xe_ccs_regs sysctl__debug_xegfxaccel_iop_xe_ccs_regs
++#define nvaccel_iop_xe_ccs_fail xegfxaccel_iop_xe_ccs_fail
++#define sysctl__debug_nvaccel_iop_xe_ccs_fail sysctl__debug_xegfxaccel_iop_xe_ccs_fail
+ #endif
