@@ -1,0 +1,1377 @@
+# 0031 XeMTL plugin: compressed scanout images, IOSurface import by surface, image arena, census and compile statistics
+#
+# Base:  plugin/ after 0005 + 0006 + 0007 + 0026 (XeGfx 0.0.35 · 497d521e)
+# Files: plugin/{NVMTLEventSync.m, NVMTLObjects.h, NVMTLObjects.m, XeMTLDevice.m, nvmtl_vk.c, nvmtl_vk.h}
+# Apply: patch -p1 < patches/0031-plugin-ccs-scanout-surface-import-arena.patch
+# Build: XeMTLDriver 19bea7235828 after ad-hoc signing (needs core 0028, accel 0029, libdrm 0032)
+#
+# Compressed scanout (docs/render-compression.md):
+#   - a scanout surface that has a private copy (page-off, 0026) is drawn into a Tile4 + MTL RC CCS image instead, and
+#     the display scans that image itself, when the accel reports compressed scanout on (selector 2, flag 0x4).  The
+#     image has no fast-cleared blocks: MTL_RC_CCS has no clear colour for the display to resolve.
+#   - the image's memory is exported, its GEM handle found again in WindowServer's DRM file (drmPrimeFDToHandle) and
+#     pinned with the core's BO_SCANOUT; the core's reply size is checked against the image's memory (a stale export
+#     once named a surface import of a different size), then the image is registered with selector 9 (surface ID,
+#     token, main pitch, CCS offset and pitch) and dropped with selector 10.
+#   - a scanout surface is promoted while both compressed scanout and page-off are on; a compressed image goes back to
+#     drawing over the surface's pages when compressed scanout is switched off or 0026's page-off rules mark the
+#     surface for demotion.
+#
+# Import by surface: before ANV imports an IOSurface WindowServer draws from (a host-pointer import), the plugin asks
+# the accel for a ticket (selector 11) and announces it with the pointer and size (the core's SURF_EXPECT, on ANV's
+# DRM file); the import that follows is then made of the surface's own memory (0028).  Counters for announced and
+# refused imports are in the plugin log.
+#
+# Image arena: device images up to 8 MiB are suballocated from 64 MiB VkDeviceMemory blocks instead of one allocation
+# each (fewer GEM objects for the kernel to look up and pin on every execbuffer).  Off with XEMTL_NO_ARENA=1 or
+# /Library/GPUBundles/.xemtl-no-arena.
+#
+# Explicit residency: when ANV exports anv_xemtl_* (0033) and /Library/GPUBundles/.xemtl-no-xres is absent, imported
+# surface memory is marked explicit and each submitted part declares the imports its textures use, so the other
+# imports stay out of that execbuffer.  The published setup keeps it held off (the file exists).
+#
+# Diagnostics (all off unless asked for):
+#   - texture census: /tmp/nvmtl-texcensus-request writes /private/tmp/xemtl-texcensus.txt: images of 1024x600 or
+#     more by the path that made them (plain, heap, buffer, pages, pages-t4, pageoff, copied, vram, ccs) and size, and
+#     the passes drawn into them with their GPU time while passtime is armed.
+#   - compile statistics: XEMTL_PSTAT=1 or /private/tmp/xemtl-pstat-on at process start logs ANV's statistics for every
+#     fragment executable (instructions, SENDs, cycles, spills, SIMD width) and keeps each pipeline's SPIR-V in
+#     /private/tmp/xemtl-pstat (WindowServer's home is not writable); ptpso lines carry the fragment function's
+#     constants, which select Core Animation's shader variant.
+#   - per-draw GPU time: /tmp/nvmtl-drawtime-request together with passtime adds one timestamp per draw (shader, vertex
+#     count, scissor, first two textures).  It serialises the draws, so absolute times are too large.
+#
+--- a/plugin/NVMTLEventSync.m
++++ b/plugin/NVMTLEventSync.m
+@@ -24,6 +24,21 @@
+     BOOL copyInputsPrepared, hasHostCopies;
+ }
+ @end
++// <wtl> §37.19: the surface imports of every texture this part holds; then the list is complete (ANV leaves the other
++// marked imports out of this part's execbuffer)
++static void nvmtl_xres_declare(XeMTLSubmissionPart *part)
++{
++    extern void nvmtl_vk_cmd_use_import(nvk_cmdbuf *c, const nvk_buffer *b);
++    for (NSSet *set in @[ part->resources ?: [NSSet set], part->surfaces ?: [NSSet set] ])
++        for (id o in set) {
++            if (![o isKindOfClass:[XeMTLTexture class]]) continue;
++            XeMTLTexture *t = (XeMTLTexture *)o, *r = t->_parent ? t->_parent : t;
++            if (r->_hostState > 0 && r->_hostBuf.mem) nvmtl_vk_cmd_use_import(&part->commands, &r->_hostBuf);
++        }
++    extern void nvmtl_vk_cmd_xres_complete(nvk_cmdbuf *c);
++    nvmtl_vk_cmd_xres_complete(&part->commands);
++}
++// </wtl>
+ static _Atomic unsigned gsub_inflight;
+ static _Atomic unsigned long long gsub_ahead, gsub_peak;
+ static NSMutableArray *nvmtl_quarantined_parts;
+@@ -585,6 +600,7 @@
+         for (XeMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
+         [self nvmtlMarkScheduled];
+         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
++        nvmtl_xres_declare(part);   // <wtl> §37.19
+         const int r = nvmtl_vk_submit_begin(&part->commands, f);
+         _nextSubmit++;
+         if (r) {
+@@ -948,7 +964,7 @@
+             const nvk_image old = r->_i; r->_i = to->_i; to->_i = old;
+             const nvk_buffer hb = r->_hostBuf; const int8_t hs = r->_hostState;
+             r->_hostBuf = to->_hostBuf; r->_hostState = to->_hostState; to->_hostBuf = hb; to->_hostState = hs;
+-            r->_hostImg = YES; to->_hostImg = NO; r->_po = NO; r->_imgGen++;
++            r->_hostImg = YES; to->_hostImg = NO; r->_po = NO; r->_ccs = NO; r->_imgGen++;
+             r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
+         }
+     }
+@@ -980,6 +996,7 @@
+         @synchronized (r) {
+             const nvk_image old = r->_i; r->_i = to->_i; to->_i = old;
+             r->_hostImg = NO; r->_po = YES; r->_poDrawn = NO; r->_imgGen++;
++            nvmtl_vk_tc_made(&r->_i, NVMTL_TC_PAGEOFF);   // <wtl> §37.11
+             r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
+         }
+     }
+@@ -988,6 +1005,40 @@
+                    ^{ (void)to; });	// holds the image over the pages until then
+     nvlog("page-off: surface %u %ux%u promoted to a private copy after %u commits", sid, r->_i.w, r->_i.h, r->_poDraws);
+ }
++// <wtl> §37.14 phase 2: a scanout surface drawn over its pages becomes a private compressed image the display scans
++// itself (nvmtl_vk_image_create_ccs, registered with the accelerator).  Made from the pages on the GPU and swapped in as
++// nvmtl_po_promote does; from then on it is a page-off copy (CPU locks bring the pages up to date, linear), so the pages'
++// layout is linear again for the accelerator's fallback (a frame it cannot scan compressed is paged off and scanned
++// linear).  Once per surface.
++static void nvmtl_ccs_promote(XeMTLTexture *r)
++{
++    static _Atomic int fails;
++    const uint32_t sid = IOSurfaceGetID(r->_surf);
++    r->_ccsTried = YES;
++    { extern void nvmtl_roots_dump(uint32_t, const char *); nvmtl_roots_dump(sid, "ccs promote"); }   // §37.14 diagnosis
++    if (atomic_load(&fails) >= 3) return;
++    XeMTLTexture *to = [XeMTLTexture new]; to->_tile4 = NO; to->_ccsWant = YES;
++    if (nvmtl_surface_image_create(to, r->_surf, r->_plane, r->_i.w, r->_i.h, r->_i.fmt, r->_i.bpp, 0, r->_i.storage ? 1 : 0) || !to->_i.ccs_token) {
++        atomic_fetch_add(&fails, 1); nvlog("ccs: surface %u: no compressed image -- stays over its pages", sid); return; }
++    to->_ccsWant = NO;
++    to->_q = r->_q; to->_surf = r->_surf; CFRetain(to->_surf); to->_surfOwned = YES; to->_plane = r->_plane;
++    to->_fmt = r->_fmt; to->_usage = r->_usage; to->_stex = to->_i.storage != 0;
++    if (!nvmtl_tile4_relayout([r device], r, to)) { atomic_fetch_add(&fails, 1); nvlog("ccs: surface %u: copy from its pages failed -- stays over them", sid); return; }
++    @synchronized (nvmtl_surface_sync(r)) {
++        @synchronized (r) {
++            const nvk_image old = r->_i; r->_i = to->_i; to->_i = old;
++            r->_hostImg = NO; r->_po = YES; r->_ccs = YES; r->_poDrawn = NO; r->_tile4 = NO; to->_tile4 = YES; r->_imgGen++;
++            r->_surfSeed = IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
++        }
++    }
++    nvmtl_vk_tile4_content_set(sid, 0);
++    (void)nvmtl_vk_surface_gpu_mark2(sid, 2, 0);	// the pages are linear from now on (page-off writes them so)
++    nvmtl_po_register(r);
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * (int64_t)NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
++                   ^{ (void)to; });	// holds the image over the pages until then
++    nvlog("ccs: surface %u %ux%u is drawn compressed and scanned so", sid, r->_i.w, r->_i.h);
++}
++// </wtl>
+ // §37.7: a second root that cannot share the private copy is about to be made over the surface: the copy goes back to
+ // the pages first, so both roots then read and write the same pages
+ void nvmtl_po_demote_now(XeMTLTexture *r)
+@@ -1006,7 +1057,7 @@
+         for (XeMTLTexture *t in part->surfaces) {
+             XeMTLTexture *r = t->_parent ? t->_parent : t;
+             if (r->_po && r->_surf && !r->_hostImg && ![roots containsObject:r] &&
+-                (r->_poDemote || nvmtl_vk_is_scanout((uint32_t)IOSurfaceGetID(r->_surf)))) {   // <wtl> §36.12
++                (r->_poDemote || (r->_ccs ? !nvmtl_vk_ccs_on() : nvmtl_vk_is_scanout((uint32_t)IOSurfaceGetID(r->_surf))))) {   // <wtl> §36.12, §37.14
+                 if (!roots) { roots = [NSMutableArray new]; wants = [NSMutableArray new]; }
+                 [roots addObject:r]; [wants addObject:@(-1)]; continue;
+             }
+@@ -1016,6 +1067,13 @@
+                 [roots addObject:r]; [wants addObject:@(-2)]; continue;
+             }
+             if (!r->_surf || !r->_hostImg || r->_vramOn || [roots containsObject:r]) continue;
++            // <wtl> §37.14: a scanout surface over its pages is drawn compressed instead, when the accelerator scans that
++            if (!r->_ccsTried && r->_plane == 0 && r->_i.w >= 1024 && r->_i.h >= 600 && r->_i.bpp == 4 &&
++                nvmtl_vk_is_scanout((uint32_t)IOSurfaceGetID(r->_surf)) && nvmtl_vk_ccs_on() && nvmtl_vk_po_on()) {
++                if (!roots) { roots = [NSMutableArray new]; wants = [NSMutableArray new]; }
++                [roots addObject:r]; [wants addObject:@(-3)]; continue;
++            }
++            // </wtl>
+             const int want = nvmtl_tile4_want(r->_surf, r->_plane, r->_i.w, r->_i.h, r->_i.fmt);
+             if (want == (r->_tile4 ? 1 : 0)) continue;
+             if (!roots) { roots = [NSMutableArray new]; wants = [NSMutableArray new]; }
+@@ -1023,7 +1081,10 @@
+         }
+     }
+     for (NSUInteger i = 0; i < roots.count; i++) {
+-        if ([wants[i] intValue] == -2) {   // <wtl> §36.12
++        if ([wants[i] intValue] == -3) {   // <wtl> §37.14
++            XeMTLTexture *r = roots[i];
++            if (!nvmtl_po_denied(r->_surf) && !nvmtl_roots_others(r->_surf, r)) nvmtl_ccs_promote(r); else r->_ccsTried = YES;
++        } else if ([wants[i] intValue] == -2) {   // <wtl> §36.12
+             XeMTLTexture *r = roots[i]; const uint32_t sid = IOSurfaceGetID(r->_surf);
+             if (nvmtl_vk_po_on() && !nvmtl_vk_is_scanout(sid) && !nvmtl_po_denied(r->_surf) && !nvmtl_roots_others(r->_surf, r)) nvmtl_po_promote(r);
+             else r->_poCand = NO;
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -54,6 +54,7 @@
+   uint32_t _poCount; uint64_t _poWinNs;   // <wtl> §36.12: page-offs in the current one-second window
+   BOOL _poDrawn; uint64_t _poBornNs;      // <wtl> §36.12: the GPU drew the copy (it must reach the pages before it goes), and when it was made
+   BOOL _poCand; uint32_t _poDraws;        // <wtl> §36.12: drawn over its pages until it proves long-lived (nvmtl_po_promote); commits drawing it
++  BOOL _ccs, _ccsWant, _ccsTried;         // <wtl> §37.14: the private copy is a compressed scanout image (nvmtl_ccs_promote); make one; tried once
+   BOOL _stex;
+   uint64_t _resid;
+   NSUInteger _usage;
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -877,6 +877,7 @@
+         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu, buffer %lu B, storage %lu) -> nil (reason above)",
+               (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)_b.size, (unsigned long)_storage);
+         return nil; }
++    nvmtl_vk_tc_made(&t->_i, NVMTL_TC_BUFFER);   // <wtl> §37.11
+     t->_q = nvmtl_device_queue();
+     t->_fmt = d.pixelFormat; t->_mips = 1;
+     t->_stex = t->_i.storage != 0;
+@@ -1404,6 +1405,21 @@
+     if (t && t->_surf) @synchronized (nvmtl_surface_sync(t)) { }
+ }
+ // live roots over s other than except
++// §37.14 diagnosis: every root of surface sid, whichever IOSurfaceRef it was made through
++void nvmtl_roots_dump(uint32_t sid, const char *why)
++{
++    pthread_mutex_lock(&g_po_mu);
++    unsigned n = 0;
++    for (NSValue *k in g_surf_roots) for (XeMTLTexture *r in [g_surf_roots objectForKey:k]) {
++        if (!r->_surf || IOSurfaceGetID(r->_surf) != sid) continue;
++        nvlog("roots: %s: surface %u root %p ref %p fmt %lu %s%s%s kind %u img %p", why, sid, (__bridge void *)r, (void *)r->_surf,
++              (unsigned long)r->_fmt, r->_hostImg ? "over its pages" : r->_po ? "private copy" : "other", r->_tile4 ? " Tile4" : "",
++              r->_ccs ? " ccs" : "", r->_i.kind, r->_i.img);
++        n++;
++    }
++    pthread_mutex_unlock(&g_po_mu);
++    nvlog("roots: %s: surface %u has %u root(s)", why, sid, n);
++}
+ int nvmtl_roots_others(IOSurfaceRef s, XeMTLTexture *except)
+ {
+     int n = 0;
+@@ -1515,6 +1531,9 @@
+         }
+     }
+     // </wtl>
++    if (r->_po) { static _Atomic unsigned nsi; if (atomic_fetch_add(&nsi, 1) < 24)   // §37.14 diagnosis
++        nvlog("roots: surface %u: surface-in of its private copy %p (%s, seed %u, ours %u, synced %d) locks it", (unsigned)IOSurfaceGetID(r->_surf),
++              (__bridge void *)r, r->_ccs ? "ccs" : "page-off", IOSurfaceGetSeed(r->_surf), r->_surfSeed, (int)r->_surfSynced); }
+     uint32_t seed = 0;
+     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
+     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+@@ -1574,6 +1593,25 @@
+     }
+     // </wtl>
+     if (r->_hostImg) {   // the GPU wrote the surface's pages themselves; a write lock only moves the seed for other processes
++        { extern XeMTLTexture *nvmtl_po_root(uint32_t sid); extern void nvmtl_roots_dump(uint32_t, const char *);   // §37.14 diagnosis
++          const uint32_t sid = (uint32_t)IOSurfaceGetID(r->_surf);
++          XeMTLTexture *po = nvmtl_po_root(sid);
++          static void *seen[64]; static unsigned seenN[64]; static _Atomic unsigned nseen; int slot = -1;
++          if (po && po != r && po->_po) {
++              for (unsigned i = 0; i < 64; i++) if (seen[i] == (__bridge void *)r) { slot = (int)i; break; }
++              if (slot < 0) { const unsigned i = atomic_fetch_add(&nseen, 1); if (i < 64) { seen[i] = (__bridge void *)r; slot = (int)i; } }
++          }
++          if (slot >= 0 && seenN[slot]++ < 3) {
++              nvlog("roots: (draw %u of root %p, kind %u img %p tile4 %d po %d ccs %d surfSynced %d)", seenN[slot], (__bridge void *)r,
++                    r->_i.kind, r->_i.img, (int)r->_tile4, (int)r->_po, (int)r->_ccs, (int)r->_surfSynced);
++              nvlog("roots: surface %u: root %p (ref %p, fmt %lu%s) over its pages drew it while root %p (ref %p, fmt %lu%s) holds its private copy; drawn by:",
++                    sid, (__bridge void *)r, (void *)r->_surf, (unsigned long)r->_fmt, r->_tile4 ? ", Tile4" : "", (__bridge void *)po, (void *)po->_surf,
++                    (unsigned long)po->_fmt, po->_ccs ? ", ccs" : "");
++              NSArray *st = [NSThread callStackSymbols];
++              for (NSUInteger i = 1; i < st.count && i < 14; i++) nvlog("roots:   %s", [st[i] UTF8String]);
++              nvmtl_roots_dump(sid, "second root");
++          } }
++
+         uint32_t seed = 0;
+         if (!nvmtl_noseed() && IOSurfaceLock(r->_surf, 0, NULL) == kIOReturnSuccess) IOSurfaceUnlock(r->_surf, 0, &seed);
+         r->_surfSeed = seed ? seed : IOSurfaceGetSeed(r->_surf); r->_surfSynced = YES;
+@@ -3324,6 +3362,7 @@
+                 uint32_t h = 2166136261u; const uint8_t *b = d.bytes; for (NSUInteger i = 0; i < d.length; i++) { h ^= b[i]; h *= 16777619u; }
+                 if (s) hf = h; else hv = h;
+                 NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches/nvmtl/pstat"];
++                if (access(NSHomeDirectory().fileSystemRepresentation, W_OK) != 0) dir = @"/private/tmp/xemtl-pstat";   // <wtl> §37.19: WindowServer's home is /var/empty
+                 NSString *pth = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.%s.spv", h, s ? "frag" : "vert"]];
+                 if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) {
+                     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+@@ -3333,7 +3372,14 @@
+             objc_setAssociatedObject(p, &kPtHash, hn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+             extern int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n);
+             char st[600]; nvmtl_vk_pipeline_stats(p->_p.pipe, st, sizeof st);
+-            nvlog("ptpso: vs %08x fs %08x | %s", hv, hf, st);
++            // <wtl> §37.19: names and the fragment function's constants (index=bytes), which pick Core Animation's variant
++            NSMutableString *fcs = [NSMutableString new];
++            { id ff = p->_descriptor.fragmentFunction; NSDictionary *fc = [ff isKindOfClass:[XeMTLFunction class]] ? ((XeMTLFunction *)ff)->_fc : nil;
++              NSArray *keys = [fc.allKeys sortedArrayUsingComparator:^NSComparisonResult(id a, id b) { return [@([a integerValue]) compare:@([b integerValue])]; }];
++              for (NSString *k in keys) { NSArray *v = fc[k]; if (![v isKindOfClass:[NSArray class]]) continue; [fcs appendFormat:@" %@=", k];
++                  for (NSNumber *b in v) [fcs appendFormat:@"%02x", b.unsignedCharValue]; } }
++            nvlog("ptpso: vs %08x fs %08x %s / %s fc[%s ] | %s", hv, hf, p->_vname.UTF8String ?: "?", p->_fname.UTF8String ?: "?", fcs.UTF8String, st);
++            { extern void nvmtl_vk_pipeline_stats_frag(void *pipe, uint32_t fs); nvmtl_vk_pipeline_stats_frag(p->_p.pipe, hf); }
+         }
+         extern void nvmtl_vk_pt_note(nvk_cmdbuf *c, uint32_t fs);
+         nvmtl_vk_pt_note(&_cb->_c, (uint32_t)(hn.unsignedLongLongValue & 0xffffffffu));
+@@ -3425,6 +3471,7 @@
+     nvmtl_surface_in_for_cb(_cb, nt);
+     { XeMTLTexture *rt = nt->_parent ? nt->_parent : nt; nvtrace("FTEX[%lu] %ux%u surf %u view %d", (unsigned long)i, [nt nvi]->w, [nt nvi]->h,
+         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }
++    { extern void nvmtl_vk_dt_tex(nvk_cmdbuf *c, uint32_t i, const nvk_image *im); nvmtl_vk_dt_tex(&_cb->_c, (uint32_t)i, [(nt->_parent ? nt->_parent : nt) nvi]); }   // <wtl> §37.19
+     if (nt->_tbView) nvmtl_vk_bind_texel_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_tbView, nt->_tbStorage);
+     else {
+     if (nvmtl_vk_bind_texture_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, [nt nvsampleview])) nvlog("setFragmentTexture: bind FAILED");
+@@ -4116,6 +4163,7 @@
+     if (nvmtl_vk_image_create_typed_placed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex,
+                                             (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &_hm, off, &t->_i)) {
+         nvlog("heap newTextureWithDescriptor: %lux%lu offset:%lu FAILED", (unsigned long)d.width, (unsigned long)d.height, (unsigned long)off); return nil; }
++    nvmtl_vk_tc_made(&t->_i, NVMTL_TC_HEAP);   // <wtl> §37.11
+     t->_q = nvmtl_device_queue(); t->_stex = t->_i.storage != 0; t->_heap = self; t->_heapOffset = off;
+     nvmtl_texture_desc_swizzle(t, d);
+     nvlog("heap newTextureWithDescriptor: %lux%lu%s offset:%lu -> %p", (unsigned long)d.width, (unsigned long)d.height, t->_stex ? " +storage" : "", (unsigned long)off, (__bridge void *)t);
+@@ -4223,6 +4271,7 @@
+     t->_fmt = d.pixelFormat; t->_mips = mips; t->_usage = d.usage;
+     t->_q = nvmtl_device_queue(); t->_stex = t->_i.storage != 0;
+     t->_subHeap = self; t->_subCharge = len; t->_subPlaced = YES; t->_heapOffset = off;
++    nvmtl_vk_tc_made(&t->_i, NVMTL_TC_HEAP);   // <wtl> §37.11
+     t->_parkable = !noRecycle; memcpy(t->_pkey, key, sizeof key); t->_pkLen = len;
+     _used += len;
+     atomic_fetch_add(&gHAPlaced, 1); atomic_fetch_add(&gHALive, len);
+@@ -5449,10 +5498,12 @@
+     nvmtl_res2_cb_done(self);
+     if (!_committed && _c.cb) nvmtl_vk_cmd_abandon(&_c);
+     [self nvmtlReleaseCapacity];
+-    @synchronized ([XeMTLCommandBuffer class]) {
+-        [self nvmtlReleaseReservation];
+-        nvmtl_pump_buffers();
+-    }
++    // <wtl> §37.17 (native-display docs/37-RENDER-COMPRESSION.md): never the class lock here.  The submit threads hold
++    // it across their execbuffers, and WindowServer releases its command buffers on its main thread: 413 ms in 10 s of
++    // genie were spent waiting here.  A completed buffer's reservation is already gone (the worker released it); one
++    // still queued holds its buffer weakly, and the pump drops reservations whose buffer is gone -- so only a pump is
++    // needed, so the buffers behind it go on, and it runs off this thread.
++    if (_reservation) dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{ nvmtl_pump_buffers(); });
+ }
+ - (CFTimeInterval)GPUStartTime {
+     [_completionCondition lock];
+--- a/plugin/XeMTLDevice.m
++++ b/plugin/XeMTLDevice.m
+@@ -953,6 +953,7 @@
+     } else
+     if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+     nvmtl_alloc_ok();
++    nvmtl_vk_tc_made(&t->_i, NVMTL_TC_PLAIN);   // <wtl> §37.11
+     t->_q = nvmtl_device_queue();
+     t->_stex = t->_i.storage != 0;
+     t->_usage = d.usage;
+@@ -1007,7 +1008,7 @@
+             nvk_buffer vb;
+             if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
+                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+-                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
++                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++; nvmtl_vk_tc_made(&t->_i, NVMTL_TC_VRAM);   // <wtl> §37.11
+                     uint32_t seed = IOSurfaceGetSeed(surf);
+                     int current = nvmtl_vram_tag_current(surf, 0, seed);
+                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
+@@ -1019,7 +1020,15 @@
+                 nvmtl_vk_buffer_destroy(&vb);
+             }
+         }
++    }
++    // <wtl> §37.14: a compressed scanout image the display scans itself (nvmtl_ccs_promote asks for it)
++    if (t->_ccsWant) {
++        if (!surf || plane != 0 || a8) return -1;
++        const int rc = nvmtl_vk_image_create_ccs((uint32_t)IOSurfaceGetID(surf), w, h, vkf, bpp, stex, &t->_i);
++        if (!rc) nvmtl_vk_tc_made(&t->_i, NVMTL_TC_CCS);
++        return rc;
+     }
++    // </wtl>
+     // <wtl>
+     // Intel/AMD: the image is laid over the surface's own pages (explicit linear layout, the surface's bytesPerRow), so
+     // what the GPU draws is in the surface when the command buffer completes, and CPU writes need no upload (I-108).
+@@ -1031,6 +1040,15 @@
+             if (t->_tile4 && nvmtl_vk_image_create_buffer_alias_tile4(w, h, vkf, bpp, a8, stex, 1, &t->_hostBuf, 0, row, &t->_i)) t->_tile4 = NO;
+             if (t->_tile4 || !nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &t->_hostBuf, 0, row, &t->_i)) {
+                 t->_hostState = 1; t->_hostImg = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
++                { extern XeMTLTexture *nvmtl_po_root(uint32_t sid);   // §37.14 diagnosis: an image over the pages of a surface with a private copy
++                  XeMTLTexture *po = nvmtl_po_root((uint32_t)IOSurfaceGetID(surf)); static _Atomic unsigned nh;
++                  if (po && po->_po && atomic_fetch_add(&nh, 1) < 16) {
++                      nvlog("roots: surface %u: texture %p gets an image over its pages while %p holds its private copy%s; made by:",
++                            (unsigned)IOSurfaceGetID(surf), (__bridge void *)t, (__bridge void *)po, po->_ccs ? " (ccs)" : "");
++                      NSArray *st = [NSThread callStackSymbols];
++                      for (NSUInteger i = 1; i < st.count && i < 9; i++) nvlog("roots:   %s", [st[i] UTF8String]);
++                  } }
++                nvmtl_vk_tc_made(&t->_i, t->_tile4 ? NVMTL_TC_PAGES_T4 : NVMTL_TC_PAGES);   // <wtl> §37.11
+                 static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                     nvmtl_xd_add(XD_SURF_IMPORT, 1);
+                     nvlog("surface %u %ux%u pitch %zu -> an image in the surface's own pages (no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+@@ -1053,7 +1071,9 @@
+               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
+               : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
+     }
+-    return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
++    const int rc = nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
++    if (!rc) nvmtl_vk_tc_made(&t->_i, t->_poWant ? NVMTL_TC_PAGEOFF : NVMTL_TC_COPIED);   // <wtl> §37.11
++    return rc;
+ }
+ 
+ static char nvmtl_surface_cache_key;
+@@ -1225,6 +1245,7 @@
+     nvmtl_texture_desc_swizzle(t, d);
+     if (t->_poWant && !t->_hostImg && !t->_vramOn && nvmtl_po_prepare(t)) { t->_po = YES; nvmtl_po_register(t); }   // <wtl> §36.12: eager
+     else if (poWant && t->_hostImg && !t->_vramOn && !t->_tile4) { t->_poCand = YES; t->_poBornNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }   // <wtl> §36.12
++    if (!t->_po && t->_i.kind == NVMTL_TC_PAGEOFF) nvmtl_vk_tc_made(&t->_i, NVMTL_TC_COPIED);   // <wtl> §37.11: wanted, not made one
+     t->_poWant = NO;
+     if (key && !t->_vramOn) [cache setObject:t forKey:key];
+     nvmtl_roots_add(t);   // <wtl> §37.7
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -55,7 +55,10 @@
+ #include <unistd.h>
+ #include <limits.h>
+ #include <sys/stat.h>
++#include <sys/ioccom.h>   /* <wtl> §37.14: the core's BO_SCANOUT ioctls */
+ #include <pthread.h>
++static void nvmtl_tc_pass(uint32_t kind, uint32_t w, uint32_t h, double us);   // <wtl> §37.11
++static void nvmtl_tc_dump(void);
+ static pthread_mutex_t g_gpu_clock_lock = PTHREAD_MUTEX_INITIALIZER;
+ static inline const char *nvmtl_pick_vk(const char *staged, const char *dev) {
+     return access(staged, R_OK) == 0 ? staged : dev;
+@@ -454,7 +457,34 @@
+         }
+     }
+     return 0;
++}
++// <wtl> §37.19: one log line per fragment executable (SIMD8/16/32) of a pipeline, so they are not cut off behind the
++// vertex stage's statistics (nvlog lines end at 512 bytes)
++void nvmtl_vk_pipeline_stats_frag(void *pipe, uint32_t fs)
++{
++    if (!g_pstat || !pipe || !p_pstat_props || !p_pstat_stats) return;
++    VkPipelineInfoKHR pi = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, NULL, (VkPipeline)pipe };
++    uint32_t ne = 0; if (p_pstat_props(g_dev, &pi, &ne, NULL) != VK_SUCCESS || !ne) return;
++    VkPipelineExecutablePropertiesKHR ep[8]; if (ne > 8) ne = 8;
++    for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR };
++    if (p_pstat_props(g_dev, &pi, &ne, ep) < 0) return;
++    for (uint32_t e = 0; e < ne; e++) {
++        if (!(ep[e].stages & VK_SHADER_STAGE_FRAGMENT_BIT)) continue;
++        VkPipelineExecutableInfoKHR ei = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, (VkPipeline)pipe, e };
++        VkPipelineExecutableStatisticKHR st[24]; uint32_t ns = 24;
++        for (uint32_t i = 0; i < ns; i++) st[i] = (VkPipelineExecutableStatisticKHR){ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR };
++        if (p_pstat_stats(g_dev, &ei, &ns, st) < 0) continue;
++        char out[440]; size_t w = 0;
++        for (uint32_t i = 0; i < ns && w + 1 < sizeof out; i++) {
++            unsigned long long v = st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR ? (unsigned long long)st[i].value.i64
++                                 : st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR ? (unsigned long long)st[i].value.f64
++                                 : st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR ? (unsigned long long)st[i].value.b32 : st[i].value.u64;
++            int k = snprintf(out + w, sizeof out - w, "%s%s=%llu", w ? " " : "", st[i].name, v); if (k > 0) w += (size_t)k < sizeof out - w ? (size_t)k : sizeof out - w - 1;
++        }
++        nvlog("ptstat fs %08x %s subgroup %u: %s", fs, ep[e].name, ep[e].subgroupSize, out);
++    }
+ }
++// </wtl>
+ static VkResult nvmtl_opaque_CreateComputePipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkComputePipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
+ {
+     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
+@@ -717,6 +747,18 @@
+             }
+         }
+     }
++    // <wtl> §37.14 phase 2: compressed scanout needs images with no fast-cleared blocks -- MTL_RC_CCS has no clear colour
++    // and the display cannot decode them (ANV fast-clears to the default value in GENERAL; on this GPU, CCS_E and not FCV,
++    // nofc leaves none).  So WindowServer starts with fast clears off when the switch is there at its start:
++    // /Library/GPUBundles/.xemtl-ccs (kept across boots) or /private/tmp/xemtl-ccs (until the next boot).
++    { extern int g_ccs_init;
++      if (getprogname() && !strcmp(getprogname(), "WindowServer") &&
++          (access("/Library/GPUBundles/.xemtl-ccs", F_OK) == 0 || access("/private/tmp/xemtl-ccs", F_OK) == 0)) {
++        const char *was = getenv("INTEL_DEBUG"); char v[256];
++        snprintf(v, sizeof v, "%s%snofc", was && *was ? was : "", was && *was ? "," : "");
++        setenv("INTEL_DEBUG", v, 1); g_ccs_init = 1;
++        nvlog("ccs: compressed scanout wanted -- fast clears off (INTEL_DEBUG=%s)", v);
++      } }
+     // <wtl> §37.3 phase 0: /private/tmp/xemtl-noccs turns ANV's render compression (CCS) off for this process, to
+     // measure what it saves.  Read once, before the driver loads (INTEL_DEBUG is parsed when it starts).
+     if (access("/private/tmp/xemtl-noccs", F_OK) == 0) {
+@@ -831,7 +873,8 @@
+     g_host_import = have[6];
+     g_linmod = have[7];
+     g_extfd = have[8];
+-    { const char *e = getenv("XEMTL_PSTAT"); g_pstat = have[13] && e && *e == '1'; }
++    { const char *e = getenv("XEMTL_PSTAT");   // <wtl> §37.19: or /private/tmp/xemtl-pstat-on when the process starts (WindowServer's environment is not ours)
++      g_pstat = have[13] && ((e && *e == '1') || access("/private/tmp/xemtl-pstat-on", F_OK) == 0); }
+     g_mutable = have[9] && !getenv("XEMTL_NO_TEXBUF");
+     nvlog("vk: par3 VK_EXT_mutable_descriptor_type %s — texture buffers %s", have[9] ? "present" : "ABSENT",
+           g_mutable ? "ON (mutable texture/storage bands)" : have[9] ? "OFF (NVMTL_NO_TEXBUF)" : "OFF");
+@@ -1473,7 +1516,9 @@
+ // how many there are, how big, and how many the surface cache saved (nvmtl_vk_surface_host_get).
+ static _Atomic uint64_t g_hi_n, g_hi_bytes, g_hi_big, g_hi_last;
+ static _Atomic uint64_t g_hc_hits, g_hc_misses, g_hc_evicted, g_hc_full, g_hc_sameid, g_hc_inuse;
++static _Atomic uint64_t g_si_ok, g_si_fail;   // <wtl> §37.17: surface imports announced to the core, and refused
+ static _Atomic uint32_t g_hc_lastid;
++static uint64_t nvmtl_xres_stat(int k);   // <wtl> §37.19
+ static void nvmtl_hi_note(size_t size)
+ {
+     atomic_fetch_add(&g_hi_n, 1); atomic_fetch_add(&g_hi_bytes, size);
+@@ -1481,12 +1526,13 @@
+     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), last = atomic_load(&g_hi_last);
+     if (now - last < 5000000000ull || !atomic_compare_exchange_strong(&g_hi_last, (uint64_t *)&last, now)) return;
+     nvlog("vk: host imports so far: %llu (%llu MB, %llu of them >= 1 MB); surface cache %llu hits, %llu imports, %llu freed, %llu uncached; "
+-          "misses on a cached ID with another size %llu; %llu entries in use; last miss id %u",
++          "misses on a cached ID with another size %llu; %llu entries in use; last miss id %u; by surface %llu announced, %llu refused; "
++          "xres %llu marked, %llu declared, %llu left out",
+           (unsigned long long)atomic_load(&g_hi_n), (unsigned long long)(atomic_load(&g_hi_bytes) >> 20),
+           (unsigned long long)atomic_load(&g_hi_big), (unsigned long long)atomic_load(&g_hc_hits),
+           (unsigned long long)atomic_load(&g_hc_misses), (unsigned long long)atomic_load(&g_hc_evicted),
+           (unsigned long long)atomic_load(&g_hc_full), (unsigned long long)atomic_load(&g_hc_sameid), (unsigned long long)atomic_load(&g_hc_inuse),
+-          (unsigned)atomic_load(&g_hc_lastid));
++          (unsigned)atomic_load(&g_hc_lastid), (unsigned long long)atomic_load(&g_si_ok), (unsigned long long)atomic_load(&g_si_fail), (unsigned long long)nvmtl_xres_stat(0), (unsigned long long)nvmtl_xres_stat(1), (unsigned long long)nvmtl_xres_stat(2));
+ }
+ // </wtl>
+ int nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
+@@ -1791,6 +1837,7 @@
+ }
+ unsigned long long nvmtl_tex_objs_live(void);
+ unsigned long long nvmtl_tex_objs_released(void);
++void nvmtl_vk_arena_stats(char *out, size_t n);   // <wtl> §37.17
+ static void nvmtl_vk_image_census(void)
+ {
+     if ((g_img_made & 0xFFF) == 0)
+@@ -1806,7 +1853,8 @@
+               (unsigned long long)g_img_made, (unsigned long long)g_img_gone, (unsigned long long)(g_img_made - g_img_gone),
+               (unsigned long long)(g_vram_bytes >> 20), (unsigned long long)(g_sys_bytes >> 20), (unsigned long long)g_spilled,
+               (unsigned long long)(nvmtl_vk_vram_bytes() >> 20), (unsigned long long)(bud >> 20), (unsigned long long)(used >> 20), m ? "measured" : "estimated",
+-              nvmtl_tex_objs_live(), nvmtl_tex_objs_released()); }
++              nvmtl_tex_objs_live(), nvmtl_tex_objs_released());
++        { char ar[256]; nvmtl_vk_arena_stats(ar, sizeof ar); nvlog("%s", ar); } }   // <wtl> §37.17
+ }
+ static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDeviceMemory *mem, uint32_t *sysmem, const char *what)
+ {
+@@ -1853,7 +1901,160 @@
+         else nvlog("vk: %s image: VRAM full and no system-memory type takes it (bits 0x%x) -> %d", what, mr->memoryTypeBits, r);
+     }
+     return r;
++}
++// <wtl> §37.17 (native-display docs/37-RENDER-COMPRESSION.md): image memory from a few large blocks.  ANV puts the BO of
++// every VkDeviceMemory into every execbuffer (i915/anv_batch_chain.c: bindless use cannot be tracked), and each image had
++// its own: WindowServer's submits carried ~300 BOs each (debug.xegfx_eb), the execbuffer ioctl blocked in the kernel for
++// most of the submit, and genie made and freed ~140 images a second, each a gem_create + mmap ioctl.  Images up to 8 MiB
++// now take a range of a 64 MiB block (per memory type).  ANV keeps compression for them: a non-dedicated allocation on
++// this GPU is an AUX-TT aligned BO with its CCS at the end (ANV_BO_ALLOC_AUX_CCS), and the aux table is mapped from the
++// image's address rounded down to 1 MiB.  An image is destroyed only after the command buffers that used it completed
++// (they retain it), so its range is free for reuse at once.  First fit, ranges coalesce; a block with nothing live goes
++// unless it is the type's last.  /Library/GPUBundles/.xemtl-no-arena or XEMTL_NO_ARENA=1 at start: one memory per image.
++typedef struct nvmtl_arena_range { uint64_t off, size; struct nvmtl_arena_range *next; } nvmtl_arena_range;
++typedef struct nvmtl_arena { VkDeviceMemory mem; uint32_t mt; uint64_t size, live_bytes; unsigned live; nvmtl_arena_range *free; struct nvmtl_arena *next; } nvmtl_arena;
++#define NVMTL_ARENA_BLOCK (64ull << 20)
++#define NVMTL_ARENA_MAX (8ull << 20)
++static nvmtl_arena *g_arenas;
++static pthread_mutex_t g_arena_mu = PTHREAD_MUTEX_INITIALIZER;
++static uint64_t g_arena_allocs, g_arena_frees, g_arena_blocks_made, g_arena_blocks_freed, g_arena_misses;
++static int nvmtl_arena_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("XEMTL_NO_ARENA");
++        on = !(e && e[0] == '1') && access("/Library/GPUBundles/.xemtl-no-arena", F_OK) != 0;
++        nvlog("arena: image memory %s (%llu MiB blocks, images up to %llu MiB)", on ? "SUBALLOCATED" : "one allocation per image (switched off)",
++              NVMTL_ARENA_BLOCK >> 20, NVMTL_ARENA_MAX >> 20);
++    }
++    return on;
++}
++// a range of `size` aligned to `align` from block a, or UINT64_MAX; with g_arena_mu held
++static uint64_t nvmtl_arena_take_locked(nvmtl_arena *a, uint64_t size, uint64_t align)
++{
++    for (nvmtl_arena_range **pp = &a->free; *pp; pp = &(*pp)->next) {
++        nvmtl_arena_range *r = *pp;
++        const uint64_t at = (r->off + align - 1) & ~(align - 1);
++        if (at + size > r->off + r->size) continue;
++        const uint64_t end = r->off + r->size;
++        if (at > r->off) {   // the head stays free; the tail (if any) follows it
++            const uint64_t head = at - r->off;
++            if (at + size < end) {
++                nvmtl_arena_range *t = malloc(sizeof *t);
++                if (!t) return UINT64_MAX;
++                t->off = at + size; t->size = end - (at + size); t->next = r->next; r->next = t;
++            }
++            r->size = head;
++        } else if (at + size < end) { r->off = at + size; r->size = end - (at + size); }
++        else { *pp = r->next; free(r); }
++        a->live++; a->live_bytes += size;
++        return at;
++    }
++    return UINT64_MAX;
++}
++static void nvmtl_arena_give_locked(nvmtl_arena *a, uint64_t off, uint64_t size)
++{
++    nvmtl_arena_range **pp = &a->free;
++    while (*pp && (*pp)->off < off) pp = &(*pp)->next;
++    nvmtl_arena_range *next = *pp, *prev = NULL;
++    for (nvmtl_arena_range *r = a->free; r && r != next; r = r->next) prev = r;
++    if (prev && prev->off + prev->size == off) {   // joins the range before it, and maybe the one after
++        prev->size += size;
++        if (next && prev->off + prev->size == next->off) { prev->size += next->size; prev->next = next->next; free(next); }
++    } else if (next && off + size == next->off) { next->off = off; next->size += size; }
++    else {
++        nvmtl_arena_range *r = malloc(sizeof *r);
++        if (r) { r->off = off; r->size = size; r->next = next; *pp = r; }   // without memory the range is lost, not reused wrongly
++    }
++    a->live--; a->live_bytes -= size;
++}
++// 0 and *ar, *off set: the image takes that range of that block (bound at *off to (*ar)->mem); -1: allocate it alone
++static int nvmtl_arena_alloc(const VkMemoryRequirements *mr, nvmtl_arena **ar, uint64_t *off)
++{
++    if (!nvmtl_arena_on() || mr->size > NVMTL_ARENA_MAX || !mr->size) return -1;
++    const int mt = memtype(mr->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt < 0) return -1;
++    const uint64_t align = mr->alignment ? mr->alignment : 1;
++    if (align & (align - 1)) return -1;
++    pthread_mutex_lock(&g_arena_mu);
++    for (nvmtl_arena *a = g_arenas; a; a = a->next) {
++        if (a->mt != (uint32_t)mt) continue;
++        const uint64_t at = nvmtl_arena_take_locked(a, mr->size, align);
++        if (at != UINT64_MAX) { g_arena_allocs++; pthread_mutex_unlock(&g_arena_mu); *ar = a; *off = at; return 0; }
++    }
++    pthread_mutex_unlock(&g_arena_mu);
++    // a new block, made outside the lock (vkAllocateMemory goes to the kernel)
++    nvmtl_arena *a = calloc(1, sizeof *a);
++    nvmtl_arena_range *r = malloc(sizeof *r);
++    if (!a || !r) { free(a); free(r); return -1; }
++    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, NVMTL_ARENA_BLOCK, (uint32_t)mt };
++    if (nvmtl_vk_vram_wall(NVMTL_ARENA_BLOCK, NULL, NULL, NULL, NULL) || pvkAllocateMemory(g_dev, &mai, NULL, &a->mem) != VK_SUCCESS) {
++        free(a); free(r); g_arena_misses++; return -1; }
++    a->mt = (uint32_t)mt; a->size = NVMTL_ARENA_BLOCK; r->off = 0; r->size = NVMTL_ARENA_BLOCK; r->next = NULL; a->free = r;
++    pthread_mutex_lock(&g_arena_mu);
++    const uint64_t at = nvmtl_arena_take_locked(a, mr->size, align);
++    a->next = g_arenas; g_arenas = a; g_arena_blocks_made++;
++    if (at != UINT64_MAX) g_arena_allocs++;
++    const uint64_t made = g_arena_blocks_made, gone = g_arena_blocks_freed;
++    pthread_mutex_unlock(&g_arena_mu);
++    if (made <= 8 || (made & 63) == 0)
++        nvlog("arena: block %llu (memory type %d) made, %llu live", (unsigned long long)made, mt, (unsigned long long)(made - gone));
++    if (at == UINT64_MAX) return -1;
++    *ar = a; *off = at; return 0;
++}
++static void nvmtl_arena_free(nvmtl_arena *a, uint64_t off, uint64_t size)
++{
++    VkDeviceMemory drop = VK_NULL_HANDLE;
++    pthread_mutex_lock(&g_arena_mu);
++    nvmtl_arena_give_locked(a, off, size); g_arena_frees++;
++    if (!a->live) {   // empty: it goes, unless it is the last block of its type
++        unsigned same = 0;
++        for (nvmtl_arena *b = g_arenas; b; b = b->next) if (b->mt == a->mt) same++;
++        if (same > 1) {
++            for (nvmtl_arena **pp = &g_arenas; *pp; pp = &(*pp)->next) if (*pp == a) { *pp = a->next; break; }
++            drop = a->mem; g_arena_blocks_freed++;
++            for (nvmtl_arena_range *r = a->free, *n; r; r = n) { n = r->next; free(r); }
++            free(a);
++        }
++    }
++    pthread_mutex_unlock(&g_arena_mu);
++    if (drop) pvkFreeMemory(g_dev, drop, NULL);
+ }
++// allocate and bind the image's memory: a range of a block when it is small, else memory of its own
++static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, void **out, uint32_t *sysmem, const char *what);
++static VkResult nvmtl_image_mem_bind(nvk_image *out, const VkMemoryRequirements *mr, const char *what)
++{
++    nvmtl_arena *a = NULL; uint64_t off = 0;
++    if (!nvmtl_arena_alloc(mr, &a, &off)) {
++        const VkResult r = pvkBindImageMemory(g_dev, (VkImage)out->img, a->mem, off);
++        if (r != VK_SUCCESS) { pthread_mutex_lock(&g_arena_mu); nvmtl_arena_give_locked(a, off, mr->size); pthread_mutex_unlock(&g_arena_mu); return r; }
++        out->mem = a->mem; out->arena = a; out->aoff = off; out->sysmem = 0; out->alloc = mr->size;
++        nvmtl_vk_budget_charge(mr->size);
++        return VK_SUCCESS;
++    }
++    VkResult r = nvmtl_alloc_opaque_image_mem(mr, &out->mem, &out->sysmem, what);
++    if (r != VK_SUCCESS) return r;
++    out->alloc = mr->size;
++    return pvkBindImageMemory(g_dev, (VkImage)out->img, (VkDeviceMemory)out->mem, 0);
++}
++// the image's memory goes back: its range to the block, or its own memory to the driver
++static void nvmtl_image_mem_free(nvk_image *i)
++{
++    if (i->arena) { nvmtl_arena_free((nvmtl_arena *)i->arena, i->aoff, i->alloc); i->arena = NULL; i->mem = NULL; return; }
++    if (i->mem && !i->placed) pvkFreeMemory(g_dev, (VkDeviceMemory)i->mem, NULL);
++}
++void nvmtl_vk_arena_stats(char *out, size_t n)
++{
++    unsigned blocks = 0, live = 0; uint64_t bytes = 0, used = 0;
++    pthread_mutex_lock(&g_arena_mu);
++    for (nvmtl_arena *a = g_arenas; a; a = a->next) { blocks++; live += a->live; bytes += a->size; used += a->live_bytes; }
++    snprintf(out, n, "arena: %u blocks (%llu MiB, %llu MiB used), %u images live; %llu taken, %llu given back, %llu blocks made, %llu freed, %llu misses",
++             blocks, (unsigned long long)(bytes >> 20), (unsigned long long)(used >> 20), live, (unsigned long long)g_arena_allocs,
++             (unsigned long long)g_arena_frees, (unsigned long long)g_arena_blocks_made, (unsigned long long)g_arena_blocks_freed,
++             (unsigned long long)g_arena_misses);
++    pthread_mutex_unlock(&g_arena_mu);
++}
++// </wtl>
+ static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, void **out, uint32_t *sysmem, const char *what)
+ {
+     VkDeviceMemory memory = VK_NULL_HANDLE;
+@@ -1868,8 +2069,8 @@
+ {
+     if (image->view) pvkDestroyImageView(g_dev, (VkImageView)image->view, NULL);
+     if (image->img) pvkDestroyImage(g_dev, (VkImage)image->img, NULL);
+-    if (image->mem && !image->placed) {
+-        pvkFreeMemory(g_dev, (VkDeviceMemory)image->mem, NULL);
++    if (image->mem && (image->arena || !image->placed)) {
++        nvmtl_image_mem_free(image);   // <wtl> §37.17: a range goes back to its block
+ 
+         if (!image->sysmem) g_budget_stale = 1;
+     }
+@@ -1912,9 +2113,7 @@
+     nvmtl_vk_image_mutable(&ici, out);
+     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(ms)");
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
+-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "multisample"), "vkAllocateMemory(ms)");
+-    out->alloc = mr.size;
+-    VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory(ms)");
++    VKCK(nvmtl_image_mem_bind(out, &mr, "multisample"), "vkAllocateMemory/vkBindImageMemory(ms)");   // <wtl> §37.17
+     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, out->img, mtl_type == 8 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, (VkFormat)vkfmt,
+         { 0, 0, 0, 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers } };
+     VKCK(nvmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view), "vkCreateImageView(ms)");
+@@ -1950,14 +2149,12 @@
+     nvmtl_vk_image_mutable(&ici, out);
+     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage");
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
+-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "colour"), "vkAllocateMemory(image)");
+-    out->alloc = mr.size;
++    VKCK(nvmtl_image_mem_bind(out, &mr, "colour"), "vkAllocateMemory/vkBindImageMemory(image)");   // <wtl> §37.17
+     { static _Atomic unsigned nsz;   // <wtl> §37.3 phase 0: with CCS the size is the pixels plus about 1/256 (ANV's compression control buffer)
+       if (w >= 1024 && h >= 600 && mips == 1 && layers <= 1 && atomic_fetch_add(&nsz, 1) < 24)
+           nvlog("ccs: private image %ux%u fmt %u%s: %llu bytes for %llu of pixels (+%lld, align %llu)", w, h, vkfmt, storage ? " storage" : "",
+                 (unsigned long long)mr.size, (unsigned long long)w * h * out->bpp, (long long)mr.size - (long long)((uint64_t)w * h * out->bpp),
+                 (unsigned long long)mr.alignment); }
+-    VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory");
+     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
+                                 : (VkComponentMapping){ 0, 0, 0, 0 };
+     VkImageViewType viewType = mtl_type == 0 ? VK_IMAGE_VIEW_TYPE_1D : mtl_type == 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : mtl_type == 3 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+@@ -2061,6 +2258,7 @@
+         if (kr == KERN_SUCCESS) {
+             if (atomic_exchange(&g_t4_sel, 1) != 1) nvlog("Tile4: the accelerator takes layout marks (selector 2), scanout Tile4 %s", (out & 2) ? "on" : "off");
+             atomic_store(&g_t4_on, (out & 2) ? 1 : 0);
++            { extern _Atomic int g_ccs_on; atomic_store(&g_ccs_on, (out & 4) ? 1 : 0); }   // <wtl> §37.14
+             if ((out & 1) && surfaceID) {
+                 int known = 0;
+                 for (unsigned i = 0; i < 8; i++) if (atomic_load(&g_t4_scan[i]) == surfaceID) { known = 1; break; }
+@@ -2142,7 +2340,177 @@
+ {
+     const uint64_t in = id;
+     if (id && nvmtl_mark_conn()) (void)IOConnectCallScalarMethod(g_mark_conn, 8, &in, 1, NULL, NULL);
++}
++
++// <wtl> §37.14 phase 2: compressed scanout (native-display docs/37-RENDER-COMPRESSION.md).  WindowServer's scanout
++// surfaces are drawn into a private image with the display's own compressed layout, I915_FORMAT_MOD_4_TILED_MTL_RC_CCS
++// (Tile4 pixels, then the packed CCS: i915 intel_fb.c, ANV's compression control buffer), and the display scans that
++// image instead of the surface's pages.  The image's memory is exported (ANV's PRIME export, the libdrm stand-in's
++// fd), its GEM handle in WindowServer's DRM file found again with drmPrimeFDToHandle, pinned by the core's BO_SCANOUT
++// ioctl (a token), and registered with the accelerator (selector 9: surface, token, pitch, CCS offset and pitch).  The
++// surface's pages are brought up to date only by page-off (CPU locks).  Releasing the image unregisters it first
++// (selector 10, busy while the display may still scan it: tried again later), then unpins and frees it.
++// On when the accelerator says so (selector 2's bit 2, debug.xegfxaccel_iop_xe_ccs) and the switch was there when
++// WindowServer started (fast clears off); /private/tmp/xemtl-no-ccs (checked every second) makes no new images.
++_Atomic int g_ccs_on;
++int g_ccs_init;
++#define NVMTL_MOD_MTL_RC_CCS 0x010000000000000dull	/* fourcc_mod_code(INTEL, 13) */
++struct nvmtl_xg_bo_scanout { uint32_t handle; uint32_t token; uint64_t size; };
++#define NVMTL_XG_BO_SCANOUT	_IOWR('N', 0x48, struct nvmtl_xg_bo_scanout)
++#define NVMTL_XG_BO_UNSCANOUT	_IOW('N', 0x49, struct nvmtl_xg_bo_scanout)
++static int (*p_drmPrimeFDToHandle)(int, int, uint32_t *);
++static int (*p_drmIoctl)(int, unsigned long, void *);
++int nvmtl_vk_ccs_on(void)
++{
++    static _Atomic uint64_t checked; static _Atomic int off;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (now - atomic_load(&checked) > 1000000000ull) {
++        atomic_store(&off, access("/private/tmp/xemtl-no-ccs", F_OK) == 0); atomic_store(&checked, now); }
++    return g_ccs_init && atomic_load(&g_ccs_on) && !atomic_load(&off) && atomic_load(&g_t4_sel) == 1;
++}
++// WindowServer's DRM file (the stand-in's read-only fd whose rdev carries the instance flag) that owns this export
++static int nvmtl_ccs_handle(int efd, uint32_t *handle)
++{
++    static int last = -1;
++    struct stat st;
++    if (last >= 0 && fstat(last, &st) == 0 && S_ISCHR(st.st_mode) && (st.st_rdev & 0x800000) && p_drmPrimeFDToHandle(last, efd, handle) == 0) return last;
++    for (int fd = 0; fd < 4096; fd++)
++        if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && (st.st_rdev & 0x800000) && p_drmPrimeFDToHandle(fd, efd, handle) == 0) { last = fd; return fd; }
++    return -1;
++}
++static int nvmtl_ccs_probe(VkFormat fmt, VkImageUsageFlags usage, VkImageCreateFlags flags)
++{
++    static PFN_vkGetPhysicalDeviceImageFormatProperties2 fp2;
++    if (!fp2) fp2 = (PFN_vkGetPhysicalDeviceImageFormatProperties2)pvkGetInstanceProcAddr(g_inst, "vkGetPhysicalDeviceImageFormatProperties2");
++    if (!fp2) return -1;
++    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT, NULL,
++        NVMTL_MOD_MTL_RC_CCS, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
++    VkPhysicalDeviceExternalImageFormatInfo ei = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO, &mi,
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++    VkPhysicalDeviceImageFormatInfo2 fi = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, &ei, fmt, VK_IMAGE_TYPE_2D,
++        VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, usage, flags };
++    VkExternalImageFormatProperties ep = { VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
++    VkImageFormatProperties2 p = { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, &ep };
++    const VkResult r = fp2(g_pdev, &fi, &p);
++    if (r != VK_SUCCESS) return (int)r;
++    return (ep.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) ? 0 : 1;
++}
++static int nvmtl_drm_syms(void);   // <wtl> §37.17, below
++int nvmtl_vk_image_create_ccs(uint32_t sid, uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int stex, nvk_image *out)
++{
++    static _Atomic int fails;
++    static PFN_vkGetMemoryFdKHR gfd; static PFN_vkGetImageDrmFormatModifierPropertiesEXT gmp; static PFN_vkGetImageSubresourceLayout gsl;
++    memset(out, 0, sizeof *out);
++    if (atomic_load(&fails) >= 4 || !sid || !nvmtl_vk_ccs_on() || nvmtl_vk_init() || !nvmtl_mark_conn()) return -1;
++    // its own Vulkan entry points, whatever loaded libdrm first: the surface imports (§37.17) do it at the first
++    // import, and keying these on p_drmIoctl left them NULL -- WindowServer called address 0 (11-03 19:39)
++    if (!gfd || !gmp || !gsl) {
++        gfd = (PFN_vkGetMemoryFdKHR)pvkGetDeviceProcAddr(g_dev, "vkGetMemoryFdKHR");
++        gmp = (PFN_vkGetImageDrmFormatModifierPropertiesEXT)pvkGetDeviceProcAddr(g_dev, "vkGetImageDrmFormatModifierPropertiesEXT");
++        gsl = (PFN_vkGetImageSubresourceLayout)pvkGetDeviceProcAddr(g_dev, "vkGetImageSubresourceLayout");
++    }
++    if (!nvmtl_drm_syms() || !gfd || !gmp || !gsl) {
++        nvlog("ccs: missing an entry point (libdrm %s, vkGetMemoryFdKHR %s, modifier properties %s, layout %s) -- compressed scanout off",
++              p_drmIoctl && p_drmPrimeFDToHandle ? "ok" : "MISSING", gfd ? "ok" : "MISSING", gmp ? "ok" : "MISSING", gsl ? "ok" : "MISSING");
++        atomic_store(&fails, 4); return -1;
++    }
++    out->w = w; out->h = h; out->mips = 1; out->fmt = vkfmt; out->bpp = bpp ? bpp : 4; out->mtl_type = 2; out->layers = 1;
++    uint64_t mod = NVMTL_MOD_MTL_RC_CCS;
++    VkImageDrmFormatModifierListCreateInfoEXT ml = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT, NULL, 1, &mod };
++    VkExternalMemoryImageCreateInfo emi = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, &ml, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &emi, 0, VK_IMAGE_TYPE_2D, (VkFormat)vkfmt, { w, h, 1 }, 1, 1,
++        VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
++        | (stex ? VK_IMAGE_USAGE_STORAGE_BIT : 0), VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED };
++    nvmtl_vk_image_mutable(&ici, out);   // the same flags as every private image (format views)
++    // the driver must take the modifier with these flags; storage and then format views are given up if it does not
++    int pr = nvmtl_ccs_probe(ici.format, ici.usage, ici.flags);
++    if (pr && stex) { ici.usage &= ~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT; pr = nvmtl_ccs_probe(ici.format, ici.usage, ici.flags); }
++    if (pr) {
++        atomic_fetch_add(&fails, 1);
++        nvlog("ccs: surface %u %ux%u fmt %u: the driver does not take MTL_RC_CCS (%d) -- stays as it is", sid, w, h, vkfmt, pr);
++        return -1;
++    }
++    out->storage = (ici.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? 1 : 0; out->usage = (uint32_t)ici.usage;
++    int efd = -1, drmfd = -1; uint32_t handle = 0; struct nvmtl_xg_bo_scanout bs = { 0, 0, 0 };
++    const char *why = NULL; VkResult vr;
++    if ((vr = nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img)) != VK_SUCCESS) { why = "vkCreateImage"; goto fail; }
++    VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
++    const int mt = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (mt < 0) { why = "no memory type"; vr = VK_ERROR_UNKNOWN; goto fail; }
++    VkExportMemoryAllocateInfo exi = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++    VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &exi, (VkImage)out->img, VK_NULL_HANDLE };
++    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ded, mr.size, (uint32_t)mt };
++    VkDeviceMemory mem = VK_NULL_HANDLE;
++    if ((vr = pvkAllocateMemory(g_dev, &mai, NULL, &mem)) != VK_SUCCESS) { why = "vkAllocateMemory"; goto fail; }
++    out->mem = mem; out->alloc = mr.size;
++    if ((vr = pvkBindImageMemory(g_dev, (VkImage)out->img, mem, 0)) != VK_SUCCESS) { why = "vkBindImageMemory"; goto fail; }
++    VkImageDrmFormatModifierPropertiesEXT mp = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT };
++    if ((vr = gmp(g_dev, (VkImage)out->img, &mp)) != VK_SUCCESS || mp.drmFormatModifier != NVMTL_MOD_MTL_RC_CCS) { why = "modifier"; goto fail; }
++    VkImageSubresource s0 = { VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0 }, s1 = { VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT, 0, 0 };
++    VkSubresourceLayout l0, l1; gsl(g_dev, (VkImage)out->img, &s0, &l0); gsl(g_dev, (VkImage)out->img, &s1, &l1);
++    // i915 (intel_fb.c) takes it only so: the pixels at 0, the CCS 4 KiB aligned after them, 64 B per 512 B of pitch
++    if (l0.offset != 0 || l0.rowPitch < (uint64_t)w * out->bpp || (l1.offset & 4095) || l1.offset < l0.rowPitch * h ||
++        l1.rowPitch != (l0.rowPitch + 511) / 512 * 64 || l1.offset + l1.size > mr.size) { why = "plane layout"; vr = VK_ERROR_UNKNOWN; goto fail; }
++    VkMemoryGetFdInfoKHR gi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, NULL, mem, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++    if ((vr = gfd(g_dev, &gi, &efd)) != VK_SUCCESS || efd < 0) { why = "vkGetMemoryFdKHR"; goto fail; }
++    drmfd = nvmtl_ccs_handle(efd, &handle);
++    close(efd); efd = -1;
++    if (drmfd < 0) { why = "no GEM handle for the export"; vr = VK_ERROR_UNKNOWN; goto fail; }
++    bs.handle = handle;
++    if (p_drmIoctl(drmfd, NVMTL_XG_BO_SCANOUT, &bs) != 0 || !bs.token) { why = "BO_SCANOUT"; vr = (VkResult)-errno; bs.token = 0; goto fail; }
++    // <wtl> §37.19: the handle must name this image's memory (a stale export once named a surface import instead)
++    if (bs.size < mr.size) { nvlog("ccs: surface %u: handle %u names a %llu-byte object, not this %llu-byte image", sid, handle,
++                                   (unsigned long long)bs.size, (unsigned long long)mr.size); why = "GEM handle"; vr = VK_ERROR_UNKNOWN; goto fail; }
++    { const uint64_t in[5] = { sid, bs.token, l0.rowPitch, l1.offset, l1.rowPitch };
++      const kern_return_t kr = IOConnectCallScalarMethod(g_mark_conn, 9, in, 5, NULL, NULL);
++      if (kr != KERN_SUCCESS) { why = "selector 9"; vr = (VkResult)kr; goto fail; } }
++    VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, (VkImage)out->img, VK_IMAGE_VIEW_TYPE_2D, (VkFormat)vkfmt,
++        { 0, 0, 0, 0 }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++    if ((vr = nvmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view)) != VK_SUCCESS) {
++        const uint64_t in2[2] = { sid, bs.token };
++        (void)IOConnectCallScalarMethod(g_mark_conn, 10, in2, 2, NULL, NULL);   // never flipped yet: not busy
++        why = "vkCreateImageView"; goto fail; }
++    out->ccs_sid = sid; out->ccs_token = bs.token; out->ccs_handle = handle; out->ccs_drmfd = drmfd;
++    nvmtl_commit_image(out);
++    nvlog("ccs: surface %u %ux%u -> a compressed scanout image: %llu bytes (GEM %llu), pitch %llu, CCS at %llu pitch %llu, token %u",
++          sid, w, h, (unsigned long long)mr.size, (unsigned long long)bs.size, (unsigned long long)l0.rowPitch,
++          (unsigned long long)l1.offset, (unsigned long long)l1.rowPitch, bs.token);
++    return 0;
++fail:
++    atomic_fetch_add(&fails, 1);
++    nvlog("ccs: surface %u %ux%u: %s failed (%d) -- stays as it is", sid, w, h, why ? why : "?", (int)vr);
++    if (efd >= 0) close(efd);
++    if (bs.token) { struct nvmtl_xg_bo_scanout u = { handle, bs.token, 0 }; (void)p_drmIoctl(drmfd, NVMTL_XG_BO_UNSCANOUT, &u); }
++    if (out->view) pvkDestroyImageView(g_dev, (VkImageView)out->view, NULL);
++    if (out->img) pvkDestroyImage(g_dev, (VkImage)out->img, NULL);
++    if (out->mem) pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL);
++    memset(out, 0, sizeof *out);
++    return -1;
++}
++// a registered image goes only once the accelerator lets it (busy while the display may scan it, which on a still
++// screen lasts until the next flip): asked every 200 ms on a thread of its own
++static void nvmtl_ccs_release(const nvk_image *img)
++{
++    nvk_image *copy = malloc(sizeof *copy);
++    if (!copy) return;   // leaked rather than freed while it may be scanned
++    *copy = *img;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        const uint64_t in[2] = { copy->ccs_sid, copy->ccs_token };
++        kern_return_t kr = KERN_SUCCESS; unsigned tries = 0;
++        while (nvmtl_mark_conn() && (kr = IOConnectCallScalarMethod(g_mark_conn, 10, in, 2, NULL, NULL)) == (kern_return_t)0xe00002d5 /* busy */) {
++            if (++tries == 50 || tries % 3000 == 0) nvlog("ccs: surface %u token %u still on the display after %u tries", copy->ccs_sid, copy->ccs_token, tries);
++            usleep(200000);
++        }
++        struct nvmtl_xg_bo_scanout u = { copy->ccs_handle, copy->ccs_token, 0 };
++        if (p_drmIoctl) (void)p_drmIoctl(copy->ccs_drmfd, NVMTL_XG_BO_UNSCANOUT, &u);
++        nvlog("ccs: surface %u token %u released (0x%x after %u tries)", copy->ccs_sid, copy->ccs_token, kr, tries);
++        copy->ccs_token = 0;
++        nvmtl_vk_image_destroy(copy);
++        free(copy);
++    });
+ }
++// </wtl>
+ // the layout each surface's content is in now (Tile4 1), as this process last drew or re-laid it out; 32 entries
+ static _Atomic uint32_t g_t4_content_id[32];
+ static _Atomic int g_t4_content_t4[32];
+@@ -3582,9 +3950,7 @@
+     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(depth)");
+     out->usage = (uint32_t)ici.usage;
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
+-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "depth"), "vkAllocateMemory(depth)");
+-    out->alloc = mr.size;
+-    VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory(depth)");
++    VKCK(nvmtl_image_mem_bind(out, &mr, "depth"), "vkAllocateMemory/vkBindImageMemory(depth)");   // <wtl> §37.17
+     VkImageViewType vt = out->mtl_type == 3 || out->mtl_type == 8 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : out->mtl_type == 5 ? VK_IMAGE_VIEW_TYPE_CUBE
+                        : out->mtl_type == 6 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, out->img, vt,
+@@ -5202,13 +5568,16 @@
+         rbi.pNext = &location_begin;
+         pvkCmdSetSampleLocationsEXT(c->cb, &locations);
+     }
++    const nvk_image *tci = ncol && cf[0] ? ps->col[0] : NULL;   // <wtl> §37.11: the pass's first colour target
++    if (tci) nvmtl_tc_pass(tci->kind, tci->w, tci->h, -1.0);
+     { extern int nvmtl_pt_armed(void);
+       if (nvmtl_pt_armed() && c->pt_n < 128 && g_timestamp_bits) {
+           if (!c->pt_pool) { VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 256, 0 };
+               VkQueryPool qp; if (pvkCreateQueryPool(g_dev, &qi, NULL, &qp) == VK_SUCCESS) { pvkCmdResetQueryPool(c->cb, qp, 0, 256); c->pt_pool = (void *)qp; } }
+           if (c->pt_pool) { pvkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, (VkQueryPool)c->pt_pool, 2 * c->pt_n);
+               c->pt_w[c->pt_n] = ps->w; c->pt_h[c->pt_n] = ps->h; c->pt_f[c->pt_n] = ncol ? cf[0] : (p->has_depth ? 1000u + p->dfmt : 0u); c->pt_open = 1;
+-              memset(c->pt_fs[c->pt_n], 0, sizeof c->pt_fs[c->pt_n]); c->pt_d[c->pt_n] = 0; }
++              memset(c->pt_fs[c->pt_n], 0, sizeof c->pt_fs[c->pt_n]); c->pt_d[c->pt_n] = 0;
++              c->pt_k[c->pt_n] = tci ? tci->kind : 0; c->pt_iw[c->pt_n] = tci ? tci->w : 0; c->pt_ih[c->pt_n] = tci ? tci->h : 0; }
+       } }
+     pvkCmdBeginRenderPass(c->cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+     c->in_rp = 1;
+@@ -5608,6 +5977,31 @@
+     return 0;
+ }
+ 
++// <wtl> §37.19 per-draw GPU time (see nvk_cmdbuf.dt)
++#define NVMTL_DT_MAX 1023
++typedef struct { uint32_t pass, fs, cnt, scw, sch, tex[2][4]; } nvmtl_dt_rec;
++typedef struct { void *pool; unsigned n; nvmtl_dt_rec r[NVMTL_DT_MAX]; } nvmtl_dt;
++static int g_dt_on;
++static void nvmtl_dt_draw(nvk_cmdbuf *c)
++{
++    if (!c->pt_open || !c->pt_pool || !g_dt_on) return;
++    nvmtl_dt *d = c->dt;
++    if (!d) { VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NVMTL_DT_MAX, 0 };
++        VkQueryPool qp; if (!(d = calloc(1, sizeof *d))) return;
++        if (pvkCreateQueryPool(g_dev, &qi, NULL, &qp) != VK_SUCCESS) { free(d); return; }
++        if (c->in_rp) { /* reset is not allowed inside a render pass: host reset (VK 1.2 hostQueryReset) */
++            if (!pvkResetQueryPool || !g_host_query_reset) { pvkDestroyQueryPool(g_dev, qp, NULL); free(d); return; }
++            pvkResetQueryPool(g_dev, qp, 0, NVMTL_DT_MAX); }
++        else pvkCmdResetQueryPool(c->cb, qp, 0, NVMTL_DT_MAX);
++        d->pool = (void *)qp; c->dt = d; }
++    if (d->n >= NVMTL_DT_MAX) return;
++    pvkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, (VkQueryPool)d->pool, d->n);
++    nvmtl_dt_rec *r = &d->r[d->n++];
++    r->pass = c->pt_n; r->fs = c->dt_fs; r->cnt = c->dt_cnt; r->scw = c->dt_scw; r->sch = c->dt_sch; memcpy(r->tex, c->dt_tex, sizeof r->tex);
++}
++void nvmtl_vk_dt_tex(nvk_cmdbuf *c, uint32_t i, const nvk_image *im)
++{ if (i < 2 && im) { c->dt_tex[i][0] = im->kind; c->dt_tex[i][1] = im->w; c->dt_tex[i][2] = im->h; c->dt_tex[i][3] = im->mips; } }
++// </wtl>
+ /*
+  * Stencil export ([[stencil]] fragment output) on hardware without it. NVIDIA GPUs cannot export stencil from a fragment
+  * shader (NVIDIA's own drivers expose neither GL_ARB_ nor VK_EXT_shader_stencil_export), but Metal guarantees it and
+@@ -5617,7 +6011,8 @@
+  * clears the write-masked bits, and writes colour and depth as the draw would), then once per write-mask bit, with only
+  * that bit writable, that bit as the reference, and depth writes off.
+  */
+-#define NVMTL_SEMU_DRAW(c, DRAW) do { \
++#define NVMTL_SEMU_DRAW(c, DRAW) do { NVMTL_SEMU_DRAW0(c, DRAW); nvmtl_dt_draw(c); } while (0)
++#define NVMTL_SEMU_DRAW0(c, DRAW) do { \
+     if ((c)->skip_group) break; \
+     if ((c)->pt_open) (c)->pt_d[(c)->pt_n]++; \
+     if (!(c)->semu_layout) { DRAW; break; } \
+@@ -5672,6 +6067,7 @@
+     if (c->nobind) return;
+     __atomic_fetch_add(&g_vk_draws, 1, __ATOMIC_RELAXED);
+     const uint64_t _xd_draw0 = mach_absolute_time();
++    c->dt_cnt = count * (instances ? instances : 1);   // <wtl> §37.19
+     const uint32_t n = instances ? instances : 1;
+     if (nvmtl_fetch_split(c, count, n)) {
+         for (uint32_t k = 0; k < n; k++) for (uint32_t i = 0; i + 3 <= count; i += 3) {
+@@ -5685,7 +6081,7 @@
+     nvmtl_xd_time(XD_DRAW_US, _xd_draw0);
+ }
+ void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h)
+-{ VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); }
++{ VkRect2D r = { { x, y }, { w, h } }; pvkCmdSetScissor(c->cb, 0, 1, &r); c->dt_scw = w; c->dt_sch = h; }
+ void nvmtl_vk_cmd_bind_pipeline(nvk_cmdbuf *c, nvk_pipeline *p) {
+     nvmtl_xd_add(XD_PIPE_REQ, 1);
+     if (p->pipe && c->graphics_pipeline == p->pipe) { nvmtl_xd_add(XD_PIPE_HIT, 1); return; }
+@@ -5748,6 +6144,7 @@
+ {
+     if (!nvmtl_index_range_ok(idx, offset)) return;
+     __atomic_fetch_add(&g_vk_draws, 1, __ATOMIC_RELAXED);
++    c->dt_cnt = count * (instances ? instances : 1);   // <wtl> §37.19
+     NVMTL_XD(XD_DRAW_US);
+     pvkCmdBindIndexBuffer(c->cb, (VkBuffer)idx->buf, offset, is32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
+     if (c->nobind) return;
+@@ -5804,16 +6201,67 @@
+ static int g_pt_left; static uint64_t g_pt_seq;
+ void nvmtl_vk_pt_note(nvk_cmdbuf *c, uint32_t fs)
+ {
++    if (c && fs) c->dt_fs = fs;   // <wtl> §37.19
+     if (!c || !c->pt_open || !c->pt_pool || c->pt_n >= 128 || !fs) return;
+     for (unsigned k = 0; k < 4; k++) { if (c->pt_fs[c->pt_n][k] == fs) return; if (!c->pt_fs[c->pt_n][k]) { c->pt_fs[c->pt_n][k] = fs; return; } }
+ }
+ int nvmtl_pt_armed(void)
+ {
+     static uint64_t next; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++    static uint64_t tcnext;
++    if (now >= tcnext) { tcnext = now + 250000000ull;
++        if (access("/tmp/nvmtl-texcensus-request", F_OK) == 0) { unlink("/tmp/nvmtl-texcensus-request"); nvmtl_tc_dump(); } }   // <wtl> §37.11
+     if (g_pt_left <= 0 && now >= next) { next = now + 250000000ull;
+-        if (access("/tmp/nvmtl-passtime-request", F_OK) == 0) { unlink("/tmp/nvmtl-passtime-request"); g_pt_left = 400; nvlog("passtime: ARMED for 400 passes"); } }
++        if (access("/tmp/nvmtl-passtime-request", F_OK) == 0) { unlink("/tmp/nvmtl-passtime-request"); g_pt_left = 400;
++            g_dt_on = access("/tmp/nvmtl-drawtime-request", F_OK) == 0; nvlog("passtime: ARMED for 400 passes%s", g_dt_on ? " (per draw)" : ""); } }
+     return g_pt_left > 0;
+ }
++// <wtl> §37.11 texture census: images of 1024x600 or more, by the path that made them (kind) and size: how many were
++// made, how many passes drew into them, and (while passtime is armed) the GPU time of those passes.  Written to
++// /private/tmp/xemtl-texcensus.txt when /tmp/nvmtl-texcensus-request appears (checked with the passtime request).
++static const char *const g_tc_name[NVMTL_TC_N] = { "?", "plain", "heap", "buffer", "pages", "pages-t4", "pageoff", "copied", "vram", "ccs" };
++static struct { uint32_t kind, w, h; uint64_t made, passes, timed; double us; } g_tc[160];
++static unsigned g_tc_n, g_tc_over;
++static pthread_mutex_t g_tc_mu = PTHREAD_MUTEX_INITIALIZER;
++static int nvmtl_tc_slot(uint32_t kind, uint32_t w, uint32_t h)   // under g_tc_mu; -1 when the table is full
++{
++    for (unsigned i = 0; i < g_tc_n; i++) if (g_tc[i].kind == kind && g_tc[i].w == w && g_tc[i].h == h) return (int)i;
++    if (g_tc_n == sizeof g_tc / sizeof g_tc[0]) { g_tc_over++; return -1; }
++    g_tc[g_tc_n].kind = kind; g_tc[g_tc_n].w = w; g_tc[g_tc_n].h = h;
++    return (int)g_tc_n++;
++}
++void nvmtl_vk_tc_made(nvk_image *i, uint32_t kind)
++{
++    if (!i || kind >= NVMTL_TC_N) return;
++    const uint32_t old = i->kind; i->kind = kind;
++    if (i->w < 1024 || i->h < 600 || old == kind) return;
++    pthread_mutex_lock(&g_tc_mu);
++    int k;
++    if (old && (k = nvmtl_tc_slot(old, i->w, i->h)) >= 0 && g_tc[k].made) g_tc[k].made--;   // re-tagged: counted once, as what it became
++    if ((k = nvmtl_tc_slot(kind, i->w, i->h)) >= 0) g_tc[k].made++;
++    pthread_mutex_unlock(&g_tc_mu);
++}
++static void nvmtl_tc_pass(uint32_t kind, uint32_t w, uint32_t h, double us)   // us < 0: counted, not timed
++{
++    if (w < 1024 || h < 600 || kind >= NVMTL_TC_N) return;
++    pthread_mutex_lock(&g_tc_mu);
++    const int k = nvmtl_tc_slot(kind, w, h);
++    if (k >= 0) { if (us < 0) g_tc[k].passes++; else { g_tc[k].timed++; g_tc[k].us += us; } }
++    pthread_mutex_unlock(&g_tc_mu);
++}
++static void nvmtl_tc_dump(void)
++{
++    FILE *f = fopen("/private/tmp/xemtl-texcensus.txt", "w");
++    if (!f) return;
++    pthread_mutex_lock(&g_tc_mu);
++    fprintf(f, "# pid %d, %u sizes%s; kind WxH made passes timed_passes gpu_ms_timed\n", (int)getpid(), g_tc_n, g_tc_over ? " (table full)" : "");
++    for (unsigned i = 0; i < g_tc_n; i++)
++        fprintf(f, "%-8s %ux%u %llu %llu %llu %.1f\n", g_tc_name[g_tc[i].kind], g_tc[i].w, g_tc[i].h, (unsigned long long)g_tc[i].made,
++                (unsigned long long)g_tc[i].passes, (unsigned long long)g_tc[i].timed, g_tc[i].us / 1000.0);
++    pthread_mutex_unlock(&g_tc_mu);
++    fclose(f);
++}
++// </wtl>
+ void nvmtl_vk_cmd_end_render(nvk_cmdbuf *c) {
+     pvkCmdEndRenderPass(c->cb); c->in_rp = 0;
+     if (c->pt_open && c->pt_pool) { pvkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, (VkQueryPool)c->pt_pool, 2 * c->pt_n + 1); c->pt_n++; c->pt_open = 0; g_pt_left--; }
+@@ -6129,12 +6577,28 @@
+             for (unsigned i = 0; pf && i < n; i++) {
+                 const double gpu = (double)((r[2 * i + 1] - r[2 * i]) & mask) * us;
+                 const double gap = i ? (double)((r[2 * i] - r[2 * i - 1]) & mask) * us : 0.0;
+-                fprintf(pf, "cb %llu pass %u %ux%u fmt %u gpu_us %.1f gap_us %.1f fs %08x %08x %08x %08x draws %u\n", (unsigned long long)seq, i, c->pt_w[i], c->pt_h[i], c->pt_f[i], gpu, gap,
+-                        c->pt_fs[i][0], c->pt_fs[i][1], c->pt_fs[i][2], c->pt_fs[i][3], c->pt_d[i]);
++                const uint32_t kd = c->pt_k[i] < NVMTL_TC_N ? c->pt_k[i] : 0;   // <wtl> §37.11
++                fprintf(pf, "cb %llu pass %u %ux%u fmt %u gpu_us %.1f gap_us %.1f fs %08x %08x %08x %08x draws %u kind %s %ux%u\n", (unsigned long long)seq, i, c->pt_w[i], c->pt_h[i], c->pt_f[i], gpu, gap,
++                        c->pt_fs[i][0], c->pt_fs[i][1], c->pt_fs[i][2], c->pt_fs[i][3], c->pt_d[i], g_tc_name[kd], c->pt_iw[i], c->pt_ih[i]);
++                nvmtl_tc_pass(kd, c->pt_iw[i], c->pt_ih[i], gpu);
+             }
++            nvmtl_dt *d = c->dt;   // <wtl> §37.19
++            static uint64_t dr[NVMTL_DT_MAX]; static pthread_mutex_t dmu = PTHREAD_MUTEX_INITIALIZER;
++            if (pf && d && d->n) { pthread_mutex_lock(&dmu);
++                if (pvkGetQueryPoolResults(g_dev, (VkQueryPool)d->pool, 0, d->n, sizeof(uint64_t) * d->n, dr, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
++                    unsigned lastp = ~0u; uint64_t prev = 0;
++                    for (unsigned k = 0; k < d->n; k++) { const nvmtl_dt_rec *q = &d->r[k]; if (q->pass >= n) continue;
++                        if (q->pass != lastp) { prev = r[2 * q->pass]; lastp = q->pass; }
++                        const uint32_t k0 = q->tex[0][0] < NVMTL_TC_N ? q->tex[0][0] : 0, k1 = q->tex[1][0] < NVMTL_TC_N ? q->tex[1][0] : 0;
++                        fprintf(pf, "cb %llu pass %u draw %u gpu_us %.1f fs %08x n %u sc %ux%u t0 %s %ux%u m%u t1 %s %ux%u m%u\n", (unsigned long long)seq, q->pass, k,
++                                (double)((dr[k] - prev) & mask) * us, q->fs, q->cnt, q->scw, q->sch,
++                                g_tc_name[k0], q->tex[0][1], q->tex[0][2], q->tex[0][3], g_tc_name[k1], q->tex[1][1], q->tex[1][2], q->tex[1][3]);
++                        prev = dr[k]; } }
++                pthread_mutex_unlock(&dmu); }
+             if (pf) fflush(pf);
+         }
+         pvkDestroyQueryPool(g_dev, (VkQueryPool)c->pt_pool, NULL); c->pt_pool = NULL; c->pt_n = 0;
++        if (c->dt) { pvkDestroyQueryPool(g_dev, (VkQueryPool)((nvmtl_dt *)c->dt)->pool, NULL); free(c->dt); c->dt = NULL; }
+     }
+     pvkDestroyFence(g_dev, fence, NULL);
+     if (c->nsets > g_peak_sets) { g_peak_sets = c->nsets; nvlog("vk: commit high-water: %u descriptor sets = %u draws in one command buffer (%u pools open)", c->nsets, c->nsets / 2, g_ndescPools); }
+@@ -6197,14 +6661,17 @@
+     nvmtl_perf_note(NVP_BUFDEL, t0, n);
+ }
+ 
++static void nvmtl_ccs_release(const nvk_image *img);
+ void nvmtl_vk_image_destroy(nvk_image *i)
+ {
+     if (g_state != 1 || !i || !i->img) return;
++    if (i->ccs_token) { nvmtl_ccs_release(i); memset(i, 0, sizeof *i); return; }   // <wtl> §37.14: after the display lets go
+     nvmtl_vk_image_upload_barrier(i);   // an async upload must finish before we free this image's memory (#96)
+     g_img_gone++;
+     if (i->view) pvkDestroyImageView(g_dev, (VkImageView)i->view, NULL);
+     pvkDestroyImage(g_dev, (VkImage)i->img, NULL);
+-    if (!i->placed && i->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)i->mem, NULL); g_alloc_bytes -= i->alloc; if (i->sysmem) { g_sys_bytes -= i->alloc; g_sys_align -= (i->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= i->alloc; g_img_align -= (i->alloc + 65535ull) & ~65535ull; }    }
++    if ((!i->placed || i->arena) && i->mem) { g_alloc_bytes -= i->alloc; if (i->sysmem) { g_sys_bytes -= i->alloc; g_sys_align -= (i->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= i->alloc; g_img_align -= (i->alloc + 65535ull) & ~65535ull; }
++        nvmtl_image_mem_free(i); }   // <wtl> §37.17: a range goes back to its block
+     memset(i, 0, sizeof *i);
+ }
+ 
+@@ -6213,7 +6680,7 @@
+     out[3] = g_res1_off_b >> 20; out[4] = g_res1_on_b >> 20; out[5] = g_res1_calls; }
+ int nvmtl_vk_image_reback(nvk_image *i, int to_sysmem, int a8)
+ {
+-    if (g_state != 1 || !i || !i->img || i->placed || !i->usage || i->vpair || i->samples > 1 || i->mtl_type == 4 || i->mtl_type > 7
++    if (g_state != 1 || !i || !i->img || i->placed || i->arena || !i->usage || i->vpair || i->samples > 1 || i->mtl_type == 4 || i->mtl_type > 7
+         || (i->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) return -1;
+     nvmtl_vk_image_upload_barrier(i);   // migrating the image recreates its memory: drain a pending upload first
+     if (!to_sysmem == !i->sysmem) return 1;
+@@ -6270,7 +6737,7 @@
+     if (g_state != 1 || !o || !o->img) return;
+     if (o->view) pvkDestroyImageView(g_dev, (VkImageView)o->view, NULL);
+     pvkDestroyImage(g_dev, (VkImage)o->img, NULL);
+-    if (o->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)o->mem, NULL); g_alloc_bytes -= o->alloc; if (o->sysmem) { g_sys_bytes -= o->alloc; g_sys_align -= (o->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= o->alloc; g_img_align -= (o->alloc + 65535ull) & ~65535ull; }    }
++    if (o->mem) { if (o->arena) nvmtl_image_mem_free(o); else pvkFreeMemory(g_dev, (VkDeviceMemory)o->mem, NULL); g_alloc_bytes -= o->alloc; if (o->sysmem) { g_sys_bytes -= o->alloc; g_sys_align -= (o->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= o->alloc; g_img_align -= (o->alloc + 65535ull) & ~65535ull; }    }
+     memset(o, 0, sizeof *o);
+ }
+ static __thread nvk_cmdbuf t_mig_cb; static __thread nvk_cmdbuf *t_mig_batch; static __thread unsigned t_mig_n;
+@@ -6292,7 +6759,7 @@
+ }
+ int nvmtl_vk_image_migrate(nvk_image *i, int to_sysmem, int a8, nvk_image *old_out)
+ {
+-    if (g_state != 1 || !i || !i->img || i->placed || !i->usage || i->vpair || i->samples > 1 || i->mtl_type == 4 || i->mtl_type > 7
++    if (g_state != 1 || !i || !i->img || i->placed || i->arena || !i->usage || i->vpair || i->samples > 1 || i->mtl_type == 4 || i->mtl_type > 7
+         || (i->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) return -1;
+     if (!to_sysmem == !i->sysmem) return 1;
+     const uint32_t t = i->mtl_type, mips = i->mips ? i->mips : 1, nl = t == 7 ? 1 : (i->layers ? i->layers : 1);
+@@ -6598,6 +7065,60 @@
+     }
+     return on;
+ }
++// <wtl> §37.19 explicit residency (native-display docs/37-RENDER-COMPRESSION.md): ANV puts every VkDeviceMemory in every
++// execbuffer, ~100 of them WindowServer's surface imports, each looked up, pinned and fenced by the kernel on every
++// submit.  Our ANV (i915/anv_batch_chain.c) leaves a memory marked explicit out unless a command buffer declared it; the
++// imports are marked when made, and each submission part declares the imports of every texture it holds (its retained
++// resources and dirty surfaces) and then says its list is complete; any other submission still carries them all.  A
++// marked memory left out is not resident at all if no execbuffer carried it before (scratchpad xres-test: an undeclared
++// copy read nothing), so only a part's own command buffer opts in.
++// Off with /Library/GPUBundles/.xemtl-no-xres or an ANV without the entry points.
++static void (*p_anv_xres_mark)(VkDeviceMemory, int);
++static void (*p_anv_xres_use)(VkCommandBuffer, VkDeviceMemory);
++static void (*p_anv_xres_stats)(uint64_t *);
++static void (*p_anv_xres_excl)(VkCommandBuffer);
++static int nvmtl_xres_on(void)
++{
++    static _Atomic int st;
++    int v = atomic_load(&st);
++    if (v) return v > 0;
++    void *d = dlopen("/Library/GPUBundles/xemtl/libvulkan_intel.dylib", RTLD_NOW | RTLD_NOLOAD);   // the ANV the loader opened (RTLD_LOCAL)
++    if (!d && g_dev) {   // else the image a device command lives in (the loader hands out the driver's own for those)
++        Dl_info di; void *fn = (void *)pvkGetDeviceProcAddr(g_dev, "vkCmdDraw");
++        if (fn && dladdr(fn, &di) && di.dli_fname) d = dlopen(di.dli_fname, RTLD_NOW | RTLD_NOLOAD);
++    }
++    if (d) {
++        p_anv_xres_mark = (void (*)(VkDeviceMemory, int))dlsym(d, "anv_xemtl_memory_explicit");
++        p_anv_xres_use = (void (*)(VkCommandBuffer, VkDeviceMemory))dlsym(d, "anv_xemtl_cmd_use_memory");
++        p_anv_xres_stats = (void (*)(uint64_t *))dlsym(d, "anv_xemtl_stats");
++        p_anv_xres_excl = (void (*)(VkCommandBuffer))dlsym(d, "anv_xemtl_cmd_exclusive");
++    }
++    v = (p_anv_xres_mark && p_anv_xres_use && p_anv_xres_stats && p_anv_xres_excl && access("/Library/GPUBundles/.xemtl-no-xres", F_OK) != 0) ? 1 : -1;
++    nvlog("xres: explicit residency for surface imports %s", v > 0 ? "ON" : p_anv_xres_mark ? "off (switch)" : "off (ANV without it)");
++    atomic_store(&st, v);
++    return v > 0;
++}
++void nvmtl_vk_cmd_use_import(nvk_cmdbuf *c, const nvk_buffer *b)
++{
++    if (c && c->cb && b && b->mem && nvmtl_xres_on()) p_anv_xres_use((VkCommandBuffer)c->cb, (VkDeviceMemory)b->mem);
++}
++// every import the command buffer touches has been declared: ANV may leave the other marked ones out of its execbuffer
++// (only when every command buffer of that execbuffer says so; until the command buffer is reset)
++void nvmtl_vk_cmd_xres_complete(nvk_cmdbuf *c)
++{
++    if (c && c->cb && nvmtl_xres_on()) p_anv_xres_excl((VkCommandBuffer)c->cb);
++}
++static uint64_t nvmtl_xres_stat(int k)
++{
++    uint64_t o[3] = { 0, 0, 0 };
++    if (p_anv_xres_stats) p_anv_xres_stats(o);
++    return o[k];
++}
++static void nvmtl_xres_mark(const nvk_buffer *b)
++{
++    if (b && b->mem && nvmtl_xres_on()) p_anv_xres_mark((VkDeviceMemory)b->mem, 1);
++}
++// </wtl>
+ int nvmtl_vk_surface_host_import(void *base, size_t alloc, nvk_buffer *out)
+ {
+     memset(out, 0, sizeof *out);
+@@ -6609,9 +7130,12 @@
+     const size_t up = (alloc + g_host_align - 1) & ~(g_host_align - 1);
+     if (up != alloc && !nvmtl_vk_buffer_import_host(base, up, out)) {
+         static int said; if (!said++) nvlog("vk: surface host import: alloc %zu rounded up to %zu (alignment %zu) so the last row is inside the import", alloc, up, g_host_align);
++        nvmtl_xres_mark(out);   // <wtl> §37.19
+         return 0;
+     }
+-    return nvmtl_vk_buffer_import_host(base, alloc & ~(g_host_align - 1), out);
++    const int r = nvmtl_vk_buffer_import_host(base, alloc & ~(g_host_align - 1), out);
++    if (!r) nvmtl_xres_mark(out);   // <wtl> §37.19
++    return r;
+ }
+ // <wtl> Surface host-import cache (native-display docs/32-FRAME-RATE.md §32.10).  WindowServer wraps the same IOSurfaces
+ // in new MTLTextures every frame; each texture imported the surface's pages again, which is a new i915 userptr object
+@@ -6627,8 +7151,12 @@
+ // the pages through the import; the import's CPU view is the retained ref's mapping, which lives as long as the entry.
+ #include <IOSurface/IOSurfaceRef.h>
+ #define NVMTL_HC_SLOTS 96
+-#define NVMTL_HC_IDLE_NS 2000000000ull
+-#define NVMTL_HC_IDLE_BYTES (768ull << 20)
++// <wtl> §37.18: idle imports are kept 30 s (2 GiB at most), not 2 s (768 MiB): with imports by surface an import costs
++// only its wiring to keep, but a new one is a new GEM object bound page by page again -- genie re-imported ~7
++// surfaces a second (13 GB of pages a minute), the same IDs coming back after their 2 s, and binding them became
++// most of the execbuffer time (data/genie10-surfimp-20261103)
++#define NVMTL_HC_IDLE_NS 30000000000ull
++#define NVMTL_HC_IDLE_BYTES (2048ull << 20)
+ #define NVMTL_HC_GONE 8
+ typedef struct { IOSurfaceRef surf; uint32_t id; void *base; size_t alloc; nvk_buffer b; int refs; uint64_t idle; } nvmtl_hc_ent;
+ static nvmtl_hc_ent g_hc[NVMTL_HC_SLOTS];
+@@ -6643,7 +7171,7 @@
+     }
+     return on;
+ }
+-// Under g_hc_lock: takes idle imports past their 2 s, then the oldest idle ones while idle imports exceed the budget,
++// Under g_hc_lock: takes idle imports past their NVMTL_HC_IDLE_NS, then the oldest idle ones while idle imports exceed the budget,
+ // out of the table into gone[] (at most NVMTL_HC_GONE; the rest go next time).  The caller frees them unlocked.
+ static unsigned nvmtl_hc_sweep(uint64_t now, nvmtl_hc_ent *gone)
+ {
+@@ -6670,6 +7198,86 @@
+ }
+ // The IOSurface's pages as device memory, shared with every other texture on the same surface.  0 on success;
+ // give it back with nvmtl_vk_surface_host_put().
++// <wtl> §37.17 (native-display docs/37-RENDER-COMPRESSION.md): import a surface by its kernel memory, as Apple's
++// IOAcceleratorFamily2 and NullMoth's imports by surface ID do.  The host-pointer import below stays as it is (ANV
++// cannot import a GEM handle through the libdrm stand-in's fds: it sizes them with lseek, and they are pipes); it is
++// announced first: the accelerator hands the surface's IOMemoryDescriptor to the core for a ticket (selector 11), the
++// core is told which pointer and size that ticket stands for on ANV's own DRM file (SURF_EXPECT), and the
++// DRM_IOCTL_I915_GEM_USERPTR ANV makes for it then gets an object made of the surface's memory -- no per-page pinning.
++// An announcement that does not match (another size tried) or is refused leaves the plain userptr import, as before.
++// /Library/GPUBundles/.xemtl-no-surfimport or /private/tmp/xemtl-no-surfimport (checked every second) switch it off.
++struct nvmtl_xg_surf_expect { uint32_t ticket, pad; uint64_t user_ptr, user_size; };
++#define NVMTL_XG_SURF_EXPECT _IOW('N', 0x4A, struct nvmtl_xg_surf_expect)
++static int nvmtl_drm_syms(void)
++{
++    static _Atomic int st;
++    if (atomic_load(&st)) return atomic_load(&st) > 0;
++    if (!p_drmIoctl || !p_drmPrimeFDToHandle) {
++        void *d = dlopen("/Library/GPUBundles/xemtl/libdrm.2.dylib", RTLD_NOW | RTLD_NOLOAD);   // the copy ANV loaded
++        if (d) { p_drmPrimeFDToHandle = (int (*)(int, int, uint32_t *))dlsym(d, "drmPrimeFDToHandle");
++                 p_drmIoctl = (int (*)(int, unsigned long, void *))dlsym(d, "drmIoctl"); }
++    }
++    atomic_store(&st, p_drmIoctl && p_drmPrimeFDToHandle ? 1 : -1);
++    return atomic_load(&st) > 0;
++}
++// ANV's own DRM file (its GEM handles live there): the one that knows the fd of a small export of ours
++static int nvmtl_anv_drm_fd(void)
++{
++    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static int fd = -2;
++    pthread_mutex_lock(&mu);
++    if (fd == -2) {
++        fd = -1;
++        PFN_vkGetMemoryFdKHR gfd = (PFN_vkGetMemoryFdKHR)pvkGetDeviceProcAddr(g_dev, "vkGetMemoryFdKHR");
++        const uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
++        const int mt = memtype(all, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++        if (gfd && mt >= 0 && nvmtl_drm_syms()) {
++            VkExportMemoryAllocateInfo ex = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++            VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ex, 4096, (uint32_t)mt };
++            VkDeviceMemory m = VK_NULL_HANDLE;
++            if (pvkAllocateMemory(g_dev, &mai, NULL, &m) == VK_SUCCESS) {
++                VkMemoryGetFdInfoKHR gi = { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, NULL, m, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT };
++                int efd = -1; uint32_t h = 0;
++                if (gfd(g_dev, &gi, &efd) == VK_SUCCESS && efd >= 0) { fd = nvmtl_ccs_handle(efd, &h); close(efd); }
++                pvkFreeMemory(g_dev, m, NULL);
++            }
++        }
++        nvlog("surface import: ANV's DRM file is fd %d%s", fd, fd < 0 ? " -- imports by surface off" : "");
++    }
++    const int r = fd;
++    pthread_mutex_unlock(&mu);
++    return r;
++}
++// announce the host-pointer import of [base, base + size) as surface sid's memory; 0 when the core took it
++static int nvmtl_vk_surface_expect(uint32_t sid, void *base, size_t size)
++{
++    static _Atomic int off_sel;   // the accelerator has no selector 11
++    static _Atomic uint64_t checked; static _Atomic int off;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (now - atomic_load(&checked) > 1000000000ull) {
++        atomic_store(&off, access("/Library/GPUBundles/.xemtl-no-surfimport", F_OK) == 0 || access("/private/tmp/xemtl-no-surfimport", F_OK) == 0);
++        atomic_store(&checked, now);
++    }
++    if (atomic_load(&off) || atomic_load(&off_sel) || !sid || !base || !size || nvmtl_vk_vendor() != 0x8086 || !nvmtl_mark_conn()) return -1;
++    const int drmfd = nvmtl_anv_drm_fd();
++    if (drmfd < 0) return -1;
++    uint64_t in = sid, o[2] = { 0, 0 }; uint32_t no = 2;
++    const kern_return_t kr = IOConnectCallScalarMethod(g_mark_conn, 11, &in, 1, o, &no);
++    if (kr != KERN_SUCCESS) {
++        if (kr == (kern_return_t)0xe00002c7 /* kIOReturnUnsupported */ || kr == (kern_return_t)0xe00002c2 /* kIOReturnBadArgument */) {
++            if (!atomic_exchange(&off_sel, 1)) nvlog("surface import: the accelerator has no selector 11 (0x%x) -- imports by surface off", kr); }
++        atomic_fetch_add(&g_si_fail, 1); return -1;
++    }
++    struct nvmtl_xg_surf_expect ex = { (uint32_t)o[0], 0, (uint64_t)(uintptr_t)base, (uint64_t)size };
++    if (p_drmIoctl(drmfd, NVMTL_XG_SURF_EXPECT, &ex) != 0) {
++        const unsigned n = (unsigned)atomic_fetch_add(&g_si_fail, 1);
++        if (n < 8) nvlog("surface import: surface %u (%zu bytes at %p): the core refused the announcement (errno %d)", sid, size, base, errno);
++        return -1;
++    }
++    const unsigned n = (unsigned)atomic_fetch_add(&g_si_ok, 1);
++    if (n < 4) nvlog("surface import: surface %u (%zu bytes at %p) is imported by surface (ticket %u)", sid, size, base, ex.ticket);
++    return 0;
++}
++// </wtl>
+ int nvmtl_vk_surface_host_get(IOSurfaceRef surf, nvk_buffer *out)
+ {
+     memset(out, 0, sizeof *out);
+@@ -6677,7 +7285,8 @@
+     void *base = IOSurfaceGetBaseAddress(surf);
+     const size_t alloc = IOSurfaceGetAllocSize(surf);
+     const uint32_t id = IOSurfaceGetID(surf);
+-    if (!nvmtl_hc_on()) return nvmtl_vk_surface_host_import(base, alloc, out);
++    const size_t up = g_host_align ? (alloc + g_host_align - 1) & ~(g_host_align - 1) : alloc;   // <wtl> §37.17: the size the import tries first
++    if (!nvmtl_hc_on()) { (void)nvmtl_vk_surface_expect(id, base, up); return nvmtl_vk_surface_host_import(base, alloc, out); }
+     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+     nvmtl_hc_ent gone[NVMTL_HC_GONE]; unsigned ng;
+     pthread_mutex_lock(&g_hc_lock);
+@@ -6704,6 +7313,7 @@
+     pthread_mutex_unlock(&g_hc_lock);
+     nvmtl_hc_free(gone, ng);
+     nvk_buffer b;
++    (void)nvmtl_vk_surface_expect(id, base, up);   // <wtl> §37.17
+     if (nvmtl_vk_surface_host_import(base, alloc, &b)) return -1;
+     atomic_fetch_add(&g_hc_misses, 1);
+     nvk_buffer dup; memset(&dup, 0, sizeof dup);
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -10,7 +10,9 @@
+ const char *nvmtl_image_ident(const void *addr, char *out, size_t n);
+ typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int mtype1; /* memory type + 1 when known (imported) */ } nvk_buffer;
+ #include "nvmtl_sample_positions.h"
+-typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  uint64_t up_token; } nvk_image;
++typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  uint64_t up_token; uint32_t kind;
++                 uint32_t ccs_sid, ccs_token, ccs_handle; int ccs_drmfd; /* <wtl> §37.14: a registered compressed scanout image */
++                 void *arena; uint64_t aoff; /* <wtl> §37.17: suballocated from that image arena block at that offset (mem is the block's) */ } nvk_image;
+ #define NVMTL_NVAR 16
+ #define NVMTL_NVAR_MAX 4096
+ #define NVMTL_NCOL 8
+@@ -80,7 +82,11 @@
+                  unsigned direct_sass;   /* recorded a dispatch of compiled machine code: never reuse this pool */
+                  void *occlusion_pages; uint32_t occlusion_count;
+                  void *timing_pool; nvmtl_gpu_interval timing;
+-                 void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4]; uint32_t pt_d[128];
++                 void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4]; uint32_t pt_d[128]; uint32_t pt_k[128], pt_iw[128], pt_ih[128];
++                 /* <wtl> §37.19 per-draw GPU time while /tmp/nvmtl-drawtime-request exists (with passtime armed): a timestamp
++                    after every draw of a timed pass (serialises draws), the draw's fragment shader, vertex count, scissor,
++                    and the first two fragment textures (kind, size, mips) */
++                 void *dt; uint32_t dt_fs, dt_cnt, dt_scw, dt_sch, dt_tex[2][4];
+                  void *counter_recording; unsigned counter_error;
+                  nvmtl_sample_pattern sample_pattern;
+                  void **rvs; unsigned nrv, caprv;
+@@ -380,8 +386,17 @@
+ uint64_t nvmtl_vk_po_wait(uint32_t timeoutMs);
+ void nvmtl_vk_po_done(uint32_t surfaceID, uint32_t seq, int ok);
+ void nvmtl_vk_po_detach(uint32_t surfaceID);
++// <wtl> §37.14 phase 2: compressed scanout (native-display docs/37-RENDER-COMPRESSION.md)
++int nvmtl_vk_ccs_on(void);
++int nvmtl_vk_image_create_ccs(uint32_t surfaceID, uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int stex, nvk_image *out);
++// </wtl>
+ int nvmtl_vk_tile4_content(uint32_t surfaceID);
+ void nvmtl_vk_tile4_content_set(uint32_t surfaceID, int tile4);
+ int nvmtl_vk_image_create_buffer_alias_tile4(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, int storage, int render,
+                                        const nvk_buffer *b, size_t offset, size_t row_pitch, nvk_image *out);
+ int nvmtl_vk_accel_surface_wait(void);
++// <wtl> §37.11 texture census: which path made each large image, and the passes drawn into it
++enum { NVMTL_TC_UNKNOWN, NVMTL_TC_PLAIN, NVMTL_TC_HEAP, NVMTL_TC_BUFFER, NVMTL_TC_PAGES, NVMTL_TC_PAGES_T4, NVMTL_TC_PAGEOFF,
++       NVMTL_TC_COPIED, NVMTL_TC_VRAM, NVMTL_TC_CCS, NVMTL_TC_N };
++void nvmtl_vk_tc_made(nvk_image *i, uint32_t kind);
++// </wtl>
