@@ -37,5 +37,33 @@ passtime 每行：`cb` 命令缓冲序号、`pass` 序号、目标尺寸、格�
 前四个不同的着色器哈希，新版本末尾还有 `draws`。时间线每行：两帧间隔、排队到取出、取出到合成完成、合成完成到 arm、
 arm 到锁存、锁存到通知、通知到下一帧排进来（µs），最后是 surface ID、是否提前通知、是否成功。
 
+## 2026-11-04：压缩扫描开着时的神奇效果
+
+core `2b5aec7c0062`、accel `44aeb7cba2f5`（压缩扫描默认开）、插件 `3d0edaa47fc8`（passtime 带每个 pass 的片段着色器哈希）。
+
+| 文件 | 内容 |
+| --- | --- |
+| `genie14-passtime.log.gz`、`genie14-flips.txt`、`genie14-tl.txt` | 一分钟神奇效果：passtime、每 10 ms 的翻页计数、每帧时间线；显示器用 ColorSync 按 EDID 生成的配置文件 |
+| `genie15-passtime.log.gz`、`genie15-flips.txt`、`genie15-tl.txt` | 同上，显示器配置文件换成 sRGB IEC61966-2.1：色彩匹配着色器 44d03494 仍然出现 |
+
+## 2026-11-05：帧率、每帧时间线、逐 draw 的源和目标
+
+core `7f4f344c9e19`（`0028`）、accel `44aeb7cba2f5`（`0029`）、ANV `be2e76920ce3`（与 `0033` 相比只多了几行注释，代码相同）。
+插件分两段：`19bea7235828`（= `0031`）和临时的诊断版 `0bec5f57cb58`（在 `0031` 基础上给 passtime / drawtime 加了渲染目标与纹理的身份：
+`tgt` / `id`，`0x80000000 | IOSurface ID` 是已登记的 scanout surface，其他是图像地址右移 4 位）。诊断版期间帧率偏低、出现过旧帧，
+之后已经换回 `19bea7235828`。
+
+| 文件 | 内容 | 插件 |
+| --- | --- | --- |
+| `passtime-steady.log.gz` | `scripts/tools/genie-fps` 稳定测试时的 passtime（每个命令缓冲 p50 3.76 ms，91% 在 3840×2400 的 pass 上） | `19bea7235828` |
+| `drawtime-steady.log.gz` | 同一测试的逐 draw 计时（会让 draw 串行，绝对值偏大） | `19bea7235828` |
+| `tl-steady-550mhz.txt`、`tl-steady-1300mhz.txt` | `debug.nvaccel_iop_xe_tl`：稳定测试时 GPU 停在 550 MHz（合成 p50 4.4 ms，两帧间隔 p50 8.1 ms），和 SLPC 恢复调频以后（1.4 ms、4.9 ms） | `19bea7235828` |
+| `drawtime-tgtid-steady.log.gz`、`drawtime-tgtid-genie.log.gz` | 逐 draw 计时带源 / 目标：神奇效果里 Core Animation 每帧约 1.5 次把整屏（菜单栏以下 3840×2341）从 scanout 拷进一张私有图像 | `0bec5f57cb58` |
+| `passtime-rt-steady.log.gz`、`drawtime-rt-genie.log.gz` | 同上，“降低透明度”打开：背景捕获减半，神奇效果没有变快 | `0bec5f57cb58` |
+| `tl-genie.txt` | 只跑神奇效果时的每帧时间线（通知到下一帧 p50 7.6 ms、p90 31 ms） | `0bec5f57cb58` |
+| `fps-history.tsv` | `scripts/tools/genie-fps.sh` 每次运行一行：开机分钟、WindowServer 运行时间、稳定 fps 与帧间隔、神奇效果 fps 与最长间隔、忙时 GPU 频率与停在 550 MHz 的比例；13:56–14:00 的几行是诊断版加降低透明度，14:3x 的几行是换回之后 | 见各行时间 |
+
+逐 draw 日志用 `scripts/tools/dt-tgt.py` 汇总，时间线用 `scripts/tools/tl-summ.py`。分析见 `docs/render-compression.md`。
+
 采集与汇总工具都在 `scripts/tools/`（补丁 `0027` 也把它们加进源码树的 `tools/`）：`fps-probe.m`、`anim-probe.m`、`flip-sampler.pl`、`mark-timeout-watch.sh` 采集，`anim-summary.py`（读 stdin）、`passtime-summ.py`、`passtime-sizes.py` 汇总，后两个可以直接读 `.gz`，例如 `python3 scripts/tools/passtime-sizes.py logs/2026-10-31/genie-lazy-passtime.log.gz logs/2026-10-31/genie-coherent-passtime.log.gz`。时间线和 `xe-locks` 是 sysctl 的原样输出，不需要工具。分析见 `docs/frame-pipeline.md` 和
 `docs/page-off-and-compression.md`。
