@@ -1,0 +1,325 @@
+# 0035 XeGfx core: hardware colour for WindowServer's display transactions, GPU clock floor for late frames
+#
+# Base:  XeGfx core after 0001 + 0008 + 0011 + 0020 + 0022 + 0023 + 0028
+# Files: gpu/xkpi/src/i915/{xg_display_hook.c,xg_display_hook.h,xg_i915_exec.c},
+#        gpu/xegfx/shim/src/xnu/xg_kext.cpp, gpu/xegfx/shim/include/xg_i915.h
+# Apply: patch -p1 < patches/0035-core-pipe-colour-gt-floor.patch
+# Build: XeGfx 716e17c8ae70 (build/nvgfx/build_xegfx.sh; link, KPI and shadow checks pass)
+#
+# Hardware colour (Night Shift, colour profiles; docs/render-compression.md):
+#   - once AGDC answers the pipe's colour stages (0030), CoreDisplay stops doing colour in a GPU pass and hands the
+#     linearisation, colour matrix and encoding to the display pipe with each transaction.  Nothing applied them, so
+#     dragging the Night Shift slider did nothing.
+#   - resident call "xgPipeColour" (struct xg_pipe_colour: pre table, post table, 3x4 matrix as float bit patterns)
+#     commits them to the CRTC's DEGAMMA_LUT, CTM and GAMMA_LUT in one CRTC-only atomic commit (EDEADLK retried, the
+#     joined pipe follows through i915).  Tables are resampled linearly to the LUT sizes; floats are converted with
+#     integer arithmetic (0..65535 for LUT entries, S31.32 sign-magnitude for the CTM).  DSB is not used for these
+#     commits.  Logs one line per commit with the sizes and the time it took (~5 ms).
+#
+# GPU clock floor: resident call "xgGtMin" (int set_mhz or 0 to read, int *min, int *max) reads or sets the SLPC
+# minimum frequency (intel_rps_set_min_frequency) and reports the max soft limit, for the accel's late-frame floor
+# (0036).  Thread context; it sleeps for the GuC request.
+--- a/gpu/xkpi/src/i915/xg_display_hook.c
++++ b/gpu/xkpi/src/i915/xg_display_hook.c
+@@ -1551,6 +1551,199 @@
+ }
+ 
+ /*
++ * §37.28 hardware colour.  Since the AGDC answers the display pipe's colour stages (0030), CoreDisplay no longer runs its
++ * full-screen GPUPass: it hands the linearization, the colour matrix and the encoding to the display pipe in each
++ * transaction, as Apple's ICL driver expects (IGAccelDisplayPipe::PerformGammaTransaction / PerformCscTransaction).
++ * Until now nothing applied them, so Night Shift and colour profiles had no effect.  Here they become i915's crtc
++ * DEGAMMA_LUT, CTM and GAMMA_LUT, committed with the crtc only (i915 copies them to a joined pipe B).  The tables are
++ * resampled to the pipe's LUT sizes.  LUT loads go through MMIO, not the DSB, which nothing else here uses yet.
++ */
++static u16
++xg_colour_f32_q16(u32 bits)
++{
++	const u32 e = (bits >> 23) & 0xff;
++	u64 m, v;
++	int sh;
++
++	if ((bits & 0x80000000u) || e == 0)
++		return (0);
++	if (e == 0xff)
++		return (0xffff);
++	m = (u64)((bits & 0x7fffffu) | 0x800000u) * 65535u;
++	sh = 150 - (int)e;
++	if (sh <= 0)
++		return (0xffff);
++	if (sh >= 63)
++		return (0);
++	v = (m + (1ull << (sh - 1))) >> sh;
++	return (v > 0xffff ? 0xffff : (u16)v);
++}
++
++/* S31.32 sign-magnitude, as struct drm_color_ctm wants it */
++static u64
++xg_colour_f32_s3132(u32 bits)
++{
++	const u32 e = (bits >> 23) & 0xff;
++	const u64 sign = (u64)(bits >> 31) << 63;
++	u64 m, mag;
++	int sh;
++
++	if (e == 0)
++		return (0);
++	m = (u64)((bits & 0x7fffffu) | 0x800000u);
++	sh = (int)e - 118;	/* value * 2^32 = m * 2^(e - 150 + 32) */
++	if (e == 0xff || sh >= 40)
++		mag = 0x7fffffffffffffffull;
++	else if (sh >= 0)
++		mag = m << sh;
++	else if (sh > -63)
++		mag = m >> -sh;
++	else
++		mag = 0;
++	return (sign | (mag & 0x7fffffffffffffffull));
++}
++
++/* n RGB entries (float bits) resampled to size entries */
++static struct drm_property_blob *
++xg_colour_lut_blob(struct drm_device *dev, const u32 *rgb, unsigned int n, unsigned int size)
++{
++	struct drm_property_blob *blob;
++	struct drm_color_lut *lut;
++	unsigned int i, ch;
++
++	if (n < 2 || size < 2)
++		return (NULL);
++	blob = drm_property_create_blob(dev, sizeof(*lut) * size, NULL);
++	if (IS_ERR(blob))
++		return (blob);
++	lut = blob->data;
++	for (i = 0; i < size; i++) {
++		const u64 pos = (u64)i * (n - 1) * 65536u / (size - 1);
++		const unsigned int j = (unsigned int)(pos >> 16) < n - 1 ? (unsigned int)(pos >> 16) : n - 2;
++		const s64 f = (s64)(pos - ((u64)j << 16));
++		u16 out[3];
++
++		for (ch = 0; ch < 3; ch++) {
++			const s64 a = xg_colour_f32_q16(rgb[3 * j + ch]), b = xg_colour_f32_q16(rgb[3 * (j + 1) + ch]);
++			s64 v = a + (((b - a) * f) >> 16);
++
++			out[ch] = (u16)(v < 0 ? 0 : v > 0xffff ? 0xffff : v);
++		}
++		lut[i].red = out[0];
++		lut[i].green = out[1];
++		lut[i].blue = out[2];
++		lut[i].reserved = 0;
++	}
++	return (blob);
++}
++
++static struct drm_property_blob *
++xg_colour_ctm_blob(struct drm_device *dev, const struct xg_pipe_colour *c, int *offsets)
++{
++	struct drm_property_blob *blob;
++	struct drm_color_ctm *ctm;
++	unsigned int r, k;
++
++	blob = drm_property_create_blob(dev, sizeof(*ctm), NULL);
++	if (IS_ERR(blob))
++		return (blob);
++	ctm = blob->data;
++	*offsets = 0;
++	for (r = 0; r < 3; r++) {
++		for (k = 0; k < 3; k++) {
++			const unsigned int rr = (c->matrix_mode & 2) ? k : r, cc = (c->matrix_mode & 2) ? r : k;
++			const u32 bits = (c->matrix_mode & 1) ? c->matrix[rr * 3 + cc] : c->matrix[rr * 4 + cc];
++
++			ctm->matrix[r * 3 + k] = xg_colour_f32_s3132(bits);
++		}
++		if (((c->matrix_mode & 1) ? c->matrix[9 + r] : c->matrix[r * 4 + 3]) & 0x7fffffffu)
++			*offsets = 1;
++	}
++	return (blob);
++}
++
++int
++xg_display_kms_colour(const struct xg_pipe_colour *c, unsigned int *us_out)
++{
++	struct intel_display *display = gXgKmsDisplay;
++	struct intel_crtc *crtc = gXgKmsCrtc;
++	struct drm_property_blob *pre = NULL, *ctm = NULL, *post = NULL;
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_crtc_state *cs;
++	unsigned int dsz, gsz;
++	char line[200];
++	int ret, offsets = 0;
++	u64 t0;
++
++	if (c == NULL || c->version != XG_PIPE_COLOUR_VERSION || c->npre > XG_PIPE_COLOUR_MAX ||
++	    c->npost > XG_PIPE_COLOUR_MAX)
++		return (-EINVAL);
++	if (!gXgKmsCommitted || display == NULL || crtc == NULL)
++		return (-EAGAIN);
++	dsz = DISPLAY_INFO(display)->color.degamma_lut_size;
++	gsz = DISPLAY_INFO(display)->color.gamma_lut_size;
++	if ((c->flags & XG_PIPE_COLOUR_PRE) && dsz)
++		pre = xg_colour_lut_blob(display->drm, c->pre, c->npre, dsz);
++	if ((c->flags & XG_PIPE_COLOUR_MATRIX))
++		ctm = xg_colour_ctm_blob(display->drm, c, &offsets);
++	if ((c->flags & XG_PIPE_COLOUR_POST) && gsz)
++		post = xg_colour_lut_blob(display->drm, c->post, c->npost, gsz);
++	if (IS_ERR(pre) || IS_ERR(ctm) || IS_ERR(post)) {
++		ret = -ENOMEM;
++		goto blobs;
++	}
++	t0 = ktime_get_ns();
++	mutex_lock(&gXgKmsModeLock);
++	display->params.enable_dsb = false;
++	state = drm_atomic_state_alloc(display->drm);
++	if (state == NULL) {
++		mutex_unlock(&gXgKmsModeLock);
++		ret = -ENOMEM;
++		goto blobs;
++	}
++	drm_modeset_acquire_init(&ctx, 0);
++	state->acquire_ctx = &ctx;
++	to_intel_atomic_state(state)->internal = true;
++retry:
++	cs = drm_atomic_get_crtc_state(state, &crtc->base);
++	if (IS_ERR(cs)) {
++		ret = PTR_ERR(cs);
++		goto out;
++	}
++	cs->color_mgmt_changed |= drm_property_replace_blob(&cs->degamma_lut, pre);
++	cs->color_mgmt_changed |= drm_property_replace_blob(&cs->ctm, ctm);
++	cs->color_mgmt_changed |= drm_property_replace_blob(&cs->gamma_lut, post);
++	ret = cs->color_mgmt_changed ? drm_atomic_commit(state) : 0;
++out:
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++	drm_atomic_state_put(state);
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++	if (ret == 0)
++		xg_kms_update_joiner();
++	mutex_unlock(&gXgKmsModeLock);
++	if (us_out != NULL)
++		*us_out = (unsigned int)((ktime_get_ns() - t0) / 1000);
++	snprintf(line, sizeof(line), "kms: colour degamma %u->%u ctm %s%s gamma %u->%u: %d in %llu us",
++	    pre ? c->npre : 0, pre ? dsz : 0, ctm ? "set" : "off", offsets ? " (offsets ignored)" : "",
++	    post ? c->npost : 0, post ? gsz : 0, ret, (unsigned long long)((ktime_get_ns() - t0) / 1000));
++	xg_disp_line(display, line);
++blobs:
++	if (!IS_ERR_OR_NULL(pre))
++		drm_property_blob_put(pre);
++	if (!IS_ERR_OR_NULL(ctm))
++		drm_property_blob_put(ctm);
++	if (!IS_ERR_OR_NULL(post))
++		drm_property_blob_put(post);
++	return (ret);
++}
++
++/*
+  * K3: commit fixed mode n from the adapter's setDisplayMode.  Same rules as the K2 boot commit (DRRS off, 8 bpc, PSR
+  * off, the placeholder stays on the primary plane), plus DSC forced above 60 Hz: on its own i915 drops 240 Hz to
+  * 6 bpc rather than compress (§30.9).  A mode that needs the joiner is refused: the accel writes PLANE_SURF_1_A only,
+--- a/gpu/xkpi/src/i915/xg_display_hook.h
++++ b/gpu/xkpi/src/i915/xg_display_hook.h
+@@ -54,6 +54,29 @@
+ int xg_display_kms_joiner_info(unsigned int *active, unsigned int *delta, unsigned int *gen);
+ 
+ /*
++ * Hardware colour (native-display docs/37-RENDER-COMPRESSION.md §37.28): the colour state WindowServer attaches to its
++ * display-pipe transactions, as the accelerator reads it (IOAccelDisplayPipeTransaction2), for the pipe's pre-CSC
++ * degamma LUT, CSC and post-CSC gamma LUT.  Values are IEEE-754 single-precision bit patterns: the kernel has no
++ * floating point, so they are converted with integer arithmetic.  The accelerator keeps the same layout.
++ */
++#define XG_PIPE_COLOUR_VERSION	1
++#define XG_PIPE_COLOUR_MAX	4096
++#define XG_PIPE_COLOUR_PRE	0x1u	/* pre[] holds npre RGB entries: the linearization (pipe pre-gamma table) */
++#define XG_PIPE_COLOUR_POST	0x2u	/* post[] holds npost RGB entries: the encoding (pipe post-gamma table) */
++#define XG_PIPE_COLOUR_MATRIX	0x4u	/* matrix[] holds the colour matrix */
++struct xg_pipe_colour {
++	unsigned int	version;
++	unsigned int	flags;
++	unsigned int	npre, npost;
++	unsigned int	matrix_mode;	/* bit 0: 0 = 3x4 row-major, offsets in column 3; 1 = 3x3 row-major, then 3 offsets.
++					 * bit 1: transposed */
++	unsigned int	matrix[12];
++	unsigned int	pre[3 * XG_PIPE_COLOUR_MAX];
++	unsigned int	post[3 * XG_PIPE_COLOUR_MAX];
++};
++int xg_display_kms_colour(const struct xg_pipe_colour *c, unsigned int *us_out);
++
++/*
+  * M3b: read-only KMS KAPI v1.
+  *
+  * The KAPI is a static, fully const function table in this kext.  The nub
+--- a/gpu/xkpi/src/i915/xg_i915_exec.c
++++ b/gpu/xkpi/src/i915/xg_i915_exec.c
+@@ -287,6 +287,16 @@
+ 			return (err);
+ 	}
+ 	return ((int)intel_rps_get_min_frequency(rps));
++}
++
++/* the highest clock the minimum can be set to (the max soft limit), MHz */
++int
++xg_i915_gt_max_mhz(void)
++{
++	struct pci_dev *pdev = NULL;
++	struct drm_i915_private *i915 = xg_i915_find(&pdev);
++
++	return (i915 ? (int)intel_rps_get_max_frequency(&to_gt(i915)->rps) : -ENODEV);
+ }
+ 
+ /*
+--- a/gpu/xegfx/shim/src/xnu/xg_kext.cpp
++++ b/gpu/xegfx/shim/src/xnu/xg_kext.cpp
+@@ -223,6 +223,8 @@
+ extern "C" int xg_display_kms_joiner_info(unsigned int *active, unsigned int *delta, unsigned int *gen);
+ extern "C" int xg_display_kms_plane_layout(int want, int *cur);
+ extern "C" int xg_display_kms_plane_layout2(int want, int *cur, unsigned int ccs_off, unsigned int ccs_pitch);
++struct xg_pipe_colour;
++extern "C" int xg_display_kms_colour(const struct xg_pipe_colour *c, unsigned int *us_out);	/* §37.28 */
+ extern "C" int xg_surf_ticket(void *md, void *task, unsigned int *ticket, unsigned long long *size);	/* §37.17 */
+ 
+ IOReturn
+@@ -285,6 +287,13 @@
+ 	if (name && name->isEqualTo("xgPlaneLayout") && p2) {
+ 		int err = xg_display_kms_plane_layout((int)(intptr_t)p1, (int *)p2);
+ 		return (err == 0 ? kIOReturnSuccess : err == -EAGAIN ? kIOReturnNotReady : kIOReturnError);
++	}
++	/* "xgPipeColour" (const struct xg_pipe_colour *, unsigned *us out, int *result out): §37.28 -- the colour state of
++	 * WindowServer's display transactions committed to the pipe's degamma LUT, CSC and gamma LUT (xg_display_hook.c).
++	 * Thread context, sleeps (an atomic commit). */
++	if (name && name->isEqualTo("xgPipeColour") && p1 && p3) {
++		*(int *)p3 = xg_display_kms_colour((const struct xg_pipe_colour *)p1, (unsigned int *)p2);
++		return (kIOReturnSuccess);
+ 	}
+ 	/* "xgPlaneLayout2" (int want, int *cur out, u32 ccs offset, u32 ccs pitch): §37.14 -- as xgPlaneLayout, plus 2 =
+ 	 * Tile4 with render compression (MTL RC CCS), the CCS at that offset and pitch from each frame's start. */
+@@ -313,6 +322,15 @@
+ 		*(int *)p3 = xg_i915_flip_snap_wait(p1, (unsigned int)(uintptr_t)p2, (unsigned int *)p4);
+ 		return kIOReturnSuccess;
+ 	}
++	/* "xgGtMin" (int set_mhz or 0 to read, int *min out, int *max out): §37.29 -- XeGfxAccel raises the GPU clock floor
++	 * while compositor frames miss their vblank and puts it back after.  Thread context, sleeps (an SLPC request). */
++	if (name && name->isEqualTo("xgGtMin") && p2) {
++		const int r = xg_i915_gt_min_mhz((int)(intptr_t)p1);
++		*(int *)p2 = r;
++		if (p3)
++			*(int *)p3 = xg_i915_gt_max_mhz();
++		return (r < 0 ? kIOReturnError : kIOReturnSuccess);
++	}
+ 	if (name && name->isEqualTo("xgFlipSnapFree")) {
+ 		xg_i915_flip_snap_free(p1);
+ 		return kIOReturnSuccess;
+--- a/gpu/xegfx/shim/include/xg_i915.h
++++ b/gpu/xegfx/shim/include/xg_i915.h
+@@ -53,6 +53,7 @@
+ int xg_i915_gt_text(char *out, int max);
+ int xg_i915_gt_act_mhz(void);
+ int xg_i915_gt_min_mhz(int set_mhz);
++int xg_i915_gt_max_mhz(void);
+ void *xg_i915_flip_snapshot(void);
+ int xg_i915_flip_snap_wait(void *snap, unsigned int timeout_ms, unsigned int *fences);
+ void xg_i915_flip_snap_free(void *snap);
