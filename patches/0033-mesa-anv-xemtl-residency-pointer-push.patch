@@ -65,8 +65,11 @@
 # Verified offline with WindowServer's own 280 fragment shaders (taken from its SPIR-V cache and lowered the way the
 # plugin lowers them; scripts/tools/anv/): every shader rendered with deterministic inputs both with the pushes on and
 # off, compared byte for byte: 278 identical, the other 2 differ only in channels the shader never writes.  Pointer
-# push changes 25 of them: SENDs 1224 -> 167, estimated cycles -32.9%, one shader slower (3744 -> 4630).  In
-# WindowServer: Metal layers correct again, Genie about 79 fps with the GPU clock at its minimum.
+# push changes 25 of them: SENDs 1224 -> 167, estimated cycles -32.9%, one shader slower (3744 -> 4630).
+# In WindowServer (corrected 2026-11-06): this build was only installed on 11-06.  From 11-04 21:47 to then the older
+# build without the range fix was installed with both pushes switched off by /Library/GPUBundles/.xemtl-no-ssbo-push,
+# so the 11-05 results (Metal layers no longer black, Genie about 79 fps) were measured with the pushes off.  On 11-06,
+# with this build and the pushes on (and 0035-0037): Metal layers correct (user check), steady 126 fps, Genie 93 fps.
 #
 --- a/src/intel/compiler/brw/brw_shader.cpp
 +++ b/src/intel/compiler/brw/brw_shader.cpp

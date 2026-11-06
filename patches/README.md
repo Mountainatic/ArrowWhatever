@@ -1,6 +1,6 @@
 # patches/ —— 改动补丁系列
 
-本目录把项目里实际验证过的改动整理成三十四个可以按序应用的补丁。每个补丁开头的注释写明了基点提交、涉及文件、应用命令与改动意图，补丁体本身保持标准 unified diff，`a/` 与 `b/` 前缀可以直接配合 `patch -p1` 或 `git apply`。
+本目录把项目里实际验证过的改动整理成三十七个可以按序应用的补丁。每个补丁开头的注释写明了基点提交、涉及文件、应用命令与改动意图，补丁体本身保持标准 unified diff，`a/` 与 `b/` 前缀可以直接配合 `patch -p1` 或 `git apply`。
 
 ## 源码基点与组件补丁链
 
@@ -17,13 +17,13 @@
 
 | 组件 | 补丁链 |
 | --- | --- |
-| XeGfx core / xkpi | `0001 → 0008 → 0011 → 0020 → 0022 → 0023 → 0028` |
-| XeGfxAccel | `0002 → 0009 → 0012 → 0024 → 0029` |
+| XeGfx core / xkpi | `0001 → 0008 → 0011 → 0020 → 0022 → 0023 → 0028 → 0035` |
+| XeGfxAccel | `0002 → 0009 → 0012 → 0024 → 0029 → 0036` |
 | XeGfxIntelFB | `0003 → 0010 → 0014` |
 | XeGfxAGDC | `0004 → 0013 → 0017 → 0030` |
 | XeGfxDisplay | `0015 → 0018 → 0021 → 0025` |
 | native-display tools | `0016 → 0019 → 0027 → 0034` |
-| XeMTL | `0005 → 0006 → 0007 → 0026 → 0031` |
+| XeMTL | `0005 → 0006 → 0007 → 0026 → 0031 → 0037` |
 | libdrm | `0032` |
 | Mesa ANV | `0033` |
 
@@ -67,6 +67,9 @@
 | 0032 | `0032-libdrm-stale-export-and-trace.patch` | libdrm `b97cbde1` ＋ NvGfx 的两个 libdrm 补丁 | `xf86drm_xegfx.c` |
 | 0033 | `0033-mesa-anv-xemtl-residency-pointer-push.patch` | Mesa `bffd9194` ＋ NvGfx 的两个 Mesa 补丁 | `src/intel/compiler/brw/brw_shader.cpp`、`src/intel/vulkan/` 下 13 个文件（含 `i915/anv_batch_chain.c`） |
 | 0034 | `0034-tools-genie-fps-timeline-anv-harness.patch` | `0016 → 0019 → 0027` | 新增 `tools/{genie-fps.m,genie-fps.sh,tl-summ.py,dt-tgt.py,rearm-after-fallback.sh}`、`tools/livelog/`、`tools/anv/` |
+| 0035 | `0035-core-pipe-colour-gt-floor.patch` | `0001 → 0008 → 0011 → 0020 → 0022 → 0023 → 0028` | `gpu/xkpi/src/i915/{xg_display_hook.c,xg_display_hook.h,xg_i915_exec.c}`、`gpu/xegfx/shim/src/xnu/xg_kext.cpp`、`gpu/xegfx/shim/include/xg_i915.h` |
+| 0036 | `0036-accel-colour-gt-floor-numbered-marks.patch` | `0002 → 0009 → 0012 → 0024 → 0029` | `kexts/NVRM/accel/{nvrm-accel.cpp,xegfx_accel_names.h}` |
+| 0037 | `0037-plugin-numbered-marks.patch` | 本系列 0031 之后的插件树 | `plugin/{NVMTLEventSync.m,nvmtl_vk.c,nvmtl_vk.h}` |
 
 ## 应用方法
 
@@ -81,7 +84,7 @@ done
 
 patch -p1 -E < /path/to/patches/0013-agdc-m3d-in-kernel-arm.patch
 
-for n in 0014 0015 0016 0017 0018 0019 0020 0021 0022 0023 0024 0025 0027 0028 0029 0030 0034; do
+for n in 0014 0015 0016 0017 0018 0019 0020 0021 0022 0023 0024 0025 0027 0028 0029 0030 0034 0035 0036; do
   patch -p1 < /path/to/patches/$n-*.patch
 done
 ```
@@ -97,6 +100,7 @@ patch -p1 < /path/to/patches/0006-plugin-host-import.patch
 patch -p1 < /path/to/patches/0007-plugin-first-loss-journal.patch
 patch -p1 < /path/to/patches/0026-plugin-marks-tile4-pageoff.patch
 patch -p1 < /path/to/patches/0031-plugin-ccs-scanout-surface-import-arena.patch
+patch -p1 < /path/to/patches/0037-plugin-numbered-marks.patch
 ```
 
 `--remove-empty-files` 用于处理 `0005` 中的文件替换。最终得到当前 core/display 源码树与 XeMTL plugin 源码树。
@@ -122,10 +126,10 @@ patch -p1 < /path/to/patches/0032-libdrm-stale-export-and-trace.patch
 补丁系列使用对应上游基点进行重放验证：
 
 1. 在 `5a19a73f` 上按组件链应用 core、accel、IntelFB、AGDC、XeGfxDisplay 与 tools 补丁
-2. 在 `497d521e` 的 `plugin/` 上应用 `0005 → 0006 → 0007 → 0026 → 0031`；Mesa、libdrm 在各自基点加 NvGfx 移植补丁之后应用 `0033`、`0032`
+2. 在 `497d521e` 的 `plugin/` 上应用 `0005 → 0006 → 0007 → 0026 → 0031 → 0037`；Mesa、libdrm 在各自基点加 NvGfx 移植补丁之后应用 `0033`、`0032`
 3. 对补丁后的源码文件与实际构建输入做逐文件比对
 4. 检查 unified diff 应用结果、符号标记与新增文件
 
-当前 0.0.44 组件链、XeMTL plugin 链以及 Mesa、libdrm 补丁均可完整重放，没有 `.rej`；0028–0034 涉及的 96 个文件与实际构建输入逐字节一致。native-display tools 使用脚本自身位置解析仓库内文件，外部源码树与构建产物通过 `XEGFX_*` 环境变量传入。
+当前 0.0.44 组件链、XeMTL plugin 链以及 Mesa、libdrm 补丁均可完整重放，没有 `.rej`；0028–0034 涉及的 96 个文件、0035–0037 涉及的 10 个文件与实际构建输入逐字节一致。native-display tools 使用脚本自身位置解析仓库内文件，外部源码树与构建产物通过 `XEGFX_*` 环境变量传入。
 
 补丁来源由上面的四个固定上游基点和当前项目源码状态共同确定。

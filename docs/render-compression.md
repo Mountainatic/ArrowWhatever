@@ -1,6 +1,6 @@
 # 压缩扫描、按 surface 导入、GEM 映射上限与帧率
 
-配合 `patches/0028`–`0034` 阅读。前一轮（`page-off-and-compression.md`）让 WindowServer 的私有拷贝带上渲染压缩（CCS），
+配合 `patches/0028`–`0037` 阅读。前一轮（`page-off-and-compression.md`）让 WindowServer 的私有拷贝带上渲染压缩（CCS），
 但扫描输出仍然要先把内容拷回线性页面；这一轮让显示直接扫描压缩图像，并处理了这条路上暴露出来的几个问题。
 测量都在 ARL-HX（Core Ultra 9 275HX，iGPU 7D67）、macOS 26（25G241）、内建屏 1920×1200 HiDPI@240（3840×2400）上做，
 原始日志在 `logs/2026-11-04`、`logs/2026-11-05`。
@@ -67,9 +67,8 @@ CoreDisplay 通过 AGDC K5（0x711）问显示管线的能力。原来的回答�
 开始的请求提频。SLPC 看到 GPU 大约一半时间在忙，就停在效率频率，而这颗 GPU 的效率频率就是最低档（RP1 = RPn = 550 MHz）〔推断〕。
 通过 SLPC 写一次最低频率（`sysctl -w debug.xegfx_gt_min=…`，再写回 550）以后，SLPC 恢复调频（忙时平均约 770 MHz），
 同样的负载变成 151–174 fps，合成 p50 1.4 ms，两帧间隔 p50 4.4 ms（`logs/2026-11-05/tl-steady-*.txt`）。之后它还会再卡住，
-“刚开机快、过一阵变慢”就是这个。还没有修：打算仿照 Linux 显示路径的做法（翻页的 fence 错过 vblank 就提频），由 accel 在
-等合成时跨过一个 vblank 就向 core 要一次 SLPC boost。`genie-fps.sh` 每次运行都记下忙时频率和停在 550 MHz 的比例，
-卡住的时候能从 `data/fps-history.tsv` 看出来。
+“刚开机快、过一阵变慢”就是这个。0036 的迟到帧频率下限修掉了它（见下文）。`genie-fps.sh` 每次运行都记下忙时频率和停在
+550 MHz 的比例，卡住的时候能从 `data/fps-history.tsv` 看出来。
 
 ## 神奇效果
 
@@ -89,3 +88,45 @@ CoreDisplay 通过 AGDC K5（0x711）问显示管线的能力。原来的回答�
 三层调用者、正在等的 spin mutex 和它的持有者。看门狗 panic 时把每个 CPU 的这些信息和超过 1 ms 的寄存器读取（以 i915 MMIO
 窗口里的偏移表示）一起打印出来。`tools/livelog/` 把内核和 CoreDisplay 的显示日志实时写到磁盘，强制重启以后还能看到卡死前的
 最后几秒。
+
+## 硬件色彩：夜览和颜色描述文件（core 0035、accel 0036）
+
+AGDC 回答了显示管线的颜色级（0030）以后，CoreDisplay 不再在 GPUPass 里做颜色，而是把线性化表、颜色矩阵、编码表随每个显示事务
+交给显示管线；以前没人读这些，所以拖夜览滑块没有效果。现在 accel 在 `performTransaction` 里读事务的 pre / post gamma 表和
+3×4 颜色矩阵（Apple 的 ICL 驱动在这里调用 framebuffer 的 `PerformGammaTransaction` / `PerformCscTransaction`），翻页之前交给
+core，core 用一次只涉及 CRTC 的原子提交写进 i915 的 `DEGAMMA_LUT`、`CTM`、`GAMMA_LUT`（约 5 ms）。和上次提交一样的状态跳过
+（CoreDisplay 大约每秒把同样的表当成新对象再送一次）。默认打开、不限速，boot-arg `xegfxcolour=0` 关。早先的版本每秒最多提交一次，
+跳过了拖动中间的状态，看起来像滞回（往一边拖到某一点突然变黄，往回拖到某一点突然变白）。HDR 还没有做（需要 PQ、10 位扫描和 HDR
+元数据）。
+
+## 老帧：按命令缓冲编号的 surface 标记（accel 0036、插件 0037）
+
+用户看到“动画结束后又从中间放一遍”。翻页在扫描一个 surface 之前等插件的合成标记，等不到 100 ms 就照样扫描；WindowServer 轮换三个
+scanout surface，没画完的那个里还是两三帧之前的内容。测量（`ws late` 日志、i915 请求计时）表明 GPU 并不慢：迟到的合成都是
+“调度 +0 ms、一个 part、没有事件等待”，同一时间 i915 没有超过 50 ms 的请求。原因在标记本身：插件给每个 surface 只有一个内核标记，
+所有写它的命令缓冲都结束才释放，而 WindowServer 在 scanout surface 上的命令缓冲会首尾重叠，于是标记可以一直挂 200 ms 以上，
+翻页也在等它的事务之后才提交的工作。
+
+现在（DRM client selector 13）每个命令缓冲有自己编号的标记，写完一个 surface 就释放自己的编号；事务排队时记下当时最新的编号，
+翻页只等编号不超过它的标记，也就是交换之前提交的工作（Apple 的语义）。等待上限 100 → 200 ms，放弃等待的标记后来清掉时记一行日志。
+旧的 selector 1/2 保持不变，没有 selector 13 的 accel 上插件退回旧协议。
+
+## GPU 频率：迟到帧抬高下限（core 0035、accel 0036）
+
+翻页取到一帧 3 ms 后合成还没完成（这一帧要错过 vblank），accel 通过 core 的 `xgGtMin` 把 SLPC 最低频率抬到最高，最后一个迟到帧
+之后 150 ms 放回。Linux 的显示路径对错过 vblank 的翻页 fence 做同样的事；i915 自己的 waitboost 在这里不会触发（翻页等的是插件的标记，
+不是 i915 fence，而且合成早已开始）。sysctl：`debug.xegfxaccel_iop_xe_boost_us`（3000，0 关）、`_boost_hold_ms`、`_boost_mhz`、
+`_mark_ms`；计数 `iop_xe_late`、`_boosts`、`_boost_floor`、`_late_cleared`。
+
+## 11-06 测量与一处更正
+
+- 更正：0033 的修复版 ANV 直到 11-06 才真正装上。11-04 21:47 到 11-06 之间装着的是没有修复的那一版，而且 `.xemtl-no-ssbo-push`
+  一直在，两种 push 都是关着的；11-05 记下的“Metal 区域恢复正常、神奇效果约 79 fps”是在 push 关着的情况下测的。0033 的说明已经改正。
+- 0035–0037 加上修复版 ANV（push 打开）之后，开机 4 分钟测（`genie-fps.sh 6 3`）：稳定 **126 fps**（p99 20.9 ms，最长 29 ms；
+  同一天只有频率下限时是 52–68 fps、p99 191 ms），神奇效果 **92.8 fps**（之前 42），测量期间没有一次标记超时；合成 pop→mark p50
+  2.55 ms（之前 6.5），WindowServer 的 i915 请求平均 2.9 ms（之前 7.9）。Metal 区域正常、没有再看到老帧（用户确认）。
+- 离 240 Hz 还差的：一帧从 vblank 开始是 WindowServer 的 CPU（约 1.3 ms）加合成（约 2.5 ms），刚好在 4.17 ms 边上，所以部分帧赶上
+  一个 vblank，中位数还是两个。合成里最贵的是 Core Animation 的整屏背景捕获（3840×2341，每帧约 1.65 次）。
+- 11-06 有一次登录后约 140 s 的整机卡死（一个 CPU 连 NMI 都不响应），和 11-04 的一次一模一样，以前的版本也出现过，原因还没定位；
+  开机守护按设计退回 IntelFB，重新 arm 之后正常。
+
