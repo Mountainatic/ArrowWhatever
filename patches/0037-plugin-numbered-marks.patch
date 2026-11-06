@@ -1,0 +1,174 @@
+# 0037 XeMTL plugin: numbered surface marks, late-release log
+#
+# Base:  plugin/ after 0005 + 0006 + 0007 + 0026 + 0031 (XeGfx 0.0.35 · 497d521e)
+# Files: plugin/{NVMTLEventSync.m, nvmtl_vk.c, nvmtl_vk.h}
+# Apply: patch -p1 < patches/0037-plugin-numbered-marks.patch
+# Build: XeMTLDriver a054790c7708 (ddca6dfe9d76 after ad-hoc signing; needs accel 0036 for selector 13)
+#
+# Numbered marks: each WindowServer command buffer marks the surfaces it writes through selector 13 at commit and keeps
+# each surface's mark number; when it has finished with a surface it releases its own number at once, instead of the
+# kernel's one bit waiting for every overlapping command buffer.  The publication ordering of the earlier counted holds
+# is unchanged.  An accelerator without selector 13 keeps the old protocol (selector 1/2, one mark per surface).
+#
+# Late-release log: a composite whose mark is released 30 ms or more after commit logs one line with commit ->
+# scheduled -> GPU done -> release, its part count and event waits (first 200, then every 32nd).  This is what showed
+# the overlapping command buffers: late releases were all "scheduled +0, one part, no waits".
+--- a/plugin/NVMTLEventSync.m
++++ b/plugin/NVMTLEventSync.m
+@@ -133,7 +133,7 @@
+ }
+ // What one WindowServer command buffer holds: the surfaces it marked pending in the kernel, and the textures whose shared
+ // VRAM its commit marked newest. early is fixed at commit (nvmtl_ws_surface_wait): the marks are released part by part.
+-@interface XeMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; } @end
++@interface XeMTLSurfaceHolds : NSObject { @public NSMutableSet *ids; NSSet *dirtied; BOOL early; uint64_t t0, tSched, tDone; unsigned nparts, nwaits; NSMutableDictionary *seqs; } @end
+ @implementation XeMTLSurfaceHolds @end
+ // A texture whose part has landed while its surface is still held, published by the holder that releases it last.
+ // dirtied: the commit marked its VRAM newest, so publication is bookkeeping only (nvmtlSurfaceOutDirtied:).
+@@ -169,14 +169,31 @@
+     }
+ }
+ // One holder lets go of a surface. The last one releases the kernel mark and moves the textures waiting for it to settled.
++// §37.29: a composite whose kernel mark is released late (the flip waits for it): commit -> scheduled -> GPU done ->
++// release, in ms, logged so the 100 ms flip timeouts can be placed.  Rate limited.
++static _Atomic unsigned nvmtl_ws_late_n;
++static void nvmtl_ws_late_note(XeMTLSurfaceHolds *h, uint32_t sid, BOOL last) {
++    if (!h->t0) return;
++    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    if (now - h->t0 < 30000000ull) return;
++    const unsigned k = atomic_fetch_add(&nvmtl_ws_late_n, 1);
++    if (k >= 200 && (k & 31)) return;
++    nvlog("ws late: surface %u released %.1f ms after commit (scheduled +%.1f, GPU done +%.1f, %s holder; parts %u waits %u) [%u]",
++          (unsigned)sid, (double)(now - h->t0) / 1e6, h->tSched ? (double)(h->tSched - h->t0) / 1e6 : -1.0,
++          h->tDone ? (double)(h->tDone - h->t0) / 1e6 : -1.0, last ? "last" : "not last", h->nparts, h->nwaits, k + 1);
++}
+ static void nvmtl_ws_release(XeMTLSurfaceHolds *holds, uint32_t sid, NSMutableArray *settled) {
+     NSNumber *n = @(sid);
+     @synchronized (nvmtl_ws_lock()) {
+         if (![holds->ids containsObject:n]) return;
+         [holds->ids removeObject:n];
+         [nvmtl_ws_pending_holds removeObject:n];
+-        if ([nvmtl_ws_pending_holds countForObject:n]) return;
+-        nvmtl_ws_mark(sid, NO, NO);
++        // §37.30: a numbered mark is this command buffer's own and goes now; the kernel keeps the others' marks
++        const uint32_t seq = [holds->seqs[n] unsignedIntValue];
++        if (seq) (void)nvmtl_vk_surface_gpu_mark3(sid, 0, 0, seq, NULL);
++        if ([nvmtl_ws_pending_holds countForObject:n]) { nvmtl_ws_late_note(holds, sid, NO); return; }
++        nvmtl_ws_late_note(holds, sid, YES);
++        if (!seq) nvmtl_ws_mark(sid, NO, NO);
+         NSArray *waiting = nvmtl_ws_deferred[n];
+         if (waiting) { [settled addObjectsFromArray:waiting]; [nvmtl_ws_deferred removeObjectForKey:n]; }
+     }
+@@ -225,6 +242,8 @@
+     if (!ids) return;
+     XeMTLSurfaceHolds *holds = [XeMTLSurfaceHolds new];
+     holds->ids = ids; holds->early = nvmtl_ws_surface_wait();
++    holds->t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); holds->nparts = (unsigned)cb->_parts.count;   // §37.29
++    for (XeMTLSubmissionPart *part in cb->_parts) if ([part isKindOfClass:[XeMTLSubmissionPart class]] && part->waitEvent) holds->nwaits++;
+     if (holds->early) {
+         NSMutableSet *dirtied = [NSMutableSet new];
+         for (XeMTLSubmissionPart *part in cb->_parts) {
+@@ -236,7 +255,14 @@
+     }
+     @synchronized (nvmtl_ws_lock()) {
+         if (!nvmtl_ws_pending_holds) nvmtl_ws_pending_holds = [NSCountedSet new];
+-        for (NSNumber *n in ids) { [nvmtl_ws_pending_holds addObject:n]; nvmtl_ws_mark(n.unsignedIntValue, YES, [tile4 containsObject:n]); }
++        for (NSNumber *n in ids) {
++            [nvmtl_ws_pending_holds addObject:n];
++            uint32_t seq = 0;   // §37.30
++            if (nvmtl_vk_surface_gpu_mark3(n.unsignedIntValue, 1, [tile4 containsObject:n], 0, &seq) && seq) {
++                if (!holds->seqs) holds->seqs = [NSMutableDictionary new];
++                holds->seqs[n] = @(seq);
++            } else nvmtl_ws_mark(n.unsignedIntValue, YES, [tile4 containsObject:n]);
++        }
+     }
+     objc_setAssociatedObject(cb, nvmtl_ws_marks_key, holds, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ }
+@@ -249,6 +275,7 @@
+ static NSArray *nvmtl_ws_part_landed(XeMTLCommandBuffer *cb, NSUInteger index, NSMutableArray *settled) {
+     XeMTLSubmissionPart *part = cb->_parts[index];
+     XeMTLSurfaceHolds *holds = objc_getAssociatedObject(cb, nvmtl_ws_marks_key);
++    if (holds) holds->tDone = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);   // §37.29
+     NSMutableArray *publish = [NSMutableArray new];
+     if (!holds || !holds->early) { for (XeMTLTexture *t in part->surfaces) [publish addObject:t]; return publish; }
+     NSMutableArray *last = [NSMutableArray new];
+@@ -425,6 +452,8 @@
+     [_completionCondition lock];
+     if (!_wasScheduled) {
+         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;
++        XeMTLSurfaceHolds *wh = objc_getAssociatedObject(self, nvmtl_ws_marks_key);   // §37.29
++        if (wh && !wh->tSched) wh->tSched = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+         NSArray *handlers = [_scheduledHandlers copy]; [_scheduledHandlers removeAllObjects];
+         [self nvmtlDispatchHandlers:handlers scheduled:YES];
+         [_completionCondition broadcast];
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -2248,6 +2248,38 @@
+ static _Atomic int g_t4_on;
+ static _Atomic uint32_t g_t4_scan[8];
+ static _Atomic unsigned g_t4_scan_next;
++static void nvmtl_t4_reply(uint32_t surfaceID, uint64_t out)
++{
++    if (atomic_exchange(&g_t4_sel, 1) != 1) nvlog("Tile4: the accelerator takes layout marks (selector 2), scanout Tile4 %s", (out & 2) ? "on" : "off");
++    atomic_store(&g_t4_on, (out & 2) ? 1 : 0);
++    { extern _Atomic int g_ccs_on; atomic_store(&g_ccs_on, (out & 4) ? 1 : 0); }   // <wtl> §37.14
++    if ((out & 1) && surfaceID) {
++        int known = 0;
++        for (unsigned i = 0; i < 8; i++) if (atomic_load(&g_t4_scan[i]) == surfaceID) { known = 1; break; }
++        if (!known) {
++            atomic_store(&g_t4_scan[atomic_fetch_add(&g_t4_scan_next, 1) & 7], surfaceID);
++            nvlog("Tile4: surface %u is a scanout surface", surfaceID);
++        }
++    }
++}
++static _Atomic int g_seq_sel;   // <wtl> §37.30: 0 untried, 1 selector 13 answers, -1 it does not
++int nvmtl_vk_surface_gpu_mark3(uint32_t surfaceID, int op, int tile4, uint32_t seq, uint32_t *seq_out)
++{
++    if (seq_out) *seq_out = 0;
++    if ((pnvk_surface_dirty && g_dev) || atomic_load(&g_seq_sel) < 0 || !nvmtl_mark_conn()) return 0;
++    const uint64_t in[4] = { surfaceID, (uint64_t)op, tile4 ? 1u : 0u, seq };
++    uint64_t out[2] = { 0, 0 }; uint32_t outn = 2;
++    const kern_return_t kr = IOConnectCallScalarMethod(g_mark_conn, 13, in, 4, out, &outn);
++    if (kr == KERN_SUCCESS) {
++        if (atomic_exchange(&g_seq_sel, 1) != 1) nvlog("marks: one numbered mark per command buffer (selector 13); a flip waits only for the work before it");
++        nvmtl_t4_reply(surfaceID, out[0]);
++        if (seq_out) *seq_out = (uint32_t)out[1];
++        return 1;
++    }
++    int untried = 0;
++    if (atomic_compare_exchange_strong(&g_seq_sel, &untried, -1)) nvlog("marks: no selector 13 (0x%x) -- one mark per surface", kr);
++    return 0;
++}
+ uint32_t nvmtl_vk_surface_gpu_mark2(uint32_t surfaceID, int pending, int tile4)
+ {
+     if (pnvk_surface_dirty && g_dev) return nvmtl_vk_surface_gpu_mark(surfaceID, pending == 1);
+@@ -2256,17 +2288,7 @@
+         uint64_t out = 0; uint32_t outn = 1;
+         const kern_return_t kr = IOConnectCallScalarMethod(g_mark_conn, 2, in, 3, &out, &outn);
+         if (kr == KERN_SUCCESS) {
+-            if (atomic_exchange(&g_t4_sel, 1) != 1) nvlog("Tile4: the accelerator takes layout marks (selector 2), scanout Tile4 %s", (out & 2) ? "on" : "off");
+-            atomic_store(&g_t4_on, (out & 2) ? 1 : 0);
+-            { extern _Atomic int g_ccs_on; atomic_store(&g_ccs_on, (out & 4) ? 1 : 0); }   // <wtl> §37.14
+-            if ((out & 1) && surfaceID) {
+-                int known = 0;
+-                for (unsigned i = 0; i < 8; i++) if (atomic_load(&g_t4_scan[i]) == surfaceID) { known = 1; break; }
+-                if (!known) {
+-                    atomic_store(&g_t4_scan[atomic_fetch_add(&g_t4_scan_next, 1) & 7], surfaceID);
+-                    nvlog("Tile4: surface %u is a scanout surface", surfaceID);
+-                }
+-            }
++            nvmtl_t4_reply(surfaceID, out);
+             return 0;
+         }
+         if (atomic_load(&g_t4_sel) == 0) { atomic_store(&g_t4_sel, -1); nvlog("Tile4: no selector 2 (0x%x) -- WindowServer's surfaces stay linear", kr); }
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -379,6 +379,9 @@
+ uint32_t nvmtl_vk_surface_gpu_mark(uint32_t surfaceID, int pending);
+ /* §32.16 Tile4 scanout: selector 2 marks (pending 1/0, or 2 = layout only), scanout surfaces, content layouts */
+ uint32_t nvmtl_vk_surface_gpu_mark2(uint32_t surfaceID, int pending, int tile4);
++/* <wtl> §37.30: selector 13, one numbered mark per command buffer; 1 when the accelerator took it (*seq_out: the new
++ * mark's number for op 1), 0 when it has no selector 13 (use mark2) */
++int nvmtl_vk_surface_gpu_mark3(uint32_t surfaceID, int op, int tile4, uint32_t seq, uint32_t *seq_out);
+ int nvmtl_vk_tile4_scanout(uint32_t surfaceID);
+ int nvmtl_vk_is_scanout(uint32_t surfaceID);
+ int nvmtl_vk_po_on(void);
