@@ -4,7 +4,7 @@
 
 项目基于 [XeGfx](https://github.com/watchthelight-labs/XeGfx) 和 [NvGfx](https://github.com/watchthelight-labs/NvGfx/tree/xe)，结合 [Mesa ANV](https://gitlab.freedesktop.org/mesa/mesa) 与 [XeMTL](https://github.com/watchthelight-labs/NvGfx/tree/497d521e925bd760c8cde5bbc17d9bf96d2ee2b4/plugin)，建立了从 Metal 图形渲染、GPU 命令提交到内建屏显示的完整路径。
 
-在此基础上，ArrowWhatever 实现了 Intel 原生显示、高刷新率 HiDPI、GGTT 零拷贝翻转、压缩扫描及 GPU 渲染优化，并通过 i915 管理显示模式、硬件光标和内建屏背光。
+在此基础上，ArrowWhatever 实现了 Intel 原生显示、高刷新率 HiDPI、GGTT 零拷贝翻转、压缩扫描、硬件色彩管理及 GPU 渲染优化，并通过 i915 管理显示模式、硬件光标和内建屏背光。
 
 ![macOS Tahoe 桌面与 240 Hz 内建屏设置](assets/tahoe-desktop.png)
 
@@ -19,13 +19,14 @@
 | 高刷新率     | 1920×1200 HiDPI @ 240 Hz，3840×2400 后备光栅与双管拼接           |
 | 启动显示     | 自动恢复已选择的显示模式，启动后进入加速桌面                                 |
 | 硬件光标与背光  | 独立光标平面及 i915 背光控制                                      |
-| 显示翻转     | GGTT 零拷贝、延迟翻转与逐帧 GPU 完成同步                              |
+| 显示翻转     | GGTT 零拷贝、延迟翻转与按命令缓冲编号的 GPU 完成同步                    |
 | 压缩渲染与扫描  | Tile4、CCS 压缩及压缩图像直接扫描                                  |
 | 图形内存管理   | IOSurface Device Cache、page-off、按 surface 导入及内存池       |
-| 显示能力协商   | AGDC 颜色处理级别、BGRA 平面格式及 HiDPI 平面尺寸                      |
-| GPU 执行优化 | Mesa ANV 常量推送、资源驻留管理及 libdrm 适配                        |
+| 显示色彩管理 | AGDC 颜色能力协商、BGRA 平面及 i915 硬件 Gamma/CTM 处理 |
+| GPU 执行优化 | Mesa ANV 常量推送、资源驻留管理及 libdrm 适配 |
+| GPU 动态调频 | 根据迟到帧临时调整 SLPC 最低频率 |
 
-目前的开发工作集中在提高 WindowServer 合成吞吐、完善显示色彩管理、GPU 动态调频及图形内存同步，部分系统动画仍有优化空间，夜览暂时无法正常色调调节，常规渲染约100fps，神奇效果动画下约50fps。
+当前测试中，常规渲染约 126 fps，神奇效果动画约 93 fps，夜览和颜色描述文件已能够通过硬件显示管线生效。后续开发集中在提高 WindowServer 高刷新率合成效率、完善显示色彩处理，以及排查偶发的整机卡死。
 
 ![Intel Xe-LPG 核显与 HiDPI 显示信息](assets/intel-gpu-info.png)
 
@@ -51,9 +52,11 @@ WindowServer 生成的图像通过 GGTT 映射进入显示地址空间，在 GPU
 
 早期显示路径需要由 CPU 将整帧图像复制到显示缓冲区。ArrowWhatever 通过 GGTT 将 WindowServer 合成的 IOSurface 映射到显示地址空间，使显示引擎能够直接读取图像。
 
-K9 延迟翻转进一步将 GPU 完成等待与显示翻转交给内核工作线程，并通过逐帧完成标记维护渲染与扫描之间的执行顺序，减少显示事务对 WindowServer 的阻塞。
+K9 延迟翻转进一步将 GPU 完成等待与显示翻转交给内核工作线程。驱动使用按命令缓冲编号的完成标记，使每次显示翻转只等待相应事务之前提交的 GPU 工作，避免后续命令缓冲延长等待并造成旧帧显示。
 
-相关设计见 [零拷贝翻转](docs/zero-copy-flip.md)、[K9 延迟翻转](docs/k9-deferred-flip.md)和[帧流水线](docs/frame-pipeline.md)。
+同时，显示线程在检测到合成帧迟到时，通过 SLPC 临时提高 GPU 最低频率，以改善低频状态下的合成延迟。
+
+相关设计见 [零拷贝翻转](docs/zero-copy-flip.md)、[K9 延迟翻转](docs/k9-deferred-flip.md)、[帧流水线](docs/frame-pipeline.md)及[同步与调频优化](docs/render-compression.md)。
 
 ### Tile4、page-off 与压缩扫描
 
@@ -63,15 +66,17 @@ WindowServer 的桌面合成需要频繁读写大尺寸图像。项目使用 Til
 
 详细机制见 [page-off 与渲染压缩](docs/page-off-and-compression.md)及[压缩扫描与图形内存优化](docs/render-compression.md)。
 
-### 显示能力与图形内存优化
+### 显示色彩与图形内存优化
 
-ArrowWhatever 通过 AGDC 向 CoreDisplay 提供显示平面的颜色处理级别、BGRA 格式和桌面尺寸约束，使系统能够依据显示控制器的能力组织显示事务。这一机制也为减少额外的全屏 GPUPass 和进一步实现硬件色彩管理提供了基础。
+ArrowWhatever 通过 AGDC 向 CoreDisplay 提供显示平面的颜色处理级别、BGRA 格式和桌面尺寸约束，使系统能够依据显示控制器的能力组织显示事务。
+
+在此基础上，驱动将显示事务中的 Gamma 表与颜色矩阵交给 i915，通过 DEGAMMA_LUT、CTM 和 GAMMA_LUT 在显示管线中执行颜色变换。夜览和颜色描述文件由此能够直接作用于屏幕输出，并减少额外的 GPU 全屏颜色处理。
 
 图形内存方面，项目增加了基于 IOSurface 自身物理内存的导入路径，减少 userptr 逐页映射开销，并修复了大尺寸 GEM 映射与 libdrm 导出句柄复用问题。
 
 Mesa ANV 进一步支持 XeMTL 资源驻留声明、只读 SSBO 与地址表常量推送，减少 GPU 提交和着色器执行中的冗余工作。
 
-具体实现见 [压缩扫描、图形内存与 ANV 优化](docs/render-compression.md)。
+具体实现见 [压缩扫描、硬件色彩与图形内存优化](docs/render-compression.md)。
 
 ## 测试与性能
 
@@ -93,7 +98,7 @@ Mesa ANV 进一步支持 XeMTL 资源驻留声明、只读 SSBO 与地址表常�
 | Mesa ANV         | Mesa `bffd9194`，叠加 NvGfx 移植补丁                                                                                          |
 | libdrm           | libdrm `b97cbde1`，叠加 NvGfx 移植补丁                                                                                        |
 
-获取对应源码后，按照 [补丁应用说明](patches/README.md) 中的顺序应用补丁，即可建立驱动源码树。当前补丁系列覆盖 XeGfx、XeMTL、Mesa ANV、libdrm 及开发工具。
+获取对应源码后，按照 [补丁应用说明](patches/README.md) 中的顺序应用补丁，即可建立驱动源码树。当前共有 37 个补丁，覆盖 XeGfx、XeMTL、Mesa ANV、libdrm 及开发工具。
 
 项目提供构建、安装、AuxKC 更新、启动验证及回滚工具。外部源码与构建产物通过 `XEGFX_*` 环境变量指定。
 
@@ -108,7 +113,7 @@ Mesa ANV 进一步支持 XeMTL 资源驻留声明、只读 SSBO 与地址表常�
 | 延迟翻转                      | [K9 设计记录](docs/k9-deferred-flip.md)              |
 | 逐帧 GPU 同步与帧率分析            | [帧流水线](docs/frame-pipeline.md)                   |
 | Tile4、Device Cache 与 CCS  | [page-off 与压缩](docs/page-off-and-compression.md) |
-| 压缩扫描、IOSurface 导入及 ANV 优化 | [渲染与显示优化](docs/render-compression.md)            |
+| 压缩扫描、硬件色彩、编号同步及 ANV 优化 | [渲染与显示优化](docs/render-compression.md) |
 | userptr 生命周期修复            | [内核崩溃分析](docs/userptr-panic.md)                  |
 | 图形内存导入修复                  | [device lost](docs/device-lost.md)               |
 | 代码与构建                     | [补丁说明](patches/README.md)                        |
@@ -120,4 +125,4 @@ ArrowWhatever 基于 [NullMoth Systems](https://nullmothsystems.com) 的 macOS �
 
 `patches/` 沿用上游的 **PolyForm Noncommercial License 1.0.0**，用于非商业研究与开发。项目原创的文档和脚本采用 **MIT License**。完整许可条款和第三方来源分别见 [LICENSE](LICENSE)、[LICENSE-MIT](LICENSE-MIT) 与 [NOTICE.md](NOTICE.md)。
 
-感谢上游开发者及相关社区的工作。项目由 LLM 辅助开发，仍处于实验性研究阶段。
+感谢上游开发者及相关社区的工作。本项目由LLM驱动构建，自用项目不保证其他情况。
