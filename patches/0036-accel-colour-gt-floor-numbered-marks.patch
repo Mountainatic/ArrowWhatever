@@ -1,0 +1,664 @@
+# 0036 XeGfxAccel: hardware colour, late-frame GPU clock floor, numbered surface marks (no stale frames)
+#
+# Base:  kexts/NVRM/accel after 0002 + 0009 + 0012 + 0024 + 0029
+# Files: kexts/NVRM/accel/nvrm-accel.cpp, kexts/NVRM/accel/xegfx_accel_names.h
+# Apply: patch -p1 < patches/0036-accel-colour-gt-floor-numbered-marks.patch
+# Build: XeGfxAccel 4ec0bc233300 (build/nvgfx/build_nvaccel.sh xegfxaccel; needs core 0035, plugin 0037)
+#
+# Hardware colour:
+#   - performTransaction reads the transaction's colour state (IOAccelDisplayPipeTransaction2: pre / post gamma tables
+#     through IOAccelDisplayPipeGammaTable2::getTableEntry, the 48-byte colour matrix); a table object or matrix that
+#     changed is read again.  The flip worker hands a new state to the core ("xgPipeColour") before the frame's arming
+#     write.  A state identical to the last one committed is skipped (CoreDisplay resends the same tables as new
+#     objects about once a second).
+#   - on by default with no rate limit: debug.xegfxaccel_iop_colour (boot argument xegfxcolour=0 starts it off),
+#     iop_colour_ms (0), iop_colour_mtx (matrix layout); counters iop_colour_tx / _changes / _applied / _same / _fail,
+#     iop_colour_last_us / _max_us.  An earlier 1 s limit skipped the slider's in-between states: the colour jumped
+#     late in each direction and looked like hysteresis.
+#
+# Late-frame GPU clock floor: a deferred flip whose composite is not finished 3 ms after the worker took it (it will
+# miss its vblank) raises the SLPC minimum to the maximum ("xgGtMin"); it goes back 150 ms after the last late frame.
+# Linux's display does the same for a flip whose fence misses the vblank; i915's own waitboost never fires here (the
+# flip waits for the plugin's mark, and the composite has always started).  Without it SLPC stays at RPn (550 MHz)
+# for long stretches.  debug.xegfxaccel_iop_xe_boost_us (3000, 0 = off), _boost_hold_ms (150), _boost_mhz (0 = max);
+# counters iop_xe_late, _boosts, _boost_floor.
+#
+# Numbered surface marks (the "animation plays again from the middle" bug):
+#   - the plugin kept one pending bit per surface, released when the last command buffer writing it finished, and the
+#     flip waited for that bit.  WindowServer's command buffers on a scanout surface overlap, so the bit could stay set
+#     for 200+ ms with every command buffer short; the flip waited for work committed after its own transaction, ran
+#     into its timeout and scanned the surface unfinished -- which still held a frame from two or three frames back.
+#   - DRM client selector 13, WindowServer only: (surface, op, flags, seq) -> (selector 2's answer, seq).  op 1 makes
+#     a new mark and returns its number, op 0 releases that number (0: every mark of the surface), op 2 records the
+#     layout only.  The table keeps one mark per command buffer (64 entries).  A transaction records the newest mark
+#     number when it is queued, and its flip waits only for marks up to it.  Selectors 1/2 keep the old meaning.
+#   - the flip waits up to debug.xegfxaccel_iop_xe_mark_ms (200, was a fixed 100) before arming anyway; a mark it gave
+#     up on is logged when it clears (iop_xe_late_cleared).
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -328,6 +328,7 @@
+ 
+ #ifdef NMX_XEGFX
+ static void nvSurfMark(unsigned int id, bool pending);
++static unsigned int nvSurfMarkSeq(unsigned int id, bool pending, unsigned int seq);
+ static bool nvSurfGpuEnabled(void);
+ static void nvXeLockWatch(unsigned int id);
+ static int nvXeLockSeeds(unsigned int id, task_t task, unsigned int *lockSeed, unsigned int *unlockSeed);
+@@ -443,6 +444,30 @@
+         // plugin announces the ticket with its host-pointer import of the surface (the core's SURF_EXPECT ioctl), and
+         // that import's userptr becomes a GEM object made of the surface's own memory -- an import by surface, as
+         // IOAcceleratorFamily2 and NullMoth do, instead of pinning the user mapping page by page.
++        // Selector 13 (§37.30, docs/37-RENDER-COMPRESSION.md), WindowServer only: selector 2 with a sequence number per
++        // command buffer.  (surface ID, op, flags, seq) -> (selector 2's answer, seq).  op 1: this commit writes the
++        // surface, the answer carries the new mark's number; op 0: the command buffer that got seq has finished with it
++        // (seq 0: every mark of the surface, the old meaning); op 2: layout only.  The kernel keeps one mark per command
++        // buffer, and a flip waits only for the marks made before its transaction -- with selector 1/2's one bit per
++        // surface, released when the last overlapping command buffer finished, a flip waited for work committed after it
++        // and ran into its timeout (230 ms gaps, then the unfinished surface on the panel).
++        if (sel == 13) {
++            if (a->scalarInputCount != 4 || a->scalarOutputCount != 2) return kIOReturnBadArgument;
++            if (!nvSurfGpuEnabled()) return kIOReturnUnsupported;
++            char nm[32] = { 0 };
++            proc_selfname(nm, sizeof nm);
++            if (strcmp(nm, "WindowServer")) return kIOReturnNotPermitted;
++            const unsigned int id = (unsigned int)a->scalarInput[0], op = (unsigned int)a->scalarInput[1];
++            unsigned int seq = 0;
++            if (id) {
++                if (op) nvSurfLayoutSet(id, (a->scalarInput[2] & 1) != 0);
++                if (op == 1) { seq = nvSurfMarkSeq(id, true, 0); nvXeLockWatch(id); }
++                else if (op == 0) (void)nvSurfMarkSeq(id, false, (unsigned int)a->scalarInput[3]);
++            }
++            a->scalarOutput[0] = nvXeTile4Reply(id);
++            a->scalarOutput[1] = seq;
++            return kIOReturnSuccess;
++        }
+         if (sel == 11) {
+             char nm[32] = { 0 };
+             proc_selfname(nm, sizeof nm);
+@@ -1659,11 +1684,45 @@
+     unsigned int        getPixelFormat() const;
+     unsigned int        getSurfaceID() const;
+ };
++// §37.28: the colour state WindowServer attaches to a transaction (IOAcceleratorFamily2; Apple's Intel driver hands it to
++// its framebuffer's PerformGammaTransaction / PerformCscTransaction / PerformPQTransaction).  Table entries are floats.
++class IOAccelDisplayPipeGammaTable2 {
++public:
++    unsigned int getTableCount() const;
++    void getTableEntry(unsigned int, float *, float *, float *) const;
++};
++class IOAccelDisplayPipePostCSCGammaVID {
++public:
++    unsigned int getType() const;
++    unsigned int getFormat() const;
++    unsigned int getSize() const;
++    unsigned int getConfigurationID() const;
++    const void *getData() const;
++};
++class IOAccelDisplayPipePreCSCLinearizationVID {
++public:
++    unsigned int getType() const;
++    unsigned int getFormat() const;
++    unsigned int getSize() const;
++    unsigned int getConfigurationID() const;
++    const void *getData() const;
++};
++struct NVIopColorMatrix { uint32_t v[12]; };		// 48 bytes, returned by value (getPipeColorMatrix)
++struct NVIopColorMatrixArgs { uint32_t v[6]; };		// 24 bytes
+ class IOAccelDisplayPipeTransaction2 {
+ public:
+     IOSurface *getPlaneIOSurface(unsigned int, unsigned int) const;
+     OSObject  *getPlaneResource(unsigned int, unsigned int) const;
++    IOAccelDisplayPipeGammaTable2 *getPipePreGammaTable() const;
++    IOAccelDisplayPipeGammaTable2 *getPipePostGammaTable() const;
++    IOAccelDisplayPipeGammaTable2 *getPlaneGammaTable(unsigned int) const;
++    IOAccelDisplayPipePostCSCGammaVID *getPipePostCSCGammaVID() const;
++    IOAccelDisplayPipePreCSCLinearizationVID *getPipePreCSCLinearizationVID() const;
++    NVIopColorMatrix getPipeColorMatrix() const;
++    NVIopColorMatrixArgs getPipeColorMatrixArgs() const;
++    unsigned long long getTransactionDirtyBits() const;
+ };
++static void nvIopColourApply(void);	// §37.28, called by the flip worker before it arms a frame
+ 
+ static int    gNvIop = 0;
+ static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+@@ -1746,7 +1805,7 @@
+    busy flag is cleared *before* the signal now, and every queued frame gets its own signal.  An overflow (never
+    expected with a serialised display link) completes that transaction immediately instead of leaving it hanging. */
+ #define NV_XE_FLIP_QUEUE 4
+-struct NVXeFlipPend { void *pipe; IOSurface *s; unsigned w, h, pitch; void *snap; uint64_t tq; };	// snap: §32.14 fence snapshot; tq: queued (abs)
++struct NVXeFlipPend { void *pipe; IOSurface *s; unsigned w, h, pitch; void *snap; uint64_t tq; unsigned seq; };	// seq: §37.30	// snap: §32.14 fence snapshot; tq: queued (abs)
+ // §37.9 per-frame timeline of the deferred flip: when the display transaction was queued, when the worker took it, when
+ // its composite finished (mark), the arming write, the latch, and the transaction signal.  The last 256 frames, read with
+ // debug.nvaccel_iop_xe_tl (us, relative): does WindowServer queue the next frame only after this one was signalled?
+@@ -1823,6 +1882,30 @@
+ static SInt64 gCntXeMarkOnly, gCntXeMarkTimeouts;
+ static volatile uint64_t gSurfMarkLastAbs;	// mach_absolute_time of the newest WindowServer mark
+ static bool nvSurfWaitReady(unsigned int id);
++static bool nvSurfWaitReadyEx(unsigned int id, unsigned int timeoutUs, bool final, unsigned int maxSeq = ~0u);
++static unsigned int nvSurfMarkSeq(unsigned int id, bool pending, unsigned int seq);
++static volatile unsigned int gSurfPendSeqNow;	// §37.30: the newest pending mark's sequence number
++static unsigned int gXeArmSeq;			// §37.30: the flip being armed waits only for marks up to this one (0: all)
++/* §37.29 (native-display docs/37-RENDER-COMPRESSION.md): a deferred flip whose composite is not finished boost_us after
++   it was taken (it will miss its vblank) raises the GPU clock floor to the maximum through the core (SLPC min frequency);
++   the floor goes back hold_ms after the last late frame.  Linux's display does the same for a flip whose fence misses the
++   vblank (intel_display_rps_boost_after_vblank); i915's own waitboost never fires here, the flip waits for the plugin's
++   mark, not for an i915 fence, and the composite has always started by then.  SLPC otherwise sits at RPn (550 MHz) for
++   long stretches (§37.26).  The flip also waits up to mark_ms (was a fixed 100 ms) before it scans an unfinished
++   surface, which still holds the frame WindowServer drew into it two or three frames ago: the "animation plays again
++   from the middle" the user saw. */
++static int gIopXeBoostUs = 3000;	// debug.xegfxaccel_iop_xe_boost_us: 0 = no boost
++static int gIopXeBoostHoldMs = 150;	// debug.xegfxaccel_iop_xe_boost_hold_ms
++static int gIopXeBoostMhz = 0;		// debug.xegfxaccel_iop_xe_boost_mhz: 0 = the maximum
++static int gIopXeMarkMs = 200;		// debug.xegfxaccel_iop_xe_mark_ms: longest wait for the composite before arming anyway
++static SInt64 gCntXeBoosts, gCntXeLate, gCntXeLateCleared;
++static int gXeBoostFloor;		// MHz the floor was raised to, 0 when it is not raised
++static int gXeBoostSaved;		// the floor before
++static uint64_t gXeBoostUntil;
++static IOLock *gXeBoostLock;
++static thread_call_t gXeBoostCall;
++static volatile unsigned int gSurfLateId;	// the surface a flip last gave up waiting for, until its mark clears
++static volatile uint64_t gSurfLateAbs;
+ static const OSSymbol *gXeSnapSym, *gXeSnapWaitSym, *gXeSnapFreeSym;
+ 
+ #ifdef NMX_XEGFX
+@@ -2206,6 +2289,54 @@
+ // PLANE_SURF_1_A, and wait for the panel to latch it at a vblank (the frame before keeps scanning until then).  On
+ // success the frame is on the panel and takes over the front/previous references; on failure the caller still owns it.
+ // armed (E2) runs right after the arming write, before the latch wait.
++static IOReturn nvAccelResidentCall(const char *fn, void *p1, void *p2, void *p3, void *p4);
++static void nvXeBoostExpire(void *, void *)
++{
++    if (!gXeBoostLock) return;
++    IOLockLock(gXeBoostLock);
++    if (gXeBoostFloor && mach_absolute_time() < gXeBoostUntil) {
++        thread_call_enter_delayed(gXeBoostCall, gXeBoostUntil);
++        IOLockUnlock(gXeBoostLock);
++        return;
++    }
++    if (gXeBoostFloor) {
++        int now = 0;
++        (void)nvAccelResidentCall("xgGtMin", (void *)(intptr_t)gXeBoostSaved, &now, nullptr, nullptr);
++        gXeBoostFloor = 0;
++    }
++    IOLockUnlock(gXeBoostLock);
++}
++// flip worker only (one at a time); sleeps for the SLPC request the first time in a run of late frames
++static void nvXeBoostLate(void)
++{
++    if (gIopXeBoostUs <= 0) return;
++    if (!gXeBoostLock) {
++        IOLock *l = IOLockAlloc();
++        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gXeBoostLock)) IOLockFree(l);
++        if (!gXeBoostLock) return;
++    }
++    if (!gXeBoostCall) gXeBoostCall = thread_call_allocate(nvXeBoostExpire, nullptr);
++    if (!gXeBoostCall) return;
++    uint64_t hold = 0;
++    nanoseconds_to_absolutetime((uint64_t)(gIopXeBoostHoldMs > 0 ? gIopXeBoostHoldMs : 150) * 1000000ull, &hold);
++    IOLockLock(gXeBoostLock);
++    gXeBoostUntil = mach_absolute_time() + hold;
++    if (!gXeBoostFloor) {
++        int cur = 0, mx = 0;
++        if (nvAccelResidentCall("xgGtMin", nullptr, &cur, &mx, nullptr) == kIOReturnSuccess && cur > 0 && mx > 0) {
++            const int want = gIopXeBoostMhz > 0 && gIopXeBoostMhz < mx ? gIopXeBoostMhz : mx;
++            int now = 0;
++            if (want > cur && nvAccelResidentCall("xgGtMin", (void *)(intptr_t)want, &now, nullptr, nullptr) == kIOReturnSuccess) {
++                gXeBoostSaved = cur; gXeBoostFloor = want;
++                const SInt64 n = OSAddAtomic64(1, &gCntXeBoosts);
++                if (n < 4) ALOG("iop: late frame -- GPU clock floor %d -> %d MHz for %d ms after the last late frame", cur, want,
++                                gIopXeBoostHoldMs);
++                thread_call_enter_delayed(gXeBoostCall, gXeBoostUntil);
++            }
++        }
++    }
++    IOLockUnlock(gXeBoostLock);
++}
+ static bool nvAccelXeFlipArm(IOSurface *s, unsigned w, unsigned h, unsigned pitch, bool waitIdle,
+                              void (*armed)(void *) = nullptr, void *armedArg = nullptr, void *snap = nullptr)
+ {
+@@ -2217,6 +2348,7 @@
+             gXeMmioEnd = (NVXeMmioEnd)e; gXeMmioBegin = (NVXeMmioBegin)b;
+             ALOG("iop: display register reads are recorded on the core's watchdog slots");
+         } } }
++    nvIopColourApply();   // §37.28: a colour commit may rewrite the plane; this frame's arming write follows
+     // §37.14: a surface the plugin draws into a registered compressed image is scanned from that image's pages
+     NVXeCcsImg ccs = {};
+     bool useCcs = nvXeCcsTake(s->getSurfaceID(), &ccs) != 0;
+@@ -2312,7 +2444,17 @@
+         // of the DRM client): pending from commit until the GPU finished it.  Then §32.14: the fences submitted before the
+         // transaction when a snapshot was taken (already done for the composite itself), the whole-GPU idle poll otherwise.
+         const uint64_t tm = mach_absolute_time();
+-        const bool marked = nvSurfWaitReady(s->getSurfaceID());
++        const unsigned int msid = s->getSurfaceID();
++        bool marked = false;   // §37.29: a late composite raises the GPU clock floor, then the wait goes on to mark_ms
++        if (gIopXeBoostUs > 0) {
++            marked = nvSurfWaitReadyEx(msid, (unsigned int)gIopXeBoostUs, false, gXeArmSeq ? gXeArmSeq : ~0u);
++            if (!marked) { OSAddAtomic64(1, &gCntXeLate); nvXeBoostLate(); }
++        }
++        if (!marked) {
++            const SInt64 spent = nvIopUsBetween(tm, mach_absolute_time());
++            const SInt64 total = (SInt64)(gIopXeMarkMs > 0 ? gIopXeMarkMs : 100) * 1000;
++            marked = nvSurfWaitReadyEx(msid, (unsigned int)(total > spent ? total - spent : 1), true, gXeArmSeq ? gXeArmSeq : ~0u);
++        }
+         nvXeTlNote(&NVXeTl::mark);	// §37.9
+         const SInt64 markUs = nvIopUsBetween(tm, mach_absolute_time());
+         gXeMarkWaitLastUs = markUs; if (markUs > gXeMarkWaitMaxUs) gXeMarkWaitMaxUs = markUs;
+@@ -2453,7 +2595,7 @@
+ {
+     for (;;) {
+         if (!gXeFlipLock) return;
+-        NVXeFlipPend p; p.pipe = nullptr; p.s = nullptr; p.w = p.h = p.pitch = 0; p.snap = nullptr; p.tq = 0;
++        NVXeFlipPend p; p.pipe = nullptr; p.s = nullptr; p.w = p.h = p.pitch = 0; p.snap = nullptr; p.tq = 0; p.seq = 0;
+         IOLockLock(gXeFlipLock);
+         if (gXeFlipQHead == gXeFlipQTail) {	// nothing queued: idle out and let the display thread start us again
+             __atomic_store_n(&gXeFlipBusy, 0, __ATOMIC_RELEASE);
+@@ -2491,7 +2633,9 @@
+         NVXeTl *tl = &gXeTl[gXeTlN % 256];	// §37.9
+         bzero(tl, sizeof *tl); tl->q = p.tq; tl->pop = mach_absolute_time(); tl->sid = p.s->getSurfaceID(); tl->early = early;
+         gXeTlCur = tl;
++        gXeArmSeq = p.seq;	// §37.30
+         const bool ok = nvAccelXeFlipArm(p.s, p.w, p.h, p.pitch, true, early ? nvAccelXeFlipSignal : nullptr, &sg, p.snap);
++        gXeArmSeq = 0;
+         tl->ok = ok;
+         nvAccelXeSnapFree(p.snap);
+         gXeFlipLastEarly = ok && sg.done;
+@@ -2550,6 +2694,7 @@
+     } else {
+         NVXeFlipPend *q = &gXeFlipQ[gXeFlipQTail % NV_XE_FLIP_QUEUE];
+         q->pipe = pipe; q->s = s; q->w = w; q->h = h; q->pitch = pitch; q->snap = snap; snap = nullptr; q->tq = mach_absolute_time();
++        q->seq = __atomic_load_n(&gSurfPendSeqNow, __ATOMIC_ACQUIRE);	// §37.30: the marks made before this transaction
+         gXeFlipQTail++;
+         if (gXeFlipUnsignaled == 0) __atomic_store_n(&gXeFlipUnsignaledSince, (SInt64)mach_absolute_time(), __ATOMIC_RELEASE);
+         __atomic_store_n(&gXeFlipUnsignaled, gXeFlipUnsignaled + 1, __ATOMIC_RELEASE);
+@@ -3090,6 +3235,130 @@
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+ static bool nvSurfWaitReady(unsigned int id);
+ static void nvAccelIopHome(IOService *fb, unsigned head);
++// --- §37.28 hardware colour (native-display docs/37-RENDER-COMPRESSION.md).  Since the AGDC answers the pipe's colour
++// stages (0030) CoreDisplay no longer applies Night Shift and colour profiles in its GPUPass: it attaches the pipe's
++// linearization (pre-gamma table), colour matrix and encoding (post-gamma table) to its transactions.  The newest state
++// is kept here; the flip worker hands it to the core ("xgPipeColour"), which commits it to i915's degamma LUT, CSC and
++// gamma LUT.  A getter that returns nothing keeps the previous state (Apple's driver acts on the transaction's dirty
++// bits).  debug.xegfxaccel_iop_colour: 0 = only note and log it (default), 1 = apply.
++#define NV_COLOUR_MAX 4096
++struct NVXgPipeColour {		// = struct xg_pipe_colour (core xg_display_hook.h), version 1
++    uint32_t version, flags, npre, npost, matrix_mode, matrix[12];
++    uint32_t pre[3 * NV_COLOUR_MAX], post[3 * NV_COLOUR_MAX];
++};
++static int gIopColour = 1, gIopColourMtx = 0, gIopColourMs = 0;	// §37.29: on by default, every change (boot-arg xegfxcolour=0: off)
++static SInt64 gCntColourTx, gCntColourChanges, gCntColourApplied, gCntColourFail, gColourLastUs, gColourMaxUs, gCntColourSame;
++static IOLock *gColourLock;
++static NVXgPipeColour gColourNote, gColourPend, gColourApplyBuf;	// note: WindowServer's thread; apply: the flip worker
++static volatile uint32_t gColourGen, gColourAppliedGen;
++static uint64_t gColourLastApplyAbs;
++static const void *gColourPrePtr, *gColourPostPtr;
++static uint32_t gColourMatrixLast[12];
++
++static unsigned nvColourReadTable(IOAccelDisplayPipeGammaTable2 *t, uint32_t *out)
++{
++    const unsigned n = t->getTableCount();
++    if (n < 2 || n > NV_COLOUR_MAX) return 0;
++    for (unsigned i = 0; i < n; i++)
++        t->getTableEntry(i, (float *)&out[3 * i], (float *)&out[3 * i + 1], (float *)&out[3 * i + 2]);
++    return n;
++}
++
++static void nvIopColourNote(IOAccelDisplayPipeTransaction2 *txn)
++{
++    IOAccelDisplayPipeGammaTable2 *pre = txn->getPipePreGammaTable(), *post = txn->getPipePostGammaTable();
++    IOAccelDisplayPipePostCSCGammaVID *cv = txn->getPipePostCSCGammaVID();
++    IOAccelDisplayPipePreCSCLinearizationVID *lv = txn->getPipePreCSCLinearizationVID();
++    IOAccelDisplayPipeGammaTable2 *pl = txn->getPlaneGammaTable(0);
++    const NVIopColorMatrix m = txn->getPipeColorMatrix();
++    bool mset = false;
++    for (unsigned i = 0; i < 12; i++) if (m.v[i]) mset = true;
++    if (!pre && !post && !mset && !cv && !lv && !pl) return;
++    OSAddAtomic64(1, &gCntColourTx);
++    bool changed = false;
++    if (pre && pre != gColourPrePtr) changed = true;
++    if (post && post != gColourPostPtr) changed = true;
++    if (mset && memcmp(m.v, gColourMatrixLast, sizeof m.v)) changed = true;
++    if (!changed) return;
++    if (pre && pre != gColourPrePtr) {
++        gColourNote.npre = nvColourReadTable(pre, gColourNote.pre);
++        if (gColourNote.npre) gColourNote.flags |= 1u; else gColourNote.flags &= ~1u;
++        gColourPrePtr = pre;
++    }
++    if (post && post != gColourPostPtr) {
++        gColourNote.npost = nvColourReadTable(post, gColourNote.post);
++        if (gColourNote.npost) gColourNote.flags |= 2u; else gColourNote.flags &= ~2u;
++        gColourPostPtr = post;
++    }
++    if (mset) { memcpy(gColourNote.matrix, m.v, sizeof m.v); memcpy(gColourMatrixLast, m.v, sizeof m.v); gColourNote.flags |= 4u; }
++    gColourNote.version = 1;
++    const SInt64 n = OSAddAtomic64(1, &gCntColourChanges);
++    if (gColourLock) {
++        IOLockLock(gColourLock);
++        memcpy(&gColourPend, &gColourNote, sizeof gColourPend);
++        gColourGen++;
++        IOLockUnlock(gColourLock);
++    }
++    if (n < 32 || (n & 63) == 0) {
++        const NVIopColorMatrixArgs ma = txn->getPipeColorMatrixArgs();
++        ALOG("iop colour #%lld: dirty 0x%llx pre %u post %u plane0 %u matrix %s args %08x %08x %08x %08x %08x %08x",
++             (long long)n, txn->getTransactionDirtyBits(), pre ? gColourNote.npre : 0u, post ? gColourNote.npost : 0u,
++             pl ? pl->getTableCount() : 0u, mset ? "set" : "none", ma.v[0], ma.v[1], ma.v[2], ma.v[3], ma.v[4], ma.v[5]);
++        if (mset)
++            ALOG("iop colour #%lld: matrix %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x", (long long)n,
++                 m.v[0], m.v[1], m.v[2], m.v[3], m.v[4], m.v[5], m.v[6], m.v[7], m.v[8], m.v[9], m.v[10], m.v[11]);
++        for (unsigned w = 0; w < 2; w++) {
++            const uint32_t *t = w ? gColourNote.post : gColourNote.pre; const unsigned c = w ? gColourNote.npost : gColourNote.npre;
++            if (!c || (w ? !post : !pre)) continue;
++            const unsigned at[4] = { 0, c / 4, c / 2, c - 1 };
++            ALOG("iop colour #%lld: %s[%u]: [0] %08x %08x %08x [%u] %08x %08x %08x [%u] %08x %08x %08x [%u] %08x %08x %08x",
++                 (long long)n, w ? "post" : "pre", c, t[0], t[1], t[2], at[1], t[3 * at[1]], t[3 * at[1] + 1], t[3 * at[1] + 2],
++                 at[2], t[3 * at[2]], t[3 * at[2] + 1], t[3 * at[2] + 2], at[3], t[3 * at[3]], t[3 * at[3] + 1], t[3 * at[3] + 2]);
++        }
++        if (cv || lv) {
++            const uint32_t *cd = cv && cv->getData() && cv->getSize() >= 16 ? (const uint32_t *)cv->getData() : nullptr;
++            const uint32_t *ld = lv && lv->getData() && lv->getSize() >= 16 ? (const uint32_t *)lv->getData() : nullptr;
++            ALOG("iop colour #%lld: postcsc-gamma vid type %u fmt %u size %u cfg %u data %08x %08x %08x %08x | precsc-lin vid "
++                 "type %u fmt %u size %u cfg %u data %08x %08x %08x %08x", (long long)n,
++                 cv ? cv->getType() : 0u, cv ? cv->getFormat() : 0u, cv ? cv->getSize() : 0u, cv ? cv->getConfigurationID() : 0u,
++                 cd ? cd[0] : 0u, cd ? cd[1] : 0u, cd ? cd[2] : 0u, cd ? cd[3] : 0u,
++                 lv ? lv->getType() : 0u, lv ? lv->getFormat() : 0u, lv ? lv->getSize() : 0u, lv ? lv->getConfigurationID() : 0u,
++                 ld ? ld[0] : 0u, ld ? ld[1] : 0u, ld ? ld[2] : 0u, ld ? ld[3] : 0u);
++        }
++    }
++}
++
++static void nvIopColourApply(void)
++{
++    if (!gIopColour || !gColourLock || gColourGen == gColourAppliedGen) return;
++    const uint64_t now = mach_absolute_time();
++    uint64_t ns = 0;
++    if (gColourLastApplyAbs) absolutetime_to_nanoseconds(now - gColourLastApplyAbs, &ns);
++    if (gColourLastApplyAbs && ns < (uint64_t)(gIopColourMs > 0 ? gIopColourMs : 0) * 1000000ull) return;
++    IOLockLock(gColourLock);
++    memcpy(&gColourApplyBuf, &gColourPend, sizeof gColourApplyBuf);
++    const uint32_t gen = gColourGen;
++    IOLockUnlock(gColourLock);
++    gColourApplyBuf.matrix_mode = (uint32_t)gIopColourMtx;
++    // §37.29: CoreDisplay hands the same tables over again about once a second as new objects; an unchanged state is
++    // not committed again (each commit is ~5 ms in the flip worker, a missed vblank)
++    static NVXgPipeColour last; static bool haveLast;
++    if (haveLast && !memcmp(&last, &gColourApplyBuf, sizeof last)) {
++        gColourAppliedGen = gen; OSAddAtomic64(1, &gCntColourSame);
++        return;
++    }
++    unsigned int us = 0; int res = -1;
++    const IOReturn r = nvAccelResidentCall("xgPipeColour", &gColourApplyBuf, &us, &res, nullptr);
++    gColourLastApplyAbs = mach_absolute_time();
++    gColourAppliedGen = gen;
++    gColourLastUs = us; if ((SInt64)us > gColourMaxUs) gColourMaxUs = us;
++    if (r == kIOReturnSuccess && res == 0) { OSAddAtomic64(1, &gCntColourApplied); memcpy(&last, &gColourApplyBuf, sizeof last); haveLast = true; }
++    else {
++        const SInt64 f = OSAddAtomic64(1, &gCntColourFail);
++        if (f < 8) ALOG("iop colour: the core refused the colour state (call 0x%x, result %d)", r, res);
++    }
++}
++
+ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     NVPIPE_CNT(gCntPipePerform);
+@@ -3097,6 +3366,7 @@
+     if (gIopLastTxnEnd) nvIopStat(&gIopGapLastUs, &gIopGapMaxUs, &gIopGapSumUs, nvIopUsBetween(gIopLastTxnEnd, txnStart));
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+     if (!txn) NVIOP_FAIL(kIOReturnBadArgument, "performTransaction(NULL)");
++    nvIopColourNote(txn);   // §37.28
+     NVAccel *a = NVAccel::gAccel;
+     unsigned head = 0;
+     IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
+@@ -3412,7 +3682,8 @@
+ static int gSurfWaitMaxUs;
+ static const unsigned kSurfGpuWaitMs = 100;   // a GPU that has not finished a composite in 100 ms is hung; flip anyway
+ struct NVSurfPending { unsigned int id; unsigned int seq; };
+-static NVSurfPending gSurfPend[32];
++#define NV_SURF_PEND 64	// §37.30: one entry per command buffer and surface (was one per surface, 32)
++static NVSurfPending gSurfPend[NV_SURF_PEND];
+ static unsigned int gSurfPendSeq;
+ static IOLock *gSurfPendLock;
+ static IOLock *nvSurfLock()
+@@ -3449,47 +3720,93 @@
+     IOLockUnlock(l);
+     return t;
+ }
+-static void nvSurfMark(unsigned int id, bool pending)
++// pending: a new mark, its number returned.  Ready with seq: that mark only; ready with seq 0: every mark of the surface.
++static unsigned int nvSurfMarkSeq(unsigned int id, bool pending, unsigned int seq)
+ {
+     IOLock *l = nvSurfLock();
+-    if (!l || !id) return;
++    if (!l || !id) return 0;
++    unsigned int got = 0;
++    bool woke = false;
+     IOLockLock(l);
+-    unsigned slot = 32, oldest = 0;
+-    for (unsigned i = 0; i < 32; i++) {
+-        if (gSurfPend[i].id == id) { slot = i; break; }
+-        if (slot == 32 && !gSurfPend[i].id) slot = i;
+-        if (gSurfPend[i].seq < gSurfPend[oldest].seq) oldest = i;
+-    }
+ #ifdef NMX_XEGFX
+     gSurfMarkLastAbs = mach_absolute_time();
+ #endif
+     if (pending) {
+-        if (slot == 32) slot = oldest;   // 32 surfaces in flight at once is not a compositor; the oldest mark goes
+-        gSurfPend[slot].id = id; gSurfPend[slot].seq = ++gSurfPendSeq;
+-    } else if (slot < 32 && gSurfPend[slot].id == id) {
+-        gSurfPend[slot].id = 0;
+-        IOLockWakeup(l, gSurfPend, false);
++        unsigned slot = NV_SURF_PEND, oldest = 0;
++        for (unsigned i = 0; i < NV_SURF_PEND; i++) {
++            if (slot == NV_SURF_PEND && !gSurfPend[i].id) slot = i;
++            if (gSurfPend[i].seq < gSurfPend[oldest].seq) oldest = i;
++        }
++        if (slot == NV_SURF_PEND) { slot = oldest; woke = true; }   // a full table drops its oldest mark
++        got = ++gSurfPendSeq;
++        if (!got) got = ++gSurfPendSeq;
++        gSurfPend[slot].id = id; gSurfPend[slot].seq = got;
++        __atomic_store_n(&gSurfPendSeqNow, got, __ATOMIC_RELEASE);
++    } else {
++        for (unsigned i = 0; i < NV_SURF_PEND; i++)
++            if (gSurfPend[i].id == id && (!seq || gSurfPend[i].seq == seq)) { gSurfPend[i].id = 0; woke = true; }
+     }
++    if (woke) IOLockWakeup(l, gSurfPend, false);
++    uint64_t lateAbs = 0;
++#ifdef NMX_XEGFX
++    if (!pending && id == gSurfLateId) { lateAbs = gSurfLateAbs; gSurfLateId = 0; }   // §37.29
++#endif
+     IOLockUnlock(l);
+     OSAddAtomic64(1, &gCntSurfMarks);
++#ifdef NMX_XEGFX
++    if (lateAbs) {
++        const SInt64 n = OSAddAtomic64(1, &gCntXeLateCleared);
++        if (n < 64 || (n & 63) == 0)
++            ALOG("iop: surface %u: its composite finished %lld us after the flip stopped waiting for it (%lld so far)", id,
++                 (long long)nvIopUsBetween(lateAbs, mach_absolute_time()), (long long)n + 1);
++    }
++#endif
++    return got;
+ }
+-static bool nvSurfWaitReady(unsigned int id)
++// selectors 1/2 and the NVK escape: one mark per surface, released as a whole.  A surface that already has one keeps it
++// (and its older number, so a flip limited to that number still waits for it).
++static void nvSurfMark(unsigned int id, bool pending)
+ {
++    if (pending) {
++        IOLock *l = nvSurfLock();
++        if (!l || !id) return;
++        bool have = false;
++        IOLockLock(l);
++        for (unsigned i = 0; i < NV_SURF_PEND && !have; i++) have = gSurfPend[i].id == id;
++        IOLockUnlock(l);
++        if (have) { OSAddAtomic64(1, &gCntSurfMarks); return; }
++    }
++    (void)nvSurfMarkSeq(id, pending, 0);
++}
++// final: on timeout the pending mark is dropped (and, §37.29, remembered so its late release is logged); otherwise the
++// caller waits again
++static bool nvSurfWaitReadyEx(unsigned int id, unsigned int timeoutUs, bool final, unsigned int maxSeq)
++{
+     IOLock *l = gSurfPendLock;
+     if (!l || !id || !gSurfGpuOn) return true;   // switched off: marks left from before never hold a swap
+     uint64_t start = mach_absolute_time(), deadline = 0;
+-    clock_interval_to_deadline(kSurfGpuWaitMs, kMillisecondScale, &deadline);
++    clock_interval_to_deadline(timeoutUs ? timeoutUs : 1, kMicrosecondScale, &deadline);
+     bool waited = false, ready = true;
+     IOLockLock(l);
+     for (;;) {
+         unsigned i = 0;
+-        while (i < 32 && gSurfPend[i].id != id) i++;
+-        if (i == 32) break;
+-        if (mach_absolute_time() >= deadline) { gSurfPend[i].id = 0; ready = false; break; }
++        while (i < NV_SURF_PEND && !(gSurfPend[i].id == id && gSurfPend[i].seq <= maxSeq)) i++;
++        if (i == NV_SURF_PEND) break;
++        if (mach_absolute_time() >= deadline) {
++            if (final) {
++                for (unsigned j = 0; j < NV_SURF_PEND; j++)
++                    if (gSurfPend[j].id == id && gSurfPend[j].seq <= maxSeq) gSurfPend[j].id = 0;
++#ifdef NMX_XEGFX
++                gSurfLateId = id; gSurfLateAbs = mach_absolute_time();
++#endif
++            }
++            ready = false; break;
++        }
+         waited = true;
+         IOLockSleepDeadline(l, gSurfPend, deadline, THREAD_UNINT);
+     }
+     IOLockUnlock(l);
++    if (!final && !ready) return false;
+     if (waited) {
+         uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+         if ((int)(ns / 1000) > gSurfWaitMaxUs) gSurfWaitMaxUs = (int)(ns / 1000);
+@@ -3497,6 +3814,7 @@
+     }
+     return ready;
+ }
++static bool nvSurfWaitReady(unsigned int id) { return nvSurfWaitReadyEx(id, kSurfGpuWaitMs * 1000u, true); }
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu, CTLFLAG_RD | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "1 = WindowServer swaps wait for GPU completion here (same value as nvaccel_surface_gpu_on)");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_surface_gpu_on, CTLFLAG_RW | CTLFLAG_LOCKED, &gSurfGpuOn, 0, "0 = WindowServer waits for its own composites again (the plugin re-asks every second)");
+ NVACCEL_CNT(nvaccel_surface_gpu_marks,    gCntSurfMarks,    "pending/ready marks from WindowServer");
+@@ -3860,6 +4178,13 @@
+           sysctl__debug_nvaccel_iop_xe_mark_timeouts;
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_markonly); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_markonly_flips);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_mark_timeouts);
++      extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_mark_ms, sysctl__debug_nvaccel_iop_xe_boost_us,
++          sysctl__debug_nvaccel_iop_xe_boost_hold_ms, sysctl__debug_nvaccel_iop_xe_boost_mhz, sysctl__debug_nvaccel_iop_xe_boost_floor,
++          sysctl__debug_nvaccel_iop_xe_boosts, sysctl__debug_nvaccel_iop_xe_late, sysctl__debug_nvaccel_iop_xe_late_cleared;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_mark_ms); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_boost_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_boost_hold_ms); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_boost_mhz);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_boost_floor); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_boosts);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_late); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_late_cleared);
+       extern struct sysctl_oid sysctl__debug_nvaccel_iop_xe_tile4, sysctl__debug_nvaccel_iop_xe_tile4_plane,
+           sysctl__debug_nvaccel_iop_xe_tile4_frames, sysctl__debug_nvaccel_iop_xe_tile4_switches, sysctl__debug_nvaccel_iop_xe_tile4_fail;
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_tile4); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_tile4_plane);
+@@ -3871,6 +4196,19 @@
+           sysctl__debug_nvaccel_iop_xe_ccs_regs, sysctl__debug_nvaccel_iop_xe_ccs_fail;
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs_frames);
+       sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs_regs); sysctl_register_oid(&sysctl__debug_nvaccel_iop_xe_ccs_fail);
++      extern struct sysctl_oid sysctl__debug_nvaccel_iop_colour, sysctl__debug_nvaccel_iop_colour_mtx,
++          sysctl__debug_nvaccel_iop_colour_ms, sysctl__debug_nvaccel_iop_colour_tx, sysctl__debug_nvaccel_iop_colour_changes,
++          sysctl__debug_nvaccel_iop_colour_applied, sysctl__debug_nvaccel_iop_colour_fail,
++          sysctl__debug_nvaccel_iop_colour_last_us, sysctl__debug_nvaccel_iop_colour_max_us;
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour); sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_mtx);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_ms); sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_tx);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_changes); sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_applied);
++      { extern struct sysctl_oid sysctl__debug_nvaccel_iop_colour_same; sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_same); }
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_fail); sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_last_us);
++      sysctl_register_oid(&sysctl__debug_nvaccel_iop_colour_max_us);
++      if (!gColourLock) gColourLock = IOLockAlloc();   // §37.28
++      { int c = 0; if (PE_parse_boot_argn("xegfxcolour", &c, sizeof c)) gIopColour = c ? 1 : 0;   // §37.28
++        ALOG("iop: hardware colour %s at start", gIopColour ? "applied" : "noted only"); }
+       { int c = 1; if (PE_parse_boot_argn("xegfxccs", &c, sizeof c)) gIopXeCcs = c ? 1 : 0;   // §37.14, §37.17
+         ALOG("iop: compressed scanout %s at start%s", gIopXeCcs ? "on" : "off", gIopXeCcs ? "" : " (boot argument xegfxccs=0)"); }
+       // §37.13: E2 stops at system power-off / restart.  Registered here, at the accelerator's start, not from the
+@@ -5406,6 +5744,19 @@
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_tile4_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeTile4Frames, "frames flipped Tile4");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_tile4_switches, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeTile4Switches, "plane layout changes (each a plane-only commit)");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_tile4_fail, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeTile4Fail, "plane layout changes the core refused");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_colour, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopColour, 0,
++           "37.28: 1 = commit the transactions' colour state to the pipe (degamma, CSC, gamma), 0 = note and log only");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_colour_mtx, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopColourMtx, 0,
++           "37.28: colour matrix layout, bit 0: 3x3 then offsets (else 3x4 row-major), bit 1: transposed");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_colour_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopColourMs, 0,
++           "37.28: at least this many ms between two colour commits");
++NVACCEL_CNT(nvaccel_iop_colour_tx,      gCntColourTx,      "37.28: transactions carrying colour state");
++NVACCEL_CNT(nvaccel_iop_colour_changes, gCntColourChanges, "37.28: colour state changes noted");
++NVACCEL_CNT(nvaccel_iop_colour_applied, gCntColourApplied, "37.28: colour commits the core made");
++NVACCEL_CNT(nvaccel_iop_colour_same, gCntColourSame, "37.29: colour changes skipped, same state as the last commit");
++NVACCEL_CNT(nvaccel_iop_colour_fail,    gCntColourFail,    "37.28: colour commits refused");
++NVACCEL_CNT(nvaccel_iop_colour_last_us, gColourLastUs,     "37.28: the last colour commit, us");
++NVACCEL_CNT(nvaccel_iop_colour_max_us,  gColourMaxUs,      "37.28: the longest colour commit, us");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_ccs, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeCcs, 0,
+            "37.14: 1 = scan the plugin's compressed (MTL RC CCS) images of scanout surfaces");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_ccs_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeCcsFrames, "frames scanned compressed");
+@@ -5414,7 +5765,15 @@
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_markonly, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeMarkOnly, 0,
+     "1 = while WindowServer's surface marks are live a deferred flip waits only for its own mark (default), 0 = the fence snapshot too");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_markonly_flips, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeMarkOnly, "deferred flips that waited only for their surface mark");
+-SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_mark_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeMarkTimeouts, "deferred flips whose surface mark was not released within 100 ms");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_mark_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeMarkTimeouts, "deferred flips whose surface mark was not released within mark_ms");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_mark_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeMarkMs, 0, "§37.29: longest wait for a frame's composite before it is armed anyway, ms");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_boost_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeBoostUs, 0, "§37.29: a composite not finished this long after its flip was taken raises the GPU clock floor (0 = never)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_boost_hold_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeBoostHoldMs, 0, "§37.29: the floor goes back this long after the last late frame");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_boost_mhz, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeBoostMhz, 0, "§37.29: the raised floor, MHz (0 = the maximum)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_boost_floor, CTLFLAG_RD | CTLFLAG_LOCKED, &gXeBoostFloor, 0, "§37.29: the floor the boost holds now, MHz (0 = not raised)");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_boosts, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeBoosts, "§37.29: times the GPU clock floor was raised");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_late, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeLate, "§37.29: deferred flips whose composite was not finished after boost_us");
++SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_late_cleared, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeLateCleared, "§37.29: composites a flip stopped waiting for that finished later");
+ SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_xe_early, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopXeEarly, 0,
+     "E2: 1 = signal a deferred flip at its plane write once WindowServer rotates >= 3 surfaces (default), 0 = after the latch");
+ SYSCTL_QUAD(_debug, OID_AUTO, nvaccel_iop_xe_early_signals, CTLFLAG_RD | CTLFLAG_LOCKED, &gCntXeEarlySignals, "E2: deferred flips signalled before their latch");
+--- a/kexts/NVRM/accel/xegfx_accel_names.h
++++ b/kexts/NVRM/accel/xegfx_accel_names.h
+@@ -298,6 +298,22 @@
+ #define sysctl__debug_nvaccel_iop_xe_markonly_flips sysctl__debug_xegfxaccel_iop_xe_markonly_flips
+ #define nvaccel_iop_xe_mark_timeouts xegfxaccel_iop_xe_mark_timeouts
+ #define sysctl__debug_nvaccel_iop_xe_mark_timeouts sysctl__debug_xegfxaccel_iop_xe_mark_timeouts
++#define nvaccel_iop_xe_mark_ms xegfxaccel_iop_xe_mark_ms
++#define sysctl__debug_nvaccel_iop_xe_mark_ms sysctl__debug_xegfxaccel_iop_xe_mark_ms
++#define nvaccel_iop_xe_boost_us xegfxaccel_iop_xe_boost_us
++#define sysctl__debug_nvaccel_iop_xe_boost_us sysctl__debug_xegfxaccel_iop_xe_boost_us
++#define nvaccel_iop_xe_boost_hold_ms xegfxaccel_iop_xe_boost_hold_ms
++#define sysctl__debug_nvaccel_iop_xe_boost_hold_ms sysctl__debug_xegfxaccel_iop_xe_boost_hold_ms
++#define nvaccel_iop_xe_boost_mhz xegfxaccel_iop_xe_boost_mhz
++#define sysctl__debug_nvaccel_iop_xe_boost_mhz sysctl__debug_xegfxaccel_iop_xe_boost_mhz
++#define nvaccel_iop_xe_boost_floor xegfxaccel_iop_xe_boost_floor
++#define sysctl__debug_nvaccel_iop_xe_boost_floor sysctl__debug_xegfxaccel_iop_xe_boost_floor
++#define nvaccel_iop_xe_boosts xegfxaccel_iop_xe_boosts
++#define sysctl__debug_nvaccel_iop_xe_boosts sysctl__debug_xegfxaccel_iop_xe_boosts
++#define nvaccel_iop_xe_late xegfxaccel_iop_xe_late
++#define sysctl__debug_nvaccel_iop_xe_late sysctl__debug_xegfxaccel_iop_xe_late
++#define nvaccel_iop_xe_late_cleared xegfxaccel_iop_xe_late_cleared
++#define sysctl__debug_nvaccel_iop_xe_late_cleared sysctl__debug_xegfxaccel_iop_xe_late_cleared
+ #define nvaccel_iop_xe_tile4 xegfxaccel_iop_xe_tile4
+ #define sysctl__debug_nvaccel_iop_xe_tile4 sysctl__debug_xegfxaccel_iop_xe_tile4
+ #define nvaccel_iop_xe_tile4_plane xegfxaccel_iop_xe_tile4_plane
+@@ -308,6 +324,26 @@
+ #define sysctl__debug_nvaccel_iop_xe_tile4_switches sysctl__debug_xegfxaccel_iop_xe_tile4_switches
+ #define nvaccel_iop_xe_tile4_fail xegfxaccel_iop_xe_tile4_fail
+ #define sysctl__debug_nvaccel_iop_xe_tile4_fail sysctl__debug_xegfxaccel_iop_xe_tile4_fail
++#define nvaccel_iop_colour xegfxaccel_iop_colour
++#define sysctl__debug_nvaccel_iop_colour sysctl__debug_xegfxaccel_iop_colour
++#define nvaccel_iop_colour_mtx xegfxaccel_iop_colour_mtx
++#define sysctl__debug_nvaccel_iop_colour_mtx sysctl__debug_xegfxaccel_iop_colour_mtx
++#define nvaccel_iop_colour_ms xegfxaccel_iop_colour_ms
++#define sysctl__debug_nvaccel_iop_colour_ms sysctl__debug_xegfxaccel_iop_colour_ms
++#define nvaccel_iop_colour_tx xegfxaccel_iop_colour_tx
++#define sysctl__debug_nvaccel_iop_colour_tx sysctl__debug_xegfxaccel_iop_colour_tx
++#define nvaccel_iop_colour_changes xegfxaccel_iop_colour_changes
++#define sysctl__debug_nvaccel_iop_colour_changes sysctl__debug_xegfxaccel_iop_colour_changes
++#define nvaccel_iop_colour_applied xegfxaccel_iop_colour_applied
++#define sysctl__debug_nvaccel_iop_colour_applied sysctl__debug_xegfxaccel_iop_colour_applied
++#define nvaccel_iop_colour_same xegfxaccel_iop_colour_same
++#define sysctl__debug_nvaccel_iop_colour_same sysctl__debug_xegfxaccel_iop_colour_same
++#define nvaccel_iop_colour_fail xegfxaccel_iop_colour_fail
++#define sysctl__debug_nvaccel_iop_colour_fail sysctl__debug_xegfxaccel_iop_colour_fail
++#define nvaccel_iop_colour_last_us xegfxaccel_iop_colour_last_us
++#define sysctl__debug_nvaccel_iop_colour_last_us sysctl__debug_xegfxaccel_iop_colour_last_us
++#define nvaccel_iop_colour_max_us xegfxaccel_iop_colour_max_us
++#define sysctl__debug_nvaccel_iop_colour_max_us sysctl__debug_xegfxaccel_iop_colour_max_us
+ #define nvaccel_iop_xe_ccs xegfxaccel_iop_xe_ccs
+ #define sysctl__debug_nvaccel_iop_xe_ccs sysctl__debug_xegfxaccel_iop_xe_ccs
+ #define nvaccel_iop_xe_ccs_frames xegfxaccel_iop_xe_ccs_frames
